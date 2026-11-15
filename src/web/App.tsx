@@ -511,11 +511,8 @@ export function App() {
           <button onClick={() => setModal("accounts")}>
             <Activity size={17} />
             Agent accounts
-            <span className="count">
-              {
-                overview.accounts.filter((a: any) => a.status === "ready")
-                  .length
-              }
+            <span className="count" title="Saved accounts">
+              {overview.accounts.length}
             </span>
           </button>
           <button onClick={() => setModal("settings")}>
@@ -1265,7 +1262,9 @@ function Accounts({ accounts, refresh, onError }: any) {
     [authId, setAuthId] = useState(""),
     [events, setEvents] = useState<any[]>([]),
     [authInput, setAuthInput] = useState(""),
-    [connecting, setConnecting] = useState(false);
+    [connecting, setConnecting] = useState(false),
+    [adding, setAdding] = useState(false),
+    [added, setAdded] = useState("");
   useEffect(() => {
     if (!authId) return;
     const t = setInterval(() => {
@@ -1307,52 +1306,145 @@ function Accounts({ accounts, refresh, onError }: any) {
   const claudeUrl = claudeSignInUrl(authText);
   return (
     <>
+      <p className="accounts-intro">
+        Add as many accounts as you need, including multiple accounts for the
+        same service. Each account has its own sign-in and usage limits.
+      </p>
+      <form
+        className="account-add-form"
+        onSubmit={async (e) => {
+          e.preventDefault();
+          if (adding) return;
+          const form = e.currentTarget;
+          const name = String(new FormData(form).get("name") || "").trim();
+          if (!name) return;
+          setAdding(true);
+          setAdded("");
+          try {
+            await api("/accounts", { name, provider });
+            form.reset();
+            setAdded(`${name} added. Select Connect below to sign in.`);
+            await refresh();
+          } catch (e: any) {
+            onError(e.message);
+          } finally {
+            setAdding(false);
+          }
+        }}
+      >
+        <h3>Add another account</h3>
+        <div className="form-row">
+          <Field label="Account label">
+            <input
+              name="name"
+              required
+              maxLength={80}
+              placeholder="e.g. Personal, Work, Account 3"
+            />
+          </Field>
+          <Field label="Service">
+            <select
+              value={provider}
+              onChange={(e) => setProvider(e.target.value)}
+            >
+              <option value="codex">Codex</option>
+              <option value="claude">Claude Code</option>
+            </select>
+          </Field>
+        </div>
+        <button className="primary" disabled={adding}>
+          <Plus size={17} />
+          {adding ? "Adding account…" : "Add account"}
+        </button>
+        {added && (
+          <p className="account-added" role="status">
+            {added}
+          </p>
+        )}
+      </form>
+      <div className="accounts-summary">
+        <h3>Your accounts</h3>
+        <span>
+          {accounts.length} added ·{" "}
+          {accounts.filter((a: any) => a.status === "ready").length} connected
+        </span>
+      </div>
       <div className="account-list">
-        {accounts.map((a: any) => (
-          <div className="account-row" key={a.id}>
-            <span className={"provider-icon " + a.provider}>
-              {a.provider === "codex" ? "◈" : "✳"}
-            </span>
-            <div>
-              <strong>{a.name}</strong>
-              <small>
-                <span className={"status-dot " + a.status} />
-                {labels[a.status]}
-              </small>
-              {a.limits && (
-                <small>
-                  {a.limits.usedPercent !== undefined
-                    ? `${a.limits.usedPercent}% used`
-                    : "Usage information received"}
-                </small>
-              )}
-            </div>
-            {a.status === "limited" ? (
-              <button
-                className="secondary"
-                onClick={async () => {
-                  try {
-                    await api("/accounts/" + a.id + "/recheck", {});
-                    await refresh();
-                  } catch (e: any) {
-                    onError(e.message);
-                  }
-                }}
-              >
-                Retry
-              </button>
-            ) : (
-              <button
-                className="secondary"
-                disabled={connecting}
-                onClick={() => start(a.id)}
-              >
-                {a.status === "ready" ? "Sign in again" : "Connect"}
-              </button>
+        {[
+          { id: "codex", name: "Codex" },
+          { id: "claude", name: "Claude Code" },
+        ].map((service) => (
+          <section
+            className="account-group"
+            key={service.id}
+            aria-label={service.name + " accounts"}
+          >
+            <header>
+              <strong>{service.name}</strong>
+              <span>
+                {accounts.filter((a: any) => a.provider === service.id).length}{" "}
+                saved
+              </span>
+            </header>
+            {!accounts.some((a: any) => a.provider === service.id) && (
+              <p className="muted">
+                No accounts added yet. Add your first {service.name} account
+                above.
+              </p>
             )}
-          </div>
+            {accounts
+              .filter((a: any) => a.provider === service.id)
+              .map((a: any) => (
+                <div className="account-row" key={a.id}>
+                  <span className={"provider-icon " + a.provider}>
+                    {a.provider === "codex" ? "◈" : "✳"}
+                  </span>
+                  <div>
+                    <strong>{a.name}</strong>
+                    <small>
+                      <span className={"status-dot " + a.status} />
+                      {labels[a.status]}
+                    </small>
+                    {a.limits && (
+                      <small>
+                        {a.limits.usedPercent !== undefined
+                          ? `${a.limits.usedPercent}% used`
+                          : "Usage information received"}
+                      </small>
+                    )}
+                  </div>
+                  {a.status === "limited" ? (
+                    <button
+                      className="secondary"
+                      onClick={async () => {
+                        try {
+                          await api("/accounts/" + a.id + "/recheck", {});
+                          await refresh();
+                        } catch (e: any) {
+                          onError(e.message);
+                        }
+                      }}
+                    >
+                      Retry
+                    </button>
+                  ) : (
+                    <button
+                      className="secondary"
+                      disabled={connecting}
+                      onClick={() => start(a.id)}
+                    >
+                      {a.status === "ready" ? "Sign in again" : "Connect"}
+                    </button>
+                  )}
+                </div>
+              ))}
+          </section>
         ))}
       </div>
+      <p className="accounts-footnote">
+        You can save any number of accounts. Up to 3 tasks can run at once, with
+        one task per account.
+      </p>
       {authId && (
         <div className="auth-flow">
           <strong>Sign in through the official agent</strong>
@@ -1428,41 +1520,6 @@ function Accounts({ accounts, refresh, onError }: any) {
           </button>
         </div>
       )}
-      <hr />
-      <form
-        onSubmit={async (e) => {
-          e.preventDefault();
-          const form = e.currentTarget,
-            f = new FormData(form);
-          try {
-            await api("/accounts", { name: f.get("name"), provider });
-            form.reset();
-            await refresh();
-          } catch (e: any) {
-            onError(e.message);
-          }
-        }}
-      >
-        <h3>Add account</h3>
-        <div className="form-row">
-          <Field label="Name">
-            <input name="name" required placeholder="My primary account" />
-          </Field>
-          <Field label="Agent">
-            <select
-              value={provider}
-              onChange={(e) => setProvider(e.target.value)}
-            >
-              <option value="codex">Codex</option>
-              <option value="claude">Claude Code</option>
-            </select>
-          </Field>
-        </div>
-        <button className="primary">
-          <Plus size={17} />
-          Add
-        </button>
-      </form>
     </>
   );
 }

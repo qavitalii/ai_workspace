@@ -1079,6 +1079,72 @@ small,
   color: #3f6237;
   box-shadow: 0 1px 4px #263c1812;
 }
+.accounts-intro {
+  margin: -5px 0 20px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.65;
+}
+.account-add-form {
+  padding: 18px;
+  background: #f0f4eb;
+  border: 1px solid #e0e7d9;
+  border-radius: 12px;
+}
+.account-add-form h3 {
+  margin: 0 0 16px;
+  font-size: 14px;
+}
+.account-add-form .form-row > :first-child {
+  flex: 1.5;
+}
+.account-added {
+  margin: 12px 0 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: #365b42;
+}
+.accounts-summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 24px 0 16px;
+}
+.accounts-summary h3 {
+  margin: 0;
+  font-size: 14px;
+}
+.accounts-summary > span {
+  font-size: 11px;
+  color: var(--muted);
+}
+.account-group + .account-group {
+  margin-top: 18px;
+}
+.account-group > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 12px;
+}
+.account-group > header > span {
+  color: var(--muted);
+}
+.accounts-footnote {
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--muted);
+  margin: 18px 0 0;
+}
+.account-row > div {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.account-row > button {
+  flex-shrink: 0;
+}
 .account-row {
   display: flex;
   align-items: center;
