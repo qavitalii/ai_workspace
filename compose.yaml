@@ -1,0 +1,81 @@
+name: ai-workspace
+services:
+  db:
+    image: postgres:16-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: workspace
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Run ops/install.sh first}
+      POSTGRES_DB: workspace
+    volumes:
+      - postgres:/var/lib/postgresql/data
+    networks: [control]
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U workspace -d workspace"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+  server:
+    build: { context: ., target: server }
+    image: ai-workspace-server:0.1.0
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 45s
+    environment:
+      NODE_ENV: ${NODE_ENV:-production}
+      APP_ORIGIN: ${APP_ORIGIN:?Run ops/install.sh first}
+      DATABASE_URL: postgres://workspace:${POSTGRES_PASSWORD}@db:5432/workspace
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:?Run ops/install.sh first}
+      DATA_ROOT: ${DATA_ROOT:?Run ops/install.sh first}
+      RUNNER_IMAGE: ai-workspace-runner:0.1.0
+      MAX_CONCURRENT: ${MAX_CONCURRENT:-3}
+      MAX_FILE_MB: ${MAX_FILE_MB:-25}
+      MAX_ATTACHMENTS: ${MAX_ATTACHMENTS:-10}
+      ENABLE_AUTO_HANDOFF: ${ENABLE_AUTO_HANDOFF:-false}
+      VAPID_PUBLIC_KEY: ${VAPID_PUBLIC_KEY:-}
+      VAPID_PRIVATE_KEY: ${VAPID_PRIVATE_KEY:-}
+      VAPID_SUBJECT: ${VAPID_SUBJECT:-mailto:owner@example.com}
+    volumes:
+      - ${DATA_ROOT}:${DATA_ROOT}
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks: [control, web]
+    depends_on:
+      db: { condition: service_healthy }
+    healthcheck:
+      test:
+        [
+          CMD,
+          node,
+          -e,
+          "fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    environment:
+      SITE_ADDRESS: ${SITE_ADDRESS:?Run ops/install.sh first}
+    ports:
+      - "${HTTP_BIND:-0.0.0.0}:80:80"
+      - "${HTTPS_BIND:-0.0.0.0}:443:443"
+    volumes:
+      - ./ops/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks: [web]
+    depends_on:
+      server: { condition: service_healthy }
+  runner-image:
+    build: { context: ., target: runner }
+    image: ai-workspace-runner:0.1.0
+    profiles: [build]
+    network_mode: none
+volumes:
+  postgres:
+  caddy_data:
+  caddy_config:
+networks:
+  control: { internal: true }
+  web:

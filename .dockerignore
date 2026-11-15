@@ -1,0 +1,12 @@
+node_modules
+dist
+.git
+.env
+.data
+backups
+.wikillm
+.backup-key
+.install-mode
+.env.*
+
+.data.before-restore-*/

@@ -1,0 +1,15 @@
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+.data/
+backups/
+coverage/
+*.log
+.DS_Store
+.wikillm/
+.install-mode
+.backup-key
+
+.data.before-restore-*/

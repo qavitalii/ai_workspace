@@ -1,0 +1,28 @@
+name: Checks
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: workspace
+          POSTGRES_PASSWORD: workspace
+          POSTGRES_DB: workspace
+        ports: ["54329:5432"]
+        options: --health-cmd 'pg_isready -U workspace' --health-interval 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm }
+      - run: npm ci
+      - run: npm run build
+      - run: npm test
+        env:
+          INTEGRATION_TESTS: "1"
+          DATABASE_URL: postgres://workspace:workspace@127.0.0.1:54329/workspace
+      - run: bash -n ops/*.sh
+      - run: docker build --target server .
