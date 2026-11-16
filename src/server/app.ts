@@ -33,6 +33,17 @@ import {
   pushBranch,
   projectToken,
 } from "./git.js";
+const effortSchema = z.enum([
+  "",
+  "none",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+  "ultra",
+]);
 const uuid = z.string().uuid();
 const projectFields =
   "id,name,repo,base_branch,created_at,(github_token <> '') AS github_configured";
@@ -451,19 +462,7 @@ export async function createApp() {
     provider: z.enum(["codex", "claude"]),
     account_id: uuid,
     model: z.string().max(100).default(""),
-    effort: z
-      .enum([
-        "",
-        "none",
-        "minimal",
-        "low",
-        "medium",
-        "high",
-        "xhigh",
-        "max",
-        "ultra",
-      ])
-      .default(""),
+    effort: effortSchema.default(""),
     autonomous: z.boolean().default(false),
     handoff: z.enum(["manual", "auto"]).default("manual"),
   });
@@ -550,16 +549,7 @@ export async function createApp() {
       .object({
         title: z.string().min(1).max(160),
         model: z.string().max(100),
-        effort: z.enum([
-          "",
-          "none",
-          "minimal",
-          "low",
-          "medium",
-          "high",
-          "xhigh",
-          "max",
-        ]),
+        effort: effortSchema,
         autonomous: z.boolean(),
         handoff: z.enum(["manual", "auto"]),
       })

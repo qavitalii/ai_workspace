@@ -160,6 +160,26 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
     expect(result.statusCode).toBe(200);
     expect(result.json().model).toBe("gpt-6.1");
     expect(result.json().effort).toBe("ultra");
+    const updated = await app.inject({
+      method: "PATCH",
+      url: `/api/chats/${result.json().id}`,
+      headers,
+      payload: {
+        title: "Renamed chat",
+        model: "gpt-6.1",
+        effort: "ultra",
+        autonomous: false,
+        handoff: "manual",
+      },
+    });
+    expect(updated.statusCode).toBe(200);
+    expect(
+      (
+        await db.query("SELECT effort,title FROM chats WHERE id=$1", [
+          result.json().id,
+        ])
+      ).rows[0],
+    ).toEqual({ effort: "ultra", title: "Renamed chat" });
   });
   it("creates unnamed chats and titles them once from the first message", async () => {
     const created = await app.inject({
