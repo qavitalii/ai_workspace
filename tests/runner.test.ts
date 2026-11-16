@@ -5,7 +5,7 @@ import { randomUUID } from "node:crypto";
 import path from "node:path";
 import type { RunInput } from "../src/shared";
 
-async function run(input: RunInput) {
+async function run(input: RunInput | { type: "usage"; provider: "codex" }) {
   const name = "workspace-protocol-" + randomUUID();
   const proc = spawn(
     "docker",
@@ -57,7 +57,7 @@ async function run(input: RunInput) {
               ),
             }) + "\n",
           );
-        if (e.type === "completed") {
+        if (e.type === "completed" || e.type === "limits_read") {
           clearTimeout(timer);
           resolve();
         }
@@ -66,7 +66,10 @@ async function run(input: RunInput) {
           reject(new Error(JSON.stringify(events)));
         }
       });
-      proc.stdin.write(JSON.stringify({ type: "start", input }) + "\n");
+      proc.stdin.write(
+        JSON.stringify("type" in input ? input : { type: "start", input }) +
+          "\n",
+      );
     });
     return events;
   } finally {
@@ -79,6 +82,11 @@ async function run(input: RunInput) {
 it.skipIf(process.env.DOCKER_TESTS !== "1")(
   "bridges native plans, questions, execution mode, compaction and review without inference",
   async () => {
+    const usage = await run({ type: "usage", provider: "codex" });
+    expect(
+      usage.find((e) => e.type === "limits_read").limits.rateLimits.primary
+        .usedPercent,
+    ).toBe(25);
     const base: RunInput = {
       provider: "codex",
       prompt: "Plan the task",
@@ -90,6 +98,10 @@ it.skipIf(process.env.DOCKER_TESTS !== "1")(
       plan.some((e) => e.type === "delta" && e.text.includes("verified plan")),
     ).toBe(true);
     expect(plan.some((e) => e.type === "request_resolved")).toBe(true);
+    expect(plan.find((e) => e.type === "model")).toMatchObject({
+      model: "catalog-model",
+      effort: "high",
+    });
     await run({ ...base, mode: "default", sessionId: "thread-test" });
     const compact = await run({
       ...base,
@@ -101,6 +113,12 @@ it.skipIf(process.env.DOCKER_TESTS !== "1")(
     );
     await run({ ...base, operation: "review", prompt: "" });
     const claude = await run({ ...base, provider: "claude", mode: "plan" });
+    expect(claude.find((e) => e.type === "model").model).toBe(
+      "claude-fixture-model",
+    );
+    expect(claude.find((e) => e.type === "limits").limits.utilization).toBe(
+      0.2,
+    );
     expect(claude.find((e) => e.type === "commands").commands).toContain(
       "custom-skill",
     );

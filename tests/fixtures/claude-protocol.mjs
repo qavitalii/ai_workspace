@@ -14,8 +14,18 @@ createInterface({ input: process.stdin }).on("line", async (line) => {
     send({
       type: "system",
       subtype: "init",
+      model: "claude-fixture-model",
       session_id: "claude-test",
       slash_commands: ["compact", "context", "custom-skill"],
+    });
+    send({
+      type: "rate_limit_event",
+      rate_limit_info: {
+        status: "allowed",
+        rateLimitType: "five_hour",
+        utilization: 0.2,
+        resetsAt: 2000000000,
+      },
     });
     const response = await fetch("http://127.0.0.1:47831/approve", {
       method: "POST",

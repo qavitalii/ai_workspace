@@ -1,3 +1,4 @@
+import { saveUsage } from "./usage.js";
 import { slashCommand } from "../commands.js";
 import { foldersBusy, chatFolders } from "./folders.js";
 import { randomUUID } from "node:crypto";
@@ -90,7 +91,6 @@ async function run(job: any) {
     if (finished) return;
     finished = true;
     await runtime?.stop();
-    active.delete(job.id);
     if (text)
       await db.query(
         "INSERT INTO messages(id,chat_id,role,content) VALUES($1,$2,$3,$4)",
@@ -120,6 +120,7 @@ async function run(job: any) {
       state === "completed" ? "Task completed" : "Needs attention",
       chat.title,
     );
+    active.delete(job.id);
   }
   async function handle(e: AgentEvent) {
     if (finished) return;
@@ -155,14 +156,12 @@ async function run(job: any) {
         "UPDATE chats SET session_id=$2,session_account=$3 WHERE id=$1",
         [chat.id, e.id, job.account_id],
       );
-    if (e.type === "limits") {
-      const reset = e.limits?.primary?.resetsAt || e.limits?.resetsAt;
-      await db.query("UPDATE accounts SET limits=$2,reset_at=$3 WHERE id=$1", [
-        job.account_id,
-        e.limits,
-        typeof reset === "number" ? new Date(reset * 1000) : null,
-      ]);
-    }
+    if (e.type === "limits") await saveUsage(job.account_id, e.limits);
+    if (e.type === "model" && typeof e.model === "string")
+      await db.query(
+        "UPDATE chats SET resolved_model=$2,resolved_effort=$3 WHERE id=$1",
+        [chat.id, e.model, e.effort || ""],
+      );
     if (e.type === "commands")
       await db.query("UPDATE chats SET native_commands=$2 WHERE id=$1", [
         chat.id,
@@ -387,7 +386,7 @@ export async function switchAccount(
         { statusCode: 409 },
       );
     await c.query(
-      "UPDATE chats SET account_id=$2,session_id=NULL,session_account=NULL WHERE id=$1",
+      "UPDATE chats SET account_id=$2,session_id=NULL,session_account=NULL,resolved_model='',resolved_effort='' WHERE id=$1",
       [chatId, accountId],
     );
     if (jobId)

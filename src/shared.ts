@@ -34,6 +34,7 @@ export type RunnerCommand =
   | { type: "auth"; provider: Provider }
   | { type: "logout"; provider: Provider }
   | { type: "auth_input"; data: string }
+  | { type: "usage"; provider: Provider }
   | { type: "models"; provider: Provider };
 export function quotaError(code: unknown): boolean {
   return [

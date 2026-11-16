@@ -1,3 +1,4 @@
+import { Select } from "./Select";
 import { useEffect, useRef, useState } from "react";
 import { Folder, Upload, Unplug } from "lucide-react";
 import { api } from "./api";
@@ -152,12 +153,16 @@ export function Folders({
       ))}
       <label className="field">
         <span>Server folder</span>
-        <select value={selected} onChange={(e) => setSelected(e.target.value)}>
+        <Select
+          aria-label="Server folder"
+          value={selected}
+          onChange={(e) => setSelected(e.target.value)}
+        >
           <option value="">Choose a folder</option>
           {available.map((name) => (
             <option key={name}>{name}</option>
           ))}
-        </select>
+        </Select>
       </label>
       <div className="folder-create">
         <input
@@ -184,13 +189,14 @@ export function Folders({
       </div>
       <label className="field">
         <span>Agent access</span>
-        <select
+        <Select
+          aria-label="Agent access"
           value={readOnly ? "ro" : "rw"}
           onChange={(e) => setReadOnly(e.target.value === "ro")}
         >
           <option value="ro">Read only</option>
           <option value="rw">Read & write</option>
-        </select>
+        </Select>
       </label>
       {!readOnly && (
         <p className="muted">

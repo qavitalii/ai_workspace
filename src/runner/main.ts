@@ -213,6 +213,11 @@ async function runCodex(input: RunInput) {
   );
   threadId = r.thread.id;
   emit({ type: "session", id: threadId });
+  emit({
+    type: "model",
+    model: r.model,
+    effort: input.effort || r.reasoningEffort || "",
+  });
   if (input.operation === "compact") {
     compacting = true;
     await rpc("thread/compact/start", { threadId });
@@ -359,6 +364,8 @@ async function runClaude(input: RunInput) {
       Array.isArray(m.slash_commands)
     )
       emit({ type: "commands", commands: m.slash_commands });
+    if (m.type === "system" && m.subtype === "init" && m.model)
+      emit({ type: "model", model: m.model, effort: input.effort || "" });
     if (m.type === "system" && m.session_id)
       emit({ type: "session", id: m.session_id });
     if (m.type === "stream_event") {
@@ -485,6 +492,15 @@ createInterface({ input: process.stdin }).on("line", async (line) => {
       );
     }
     if (c.type === "auth_input") terminal?.write(c.data);
+    if (c.type === "usage") {
+      if (c.provider !== "codex")
+        throw new Error("Usage is reported during Claude tasks.");
+      await codex();
+      emit({
+        type: "limits_read",
+        limits: await rpc("account/rateLimits/read", {}),
+      });
+    }
     if (c.type === "models") {
       if (c.provider === "codex") {
         await codex();

@@ -8,7 +8,7 @@ export function Terminal({ chatId }: { chatId: string }) {
   useEffect(() => {
     const t = new XTerminal({
       theme: { background: "#171b19", foreground: "#e3e9e5" },
-      fontSize: 13,
+      fontSize: 14,
       cursorBlink: true,
       convertEol: true,
     });

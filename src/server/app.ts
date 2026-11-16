@@ -1,4 +1,5 @@
 import { commandsFor, slashCommand } from "../commands.js";
+import { accountUsage } from "./usage.js";
 import { accountModels } from "./models.js";
 import { chatFolders } from "./folders.js";
 import { folderRoutes } from "./folder-routes.js";
@@ -13,7 +14,7 @@ import { inspectWorkspace } from "./files.js";
 import { acquireWorkspace, releaseWorkspace } from "./leases.js";
 import { randomUUID } from "node:crypto";
 import { createReadStream, createWriteStream } from "node:fs";
-import { mkdir, unlink, stat } from "node:fs/promises";
+import { mkdir, unlink, stat, rm } from "node:fs/promises";
 import { pipeline } from "node:stream/promises";
 import path from "node:path";
 import { z } from "zod";
@@ -23,7 +24,7 @@ import { config } from "./config.js";
 import { bus, event } from "./events.js";
 import { safeName, seal, redact } from "./security.js";
 import { normalizeGithubRepo } from "../shared.js";
-import { concurrentTasks } from "./settings.js";
+import { concurrentTasks, modelDefaults } from "./settings.js";
 import { createResourceMonitor } from "./resources.js";
 import { disconnectAccount } from "./accounts.js";
 import { active, switchAccount } from "./worker.js";
@@ -145,6 +146,7 @@ export async function createApp() {
   });
   folderRoutes(app);
   app.get("/api/overview", async () => ({
+    modelDefaults: await modelDefaults(),
     projects: (
       await db.query(
         "SELECT " + projectFields + " FROM projects ORDER BY created_at DESC",
@@ -183,6 +185,23 @@ export async function createApp() {
       queued: jobs.rows[0].queued,
       waitingAccounts: jobs.rows[0].waiting_accounts,
     };
+  });
+  app.get("/api/settings/models", async () => modelDefaults());
+  app.post("/api/settings/models/:provider", async (req) => {
+    const provider = z
+      .enum(["codex", "claude"])
+      .parse((req.params as any).provider);
+    const value = z
+      .object({
+        model: z.string().trim().min(1).max(100),
+        effort: effortSchema.default(""),
+      })
+      .parse(req.body);
+    await db.query(
+      "INSERT INTO settings(key,value) VALUES($1,$2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+      ["model_default_" + provider, JSON.stringify(value)],
+    );
+    return { ok: true };
   });
   app.post("/api/settings/execution", async (req) => {
     const { maxConcurrent } = z
@@ -399,6 +418,7 @@ export async function createApp() {
     );
     return { ok: true };
   });
+  app.post("/api/accounts/:id/usage", async (req) => accountUsage(idOf(req)));
   app.post("/api/accounts/:id/models", async (req) => {
     const p = z
       .object({ refresh: z.boolean().default(false) })
@@ -417,6 +437,12 @@ export async function createApp() {
   });
   app.post("/api/chats", async (req) => {
     const c = chatSchema.parse(req.body);
+    const defaults = (await modelDefaults())[c.provider];
+    if (!c.model && defaults) {
+      c.model = defaults.model;
+      if (!(req.body as any).effort)
+        c.effort = effortSchema.parse(defaults.effort);
+    }
     if (c.handoff === "auto" && !config.autoHandoff)
       throw Object.assign(
         new Error(
@@ -491,12 +517,119 @@ export async function createApp() {
       ).rows,
     };
   });
+  app.patch("/api/chats/:id/title", async (req) => {
+    const id = idOf(req);
+    const { title } = z
+      .object({ title: z.string().trim().min(1).max(160) })
+      .parse(req.body);
+    const result = await db.query(
+      "UPDATE chats SET title=$2,auto_title=false WHERE id=$1 RETURNING id,title",
+      [id, title],
+    );
+    if (!result.rowCount)
+      throw Object.assign(new Error("Chat not found"), { statusCode: 404 });
+    return result.rows[0];
+  });
+  app.delete("/api/chats/:id", async (req) => {
+    const id = idOf(req);
+    const attachments = await transaction(async (c) => {
+      // Serialize with the scheduler, terminal leases and new messages.
+      await c.query("SELECT pg_advisory_xact_lock(417028)");
+      if (
+        !(await c.query("SELECT id FROM chats WHERE id=$1 FOR UPDATE", [id]))
+          .rowCount
+      )
+        throw Object.assign(new Error("Chat not found"), { statusCode: 404 });
+      const jobs = (
+        await c.query("SELECT id,state FROM jobs WHERE chat_id=$1 FOR UPDATE", [
+          id,
+        ])
+      ).rows;
+      if (
+        jobs.some(
+          (j) =>
+            [
+              "queued",
+              "running",
+              "waiting_approval",
+              "waiting_account",
+            ].includes(j.state) || active.has(j.id),
+        )
+      )
+        throw Object.assign(
+          new Error("Stop the current task before deleting this chat."),
+          { statusCode: 409 },
+        );
+      if (
+        (await c.query("SELECT 1 FROM workspace_leases WHERE chat_id=$1", [id]))
+          .rowCount
+      )
+        throw Object.assign(
+          new Error(
+            "Close the terminal or wait for the file operation before deleting this chat.",
+          ),
+          { statusCode: 409 },
+        );
+      const files = (
+        await c.query("SELECT storage_name FROM attachments WHERE chat_id=$1", [
+          id,
+        ])
+      ).rows;
+      await c.query(
+        "DELETE FROM approvals WHERE job_id IN (SELECT id FROM jobs WHERE chat_id=$1)",
+        [id],
+      );
+      await c.query(
+        "DELETE FROM events WHERE chat_id=$1 OR job_id IN (SELECT id FROM jobs WHERE chat_id=$1)",
+        [id],
+      );
+      await c.query("DELETE FROM publications WHERE chat_id=$1", [id]);
+      await c.query("DELETE FROM jobs WHERE chat_id=$1", [id]);
+      await c.query("DELETE FROM attachments WHERE chat_id=$1", [id]);
+      await c.query("DELETE FROM messages WHERE chat_id=$1", [id]);
+      await c.query("DELETE FROM chats WHERE id=$1", [id]);
+      return files;
+    });
+    const cleanup = await Promise.allSettled([
+      rm(workspace(id), { recursive: true, force: true }),
+      ...attachments.map((f) =>
+        rm(path.join(config.data, "uploads", f.storage_name), { force: true }),
+      ),
+    ]);
+    const cleanupPending = cleanup.some((r) => r.status === "rejected");
+    if (cleanupPending)
+      app.log.error({ chatId: id }, "Deleted chat has files requiring cleanup");
+    return { ok: true, cleanupPending };
+  });
+  app.patch("/api/chats/:id/model", async (req) => {
+    const id = idOf(req);
+    const p = z
+      .object({
+        model: z.string().trim().min(1).max(100),
+        effort: effortSchema,
+      })
+      .parse(req.body);
+    await transaction(async (c) => {
+      await c.query("SELECT pg_advisory_xact_lock(417028)");
+      if (
+        !(await c.query("SELECT id FROM chats WHERE id=$1 FOR UPDATE", [id]))
+          .rowCount
+      )
+        throw Object.assign(new Error("Chat not found"), { statusCode: 404 });
+      await idle(id);
+      await c.query(
+        "UPDATE chats SET resolved_model=CASE WHEN model=$2 THEN resolved_model ELSE '' END,resolved_effort=CASE WHEN model=$2 AND effort=$3 THEN resolved_effort ELSE '' END,model=$2,effort=$3 WHERE id=$1",
+        [id, p.model, p.effort],
+      );
+    });
+    return { ok: true };
+  });
   app.patch("/api/chats/:id", async (req) => {
     const id = idOf(req);
     await idle(id);
     const p = z
       .object({
-        title: z.string().min(1).max(160),
+        title: z.string().trim().min(1).max(160),
         model: z.string().max(100),
         effort: effortSchema,
         autonomous: z.boolean(),
@@ -508,7 +641,7 @@ export async function createApp() {
         statusCode: 400,
       });
     await db.query(
-      "UPDATE chats SET title=$2,auto_title=false,model=$3,effort=$4,autonomous=$5,handoff=$6 WHERE id=$1",
+      "UPDATE chats SET title=$2,auto_title=false,resolved_model=CASE WHEN model=$3 THEN resolved_model ELSE '' END,resolved_effort=CASE WHEN model=$3 AND effort=$4 THEN resolved_effort ELSE '' END,model=$3,effort=$4,autonomous=$5,handoff=$6 WHERE id=$1",
       [id, p.title, p.model, p.effort, p.autonomous, p.handoff],
     );
     return { ok: true };

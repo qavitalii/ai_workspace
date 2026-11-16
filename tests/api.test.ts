@@ -1,3 +1,4 @@
+import { accountUsage, saveUsage } from "../src/server/usage";
 import { accountModels } from "../src/server/models";
 import {
   availableFolders,
@@ -84,6 +85,392 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
       "INSERT INTO chats(id,project_id,title,provider,account_id,branch) VALUES($1,$2,'Test','codex',$3,'workspace/test')",
       [chat, project, account],
     );
+  });
+  it("changes chat model and effort without changing title, permissions or global defaults", async () => {
+    await db.query(
+      "UPDATE chats SET model='old-model',effort='low',resolved_model='old-model',resolved_effort='low',autonomous=true,auto_title=true WHERE id=$1",
+      [chat],
+    );
+    const update = (payload: any, id = chat) =>
+      app.inject({
+        method: "PATCH",
+        url: `/api/chats/${id}/model`,
+        headers,
+        payload,
+      });
+    expect(
+      (await update({ model: "new-model", effort: "high" })).statusCode,
+    ).toBe(200);
+    expect(
+      (
+        await db.query(
+          "SELECT title,model,effort,resolved_model,resolved_effort,autonomous,auto_title,handoff FROM chats WHERE id=$1",
+          [chat],
+        )
+      ).rows[0],
+    ).toEqual({
+      title: "Test",
+      model: "new-model",
+      effort: "high",
+      resolved_model: "",
+      resolved_effort: "",
+      autonomous: true,
+      auto_title: true,
+      handoff: "manual",
+    });
+    expect(
+      (await update({ model: "new-model", effort: "medium" })).statusCode,
+    ).toBe(200);
+    expect((await update({ model: " ", effort: "high" })).statusCode).toBe(400);
+    expect(
+      (await update({ model: "new-model", effort: "invalid" })).statusCode,
+    ).toBe(400);
+    expect(
+      (await update({ model: "new-model", effort: "high" }, randomUUID()))
+        .statusCode,
+    ).toBe(404);
+    expect(
+      (await app.inject({ url: "/api/settings/models", headers })).json(),
+    ).toEqual({});
+    await app.inject({
+      method: "POST",
+      url: `/api/chats/${chat}/messages`,
+      headers,
+      payload: { content: "Task", client_id: randomUUID() },
+    });
+    expect(
+      (await update({ model: "new-model", effort: "low" })).statusCode,
+    ).toBe(409);
+  });
+  it("applies global model defaults only to new chats and respects per-chat overrides", async () => {
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: "/api/settings/models/codex",
+          headers,
+          payload: { model: "global-model", effort: "high" },
+        })
+      ).statusCode,
+    ).toBe(200);
+    const create = (extra: any = {}) =>
+      app.inject({
+        method: "POST",
+        url: "/api/chats",
+        headers,
+        payload: { provider: "codex", account_id: account, ...extra },
+      });
+    const first = (await create()).json();
+    expect(first).toMatchObject({ model: "global-model", effort: "high" });
+    expect(
+      (await create({ model: "override-model", effort: "low" })).json(),
+    ).toMatchObject({ model: "override-model", effort: "low" });
+    await app.inject({
+      method: "POST",
+      url: "/api/settings/models/codex",
+      headers,
+      payload: { model: "next-model", effort: "medium" },
+    });
+    expect((await create()).json()).toMatchObject({
+      model: "next-model",
+      effort: "medium",
+    });
+    expect(
+      (await db.query("SELECT model,effort FROM chats WHERE id=$1", [first.id]))
+        .rows[0],
+    ).toEqual({ model: "global-model", effort: "high" });
+    expect(
+      (await db.query("SELECT model FROM chats WHERE id=$1", [chat])).rows[0]
+        .model,
+    ).toBe("");
+    expect(
+      (await app.inject({ url: "/api/settings/models", headers })).json(),
+    ).toEqual({ codex: { model: "next-model", effort: "medium" } });
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: "/api/settings/models/claude",
+          headers,
+          payload: { model: "claude-specific", effort: "low" },
+        })
+      ).statusCode,
+    ).toBe(200);
+    expect(
+      (await app.inject({ url: "/api/overview", headers })).json().modelDefaults
+        .claude.model,
+    ).toBe("claude-specific");
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: "/api/settings/models/codex",
+          headers,
+          payload: { model: "  " },
+        })
+      ).statusCode,
+    ).toBe(400);
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: "/api/settings/models/codex",
+          headers: { origin },
+          payload: { model: "no-auth" },
+        })
+      ).statusCode,
+    ).toBe(401);
+  });
+  it("renames an active chat without changing model settings or allowing auto-title to overwrite it", async () => {
+    await db.query(
+      "UPDATE chats SET auto_title=true,model='chosen-model',effort='high' WHERE id=$1",
+      [chat],
+    );
+    await app.inject({
+      method: "POST",
+      url: `/api/chats/${chat}/messages`,
+      headers,
+      payload: { content: "Task", client_id: randomUUID() },
+    });
+    const renamed = await app.inject({
+      method: "PATCH",
+      url: `/api/chats/${chat}/title`,
+      headers,
+      payload: { title: "  My name  " },
+    });
+    expect(renamed.statusCode).toBe(200);
+    expect(
+      (
+        await db.query(
+          "SELECT title,auto_title,model,effort FROM chats WHERE id=$1",
+          [chat],
+        )
+      ).rows[0],
+    ).toEqual({
+      title: "My name",
+      auto_title: false,
+      model: "chosen-model",
+      effort: "high",
+    });
+    for (const title of ["  ", "a".repeat(161)])
+      expect(
+        (
+          await app.inject({
+            method: "PATCH",
+            url: `/api/chats/${chat}/title`,
+            headers,
+            payload: { title },
+          })
+        ).statusCode,
+      ).toBe(400);
+    expect(
+      (
+        await app.inject({
+          method: "PATCH",
+          url: `/api/chats/${randomUUID()}/title`,
+          headers,
+          payload: { title: "Missing" },
+        })
+      ).statusCode,
+    ).toBe(404);
+  });
+  it("deletes chat history and private files while preserving shared folders and account", async () => {
+    const mid = randomUUID(),
+      jid = randomUUID();
+    const project = (
+      await db.query("SELECT project_id FROM chats WHERE id=$1", [chat])
+    ).rows[0].project_id;
+    await db.query(
+      "INSERT INTO messages(id,chat_id,role,content) VALUES($1,$2,'user','Delete me')",
+      [mid, chat],
+    );
+    await db.query(
+      "INSERT INTO jobs(id,chat_id,message_id,state) VALUES($1,$2,$3,'completed')",
+      [jid, chat, mid],
+    );
+    await db.query(
+      "INSERT INTO approvals(id,job_id,request_id,description) VALUES($1,$2,'r','Approval')",
+      [randomUUID(), jid],
+    );
+    await event(chat, jid, "status", { state: "completed" });
+    await db.query(
+      "INSERT INTO publications(id,chat_id,kind,status) VALUES($1,$2,'commit','done')",
+      [randomUUID(), chat],
+    );
+    const storage = randomUUID() + "-upload.txt";
+    await db.query(
+      "INSERT INTO attachments(id,chat_id,message_id,name,mime,size,storage_name,client_id) VALUES($1,$2,$3,'upload.txt','text/plain',4,$4,$5)",
+      [randomUUID(), chat, mid, storage, randomUUID()],
+    );
+    await db.query(
+      "INSERT INTO folder_links(id,name,chat_id) VALUES($1,'keep-shared',$2)",
+      [randomUUID(), chat],
+    );
+    await db.query(
+      "INSERT INTO folder_links(id,name,project_id) VALUES($1,'keep-project',$2)",
+      [randomUUID(), project],
+    );
+    for (const dir of [
+      path.join(data, "workspaces", chat),
+      path.join(data, "uploads"),
+      path.join(data, "shared", "keep-shared"),
+    ])
+      await mkdir(dir, { recursive: true });
+    await writeFile(path.join(data, "uploads", storage), "file");
+    await writeFile(
+      path.join(data, "workspaces", chat, "private.txt"),
+      "private",
+    );
+    const result = await app.inject({
+      method: "DELETE",
+      url: `/api/chats/${chat}`,
+      headers,
+    });
+    expect(result.statusCode).toBe(200);
+    expect(result.json().cleanupPending).toBe(false);
+    for (const table of [
+      "chats",
+      "jobs",
+      "messages",
+      "attachments",
+      "approvals",
+      "events",
+      "publications",
+    ])
+      expect((await db.query(`SELECT * FROM ${table}`)).rowCount).toBe(0);
+    expect((await db.query("SELECT * FROM accounts")).rowCount).toBe(1);
+    expect((await db.query("SELECT * FROM projects")).rowCount).toBe(1);
+    expect((await db.query("SELECT name FROM folder_links")).rows).toEqual([
+      { name: "keep-project" },
+    ]);
+    await expect(access(path.join(data, "workspaces", chat))).rejects.toThrow();
+    await expect(access(path.join(data, "uploads", storage))).rejects.toThrow();
+    await access(path.join(data, "shared", "keep-shared"));
+    expect(
+      (
+        await app.inject({
+          method: "DELETE",
+          url: `/api/chats/${chat}`,
+          headers,
+        })
+      ).statusCode,
+    ).toBe(404);
+    expect(
+      (await app.inject({ url: "/api/overview", headers })).json().chats,
+    ).toEqual([]);
+    expect(
+      (await app.inject({ url: "/api/search?q=Delete", headers })).json(),
+    ).toEqual([]);
+  });
+  it("rejects deletion while a task or terminal owns the workspace", async () => {
+    await acquireWorkspace(chat, "terminal");
+    expect(
+      (
+        await app.inject({
+          method: "DELETE",
+          url: `/api/chats/${chat}`,
+          headers,
+        })
+      ).statusCode,
+    ).toBe(409);
+    await releaseWorkspace(chat);
+    const mid = randomUUID(),
+      jid = randomUUID();
+    await db.query(
+      "INSERT INTO messages(id,chat_id,role,content) VALUES($1,$2,'user','Keep me')",
+      [mid, chat],
+    );
+    await db.query("INSERT INTO jobs(id,chat_id,message_id) VALUES($1,$2,$3)", [
+      jid,
+      chat,
+      mid,
+    ]);
+    for (const state of [
+      "queued",
+      "running",
+      "waiting_approval",
+      "waiting_account",
+    ]) {
+      await db.query("UPDATE jobs SET state=$2 WHERE id=$1", [jid, state]);
+      expect(
+        (
+          await app.inject({
+            method: "DELETE",
+            url: `/api/chats/${chat}`,
+            headers,
+          })
+        ).statusCode,
+      ).toBe(409);
+    }
+    expect(
+      (await db.query("SELECT * FROM messages WHERE id=$1", [mid])).rowCount,
+    ).toBe(1);
+    expect(
+      (
+        await app.inject({
+          method: "DELETE",
+          url: `/api/chats/${chat}`,
+          headers: { origin },
+        })
+      ).statusCode,
+    ).toBe(401);
+  });
+  it("saves all Claude windows, timestamps reports and waits for every exhausted limit to reset", async () => {
+    await saveUsage(account, {
+      rateLimitType: "five_hour",
+      utilization: 1,
+      resetsAt: 2000000000,
+    });
+    await saveUsage(account, {
+      rateLimitType: "seven_day",
+      utilization: 1,
+      resetsAt: 2000100000,
+    });
+    const saved = (
+      await db.query("SELECT * FROM accounts WHERE id=$1", [account])
+    ).rows[0];
+    expect(Object.keys(saved.limits.windows)).toEqual([
+      "five_hour",
+      "seven_day",
+    ]);
+    expect(saved.reset_at.getTime()).toBe(2000100000000);
+    expect(saved.limits_updated_at).toBeTruthy();
+  });
+  it("refreshes Codex usage once per account without inference and releases the account on failure", async () => {
+    const start = vi.fn(async (_chat, _id, emit) => ({
+      id: "usage-test",
+      send: () =>
+        emit({
+          type: "limits_read",
+          limits: {
+            rateLimits: {
+              primary: { usedPercent: 25, windowDurationMins: 300 },
+            },
+          },
+        }),
+      stop: async () => {},
+    }));
+    const [a, b] = await Promise.all([
+      accountUsage(account, start),
+      accountUsage(account, start),
+    ]);
+    expect(a.limits).toEqual(b.limits);
+    expect(start).toHaveBeenCalledTimes(1);
+    expect(
+      (await db.query("SELECT status FROM accounts WHERE id=$1", [account]))
+        .rows[0].status,
+    ).toBe("ready");
+    await expect(
+      accountUsage(account, async (_chat, _id, emit) => ({
+        id: "usage-fail",
+        send: () => emit({ type: "failed" }),
+        stop: async () => {},
+      })),
+    ).rejects.toThrow("unavailable");
+    expect(
+      (await db.query("SELECT status FROM accounts WHERE id=$1", [account]))
+        .rows[0].status,
+    ).toBe("ready");
   });
   it("deduplicates model loading and serves a cached catalog while the account is busy", async () => {
     const models = [

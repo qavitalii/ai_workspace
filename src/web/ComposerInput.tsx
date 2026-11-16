@@ -11,6 +11,7 @@ export function ComposerInput({
   onSend,
   onCommand,
   drag,
+  busy,
 }: {
   chatId: string;
   commands: ChatCommand[];
@@ -21,6 +22,7 @@ export function ComposerInput({
   onSend: () => void;
   onCommand: (name: string) => void;
   drag: boolean;
+  busy: boolean;
 }) {
   const input = useRef<HTMLTextAreaElement>(null);
   const [cursor, setCursor] = useState(0),
@@ -29,6 +31,12 @@ export function ComposerInput({
     [entries, setEntries] = useState<any[]>([]),
     [loading, setLoading] = useState(false),
     [error, setError] = useState("");
+  useEffect(() => {
+    if (!input.current) return;
+    input.current.style.height = "auto";
+    input.current.style.height =
+      Math.min(input.current.scrollHeight, 180) + "px";
+  }, [value]);
   const match = value.slice(0, cursor).match(/(?:^|\s)([/@$])([^\s]*)$/);
   const symbol = match?.[1],
     query = match?.[2]?.toLowerCase() || "";
@@ -184,10 +192,13 @@ export function ComposerInput({
         placeholder={
           drag
             ? "Drop your files here…"
-            : "Message your agent · / commands · @ files · $ skills"
+            : busy
+              ? "Write your next message while the agent works…"
+              : "Describe a task or ask a question…"
         }
-        rows={3}
+        rows={2}
         onKeyDown={(e) => {
+          if (e.nativeEvent.isComposing) return;
           if (open && e.key === "Escape") {
             e.preventDefault();
             setDismissed(true);
@@ -218,9 +229,15 @@ export function ComposerInput({
             choose(options[index]);
             return;
           }
-          if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+          if (
+            e.key === "Enter" &&
+            !e.shiftKey &&
+            (e.metaKey ||
+              e.ctrlKey ||
+              matchMedia("(hover: hover) and (pointer: fine)").matches)
+          ) {
             e.preventDefault();
-            onSend();
+            if (!busy) onSend();
           }
         }}
       />

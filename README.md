@@ -37,7 +37,7 @@ If Docker is missing, the installer installs it using Docker's official installe
 1. Sign in with your password and a six-digit authenticator code.
 2. Open **Agent accounts**, add an account, and select **Connect**. For Codex, use **Copy code** and enter the device code on the official sign-in page. For Claude Code, follow the official CLI sign-in instructions.
 3. Optionally connect a GitHub project using `owner/repository` or `https://github.com/owner/repository`. Add that project's own fine-grained token for private repositories and publishing: **Contents: Read and write**, **Pull requests: Read and write**. Manage each project's token through its settings button or **Settings → Connections**.
-4. Create a chat and select an account. Keep **No repository — private workspace** for tasks without Git. No title is required: the first message supplies a short title, which you can rename in chat settings.
+4. Create a chat and select an account. Keep **No repository — private workspace** for tasks without Git. No title is required: the first message supplies a short title. Use the ⋯ button beside any chat to rename or delete it. Deleting a chat removes its history, attachments and private workspace after confirmation; shared folders and published GitHub branches are kept. Stop active tasks and close the terminal first.
 5. Describe a task. Attach files, drop them onto the composer, or paste an image.
 6. Review files and diffs. For repository chats, commit, push, and pull requests are separate actions. Open the terminal when the agent is idle.
 
@@ -106,3 +106,9 @@ The supervisor has Docker socket access and is a trusted component with administ
 Chat and project settings include **Folders**: upload files or directories, connect an existing server folder, select read-only or read/write access, browse/download files, and disconnect without deleting data. Project folders are inherited by its chats; shared writers are serialized. See [folder setup and external server paths](docs/deployment.md#8-files-and-connected-folders).
 
 Choose a model and reasoning effort before the first message or from the composer. Type `/` for Workspace commands, `@` for files/folders, and `$` for workspace skills. These are supported Workspace features, not a claim of complete parity with every native CLI command or plugin.
+
+### Chat models and account limits
+
+**Settings → Models** saves a starting model and thinking depth separately for Codex and Claude Code. New chats copy those values; existing chats keep their own settings. Override the model when creating a chat or in chat settings. The UI displays the provider-reported model once available, including the exact model behind a Claude alias. Older chats without a reported model show that it has not been reported yet.
+
+The sidebar labels each chat with its agent and model, and shows remaining limits for each account. Open **Details** for reset times and the last report timestamp. Codex limits can be refreshed without starting an inference task when the account is idle. Claude reports limits during tasks and may omit utilization; missing percentages are shown as unknown, never as a full balance. Expired windows require a fresh report. Credits or usage costs are not treated as subscription percentages.

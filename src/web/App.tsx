@@ -1,3 +1,10 @@
+import { Select } from "./Select";
+import { ChatModelPicker } from "./ChatModelPicker";
+import { ModelDefaults } from "./ModelDefaults";
+import { AccountUsage } from "./AccountUsage";
+import { modelLabel, effortLabel } from "../usage";
+import { SidebarNavigation } from "./Sidebar";
+import { WorkspaceHome } from "./WorkspaceHome";
 import { AgentQuestions } from "./AgentQuestions";
 import { GithubTokenHelp } from "./GithubTokenHelp";
 import { commandsFor, slashCommand } from "../commands";
@@ -22,9 +29,7 @@ import {
 import {
   ArrowUp,
   Plus,
-  Search,
   FolderGit2,
-  MessageSquare,
   Settings,
   PanelLeftClose,
   Menu,
@@ -48,8 +53,8 @@ import {
   Download,
   FileText,
   Image as ImageIcon,
-  Command,
   Activity,
+  CircleHelp,
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -88,30 +93,59 @@ function Modal({
   children,
   onClose,
   className = "",
+  error,
 }: {
   className?: string;
   title: string;
   children: ReactNode;
   onClose: () => void;
+  error?: string;
 }) {
+  const dialog = useRef<HTMLDialogElement>(null);
+  const errorNotice = useRef<HTMLParagraphElement>(null);
+  useEffect(() => {
+    if (error) errorNotice.current?.scrollIntoView({ block: "nearest" });
+  }, [error]);
+  useEffect(() => {
+    const element = dialog.current!;
+    element.showModal();
+    return () => element.close();
+  }, []);
   return (
-    <div className="modal-backdrop" onClick={onClose}>
-      <section
-        role="dialog"
-        aria-modal="true"
-        aria-label={title}
-        className={"modal " + className}
-        onClick={(e) => e.stopPropagation()}
-      >
-        <header>
-          <h2>{title}</h2>
-          <button className="icon" onClick={onClose} aria-label="Close">
-            <X size={20} />
-          </button>
-        </header>
-        {children}
-      </section>
-    </div>
+    <dialog
+      ref={dialog}
+      aria-label={title}
+      className={"modal " + className}
+      onCancel={(e) => {
+        e.preventDefault();
+        onClose();
+      }}
+      onClick={(e) => {
+        if (e.target === e.currentTarget) {
+          const bounds = e.currentTarget.getBoundingClientRect();
+          if (
+            e.clientX < bounds.left ||
+            e.clientX > bounds.right ||
+            e.clientY < bounds.top ||
+            e.clientY > bounds.bottom
+          )
+            onClose();
+        }
+      }}
+    >
+      <header>
+        <h2>{title}</h2>
+        <button className="icon" onClick={onClose} aria-label="Close">
+          <X size={20} />
+        </button>
+      </header>
+      {error && (
+        <p ref={errorNotice} className="inline-error" role="alert">
+          {error}
+        </p>
+      )}
+      {children}
+    </dialog>
   );
 }
 function Field({ label, children }: { label: string; children: ReactNode }) {
@@ -198,7 +232,7 @@ function Login({ onLogin }: { onLogin: () => void }) {
               autoComplete="one-time-code"
               pattern="[0-9]{6}"
               maxLength={6}
-              placeholder="000 000"
+              placeholder="6-digit code"
               required
             />
           </Field>
@@ -212,7 +246,7 @@ function Login({ onLogin }: { onLogin: () => void }) {
             Sign in to Workspace
           </button>
         </form>
-        <small>Private access · password + TOTP</small>
+        <small>Use the six-digit code from your authenticator app.</small>
       </section>
       <footer>
         <span className="dot" /> Running independently of your device
@@ -231,14 +265,22 @@ export function App() {
     [chatId, setChatId] = useState<string | null>(
       new URLSearchParams(location.search).get("chat"),
     ),
+    [projectId, setProjectId] = useState<string | null>(
+      new URLSearchParams(location.search).get("project"),
+    ),
+    [newProjectId, setNewProjectId] = useState<string | null>(null),
     [detail, setDetail] = useState<any>(null),
     [modal, setModal] = useState(""),
+    [editingChat, setEditingChat] = useState<any>(null),
+    [chatActionBusy, setChatActionBusy] = useState(false),
     [editingProject, setEditingProject] = useState<any>(null),
     [error, setError] = useState(""),
     [mobile, setMobile] = useState(false),
     [panel, setPanel] = useState(""),
     [query, setQuery] = useState(""),
     [results, setResults] = useState<any[]>([]),
+    [searching, setSearching] = useState(false),
+    [searchError, setSearchError] = useState(""),
     [streams, setStreams] = useState<Record<string, string>>({}),
     [liveLogs, setLiveLogs] = useState<any[]>([]),
     [connected, setConnected] = useState(false);
@@ -249,9 +291,91 @@ export function App() {
   const clientId = useRef(crypto.randomUUID()),
     fileInput = useRef<HTMLInputElement>(null),
     bottom = useRef<HTMLDivElement>(null),
+    nearBottom = useRef(true),
+    textDrafts = useRef<Record<string, string>>({}),
     currentChat = useRef(chatId);
   currentChat.current = chatId;
   const loadOverview = () => api("/overview").then(setOverview);
+  useEffect(() => {
+    if (chatId) textDrafts.current[chatId] = text;
+  }, [text]);
+  useEffect(() => {
+    setError("");
+  }, [modal]);
+  useEffect(() => {
+    function pop() {
+      const params = new URLSearchParams(location.search);
+      setChatId(params.get("chat"));
+      setProjectId(params.get("project"));
+      setDetail(null);
+      setPanel("");
+      setMobile(false);
+    }
+    window.addEventListener("popstate", pop);
+    return () => window.removeEventListener("popstate", pop);
+  }, []);
+  useEffect(() => {
+    const viewport = window.visualViewport;
+    function resize() {
+      if (viewport && viewport.scale === 1)
+        document.documentElement.style.setProperty(
+          "--app-height",
+          `${viewport.height}px`,
+        );
+    }
+    resize();
+    viewport?.addEventListener("resize", resize);
+    return () => {
+      viewport?.removeEventListener("resize", resize);
+      document.documentElement.style.removeProperty("--app-height");
+    };
+  }, []);
+  useEffect(() => {
+    const media = matchMedia("(max-width: 760px)");
+    const close = () => {
+      if (!media.matches) setMobile(false);
+    };
+    media.addEventListener("change", close);
+    return () => media.removeEventListener("change", close);
+  }, []);
+  useEffect(() => {
+    if (!mobile) return;
+    const previous = document.activeElement as HTMLElement;
+    const sidebar = document.querySelector<HTMLElement>(".sidebar")!;
+    const controls = () =>
+      Array.from(
+        sidebar.querySelectorAll<HTMLElement>("button, input, a[href]"),
+      ).filter((el) => !el.closest("[hidden]") && !el.hasAttribute("disabled"));
+    controls()[0]?.focus();
+    function keyboard(e: KeyboardEvent) {
+      if (e.key === "Escape") setMobile(false);
+      if (e.key !== "Tab" || document.querySelector("dialog[open]")) return;
+      const items = controls(),
+        first = items[0],
+        last = items[items.length - 1];
+      if (e.shiftKey && document.activeElement === first) {
+        e.preventDefault();
+        last?.focus();
+      }
+      if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault();
+        first?.focus();
+      }
+    }
+    document.addEventListener("keydown", keyboard);
+    return () => {
+      document.removeEventListener("keydown", keyboard);
+      if (previous?.isConnected && previous.getClientRects().length)
+        previous.focus();
+    };
+  }, [mobile]);
+  useEffect(() => {
+    if (!me?.ok) return;
+    const timer = setInterval(() => {
+      if (!document.hidden) void loadOverview().catch(() => {});
+    }, 15000);
+    return () => clearInterval(timer);
+  }, [me?.ok]);
   const loadDetail = async (id = chatId) => {
     if (id) {
       const d = await api("/chats/" + id);
@@ -284,8 +408,10 @@ export function App() {
     }
     setStreams({});
     setLiveLogs([]);
-    setText("");
+    setText(textDrafts.current[chatId] || "");
     setDrafts([]);
+    setConnected(false);
+    nearBottom.current = true;
     clientId.current = crypto.randomUUID();
     void loadDetail(chatId).catch((e) => setError(e.message));
     let ws: WebSocket,
@@ -297,8 +423,11 @@ export function App() {
       ws = new WebSocket(
         socketUrl("/events?chat_id=" + chatId + "&after=" + cursor),
       );
-      ws.onopen = () => setConnected(true);
+      ws.onopen = () => {
+        if (!dead) setConnected(true);
+      };
       ws.onmessage = (e) => {
+        if (dead) return;
         const ev = JSON.parse(e.data);
         if (BigInt(ev.id) <= BigInt(cursor)) return;
         cursor = ev.id;
@@ -316,6 +445,8 @@ export function App() {
             "handoff",
             "request_resolved",
             "commands",
+            "model",
+            "limits",
           ].includes(ev.type)
         ) {
           void loadDetail(chatId);
@@ -323,6 +454,7 @@ export function App() {
         }
       };
       ws.onclose = () => {
+        if (dead) return;
         setConnected(false);
         if (!dead) timer = setTimeout(connect, 1500);
       };
@@ -335,22 +467,47 @@ export function App() {
     };
   }, [me?.ok, chatId]);
   useEffect(() => {
-    bottom.current?.scrollIntoView({ behavior: "smooth" });
+    if (nearBottom.current) bottom.current?.scrollIntoView({ block: "end" });
   }, [detail?.messages.length, streams]);
   useEffect(() => {
-    if (!query.trim()) {
-      setResults([]);
-      return;
-    }
-    const t = setTimeout(
-      () =>
-        api("/search?q=" + encodeURIComponent(query))
-          .then(setResults)
-          .catch(() => {}),
-      250,
-    );
-    return () => clearTimeout(t);
-  }, [query]);
+    let active = true;
+    setResults([]);
+    setSearchError("");
+    setSearching(!!query.trim());
+    if (!query.trim()) return;
+    const t = setTimeout(() => {
+      const local = overview.chats.filter((c: any) =>
+        c.title.toLowerCase().includes(query.trim().toLowerCase()),
+      );
+      api("/search?q=" + encodeURIComponent(query.trim()))
+        .then((found) => {
+          if (!active) return;
+          const merged = [
+            ...local,
+            ...found.map((c: any) => ({
+              ...c,
+              ...overview.chats.find((item: any) => item.id === c.id),
+            })),
+          ];
+          setResults([...new Map(merged.map((c: any) => [c.id, c])).values()]);
+        })
+        .catch(() => {
+          if (active) {
+            setResults(local);
+            setSearchError(
+              "Message search is unavailable. Showing matching chat titles.",
+            );
+          }
+        })
+        .finally(() => {
+          if (active) setSearching(false);
+        });
+    }, 250);
+    return () => {
+      active = false;
+      clearTimeout(t);
+    };
+  }, [query, overview.chats]);
   const run = async (fn: () => Promise<any>) => {
     setError("");
     try {
@@ -360,9 +517,50 @@ export function App() {
     }
   };
   function selectChat(id: string) {
+    if (id !== chatId) setDetail(null);
     setChatId(id);
+    setProjectId(null);
     setMobile(false);
-    history.replaceState(null, "", "?chat=" + id);
+    setPanel("");
+    setError("");
+    history.pushState(null, "", "?chat=" + id);
+  }
+  function selectProject(id: string | null) {
+    setChatId(null);
+    setDetail(null);
+    setProjectId(id);
+    setMobile(false);
+    setPanel("");
+    setQuery("");
+    setError("");
+    history.pushState(null, "", id ? "?project=" + id : location.pathname);
+  }
+  function newChat(id: string | null = chat?.project_id || projectId) {
+    setNewProjectId(id);
+    setModal("chat");
+    setMobile(false);
+  }
+  async function manageChat(c: any, action: "rename" | "delete") {
+    if (action === "rename") {
+      await api(`/chats/${c.id}/title`, { title: c.title }, "PATCH");
+      setOverview((o: any) => ({
+        ...o,
+        chats: o.chats.map((item: any) =>
+          item.id === c.id ? { ...item, title: c.title } : item,
+        ),
+      }));
+      setDetail((d: any) =>
+        d?.chat.id === c.id ? { ...d, chat: { ...d.chat, title: c.title } } : d,
+      );
+      return;
+    }
+    setEditingChat(c);
+    setModal("delete-chat");
+    setMobile(false);
+  }
+  function projectSettings(p: any) {
+    setEditingProject(p);
+    setModal("project-settings");
   }
   async function addFiles(files: File[]) {
     if (!chatId) return;
@@ -423,13 +621,14 @@ export function App() {
       });
     if (["permissions", "rename"].includes(name)) setModal("chat-settings");
     if (["status", "usage"].includes(name)) setModal("chat-status");
-    if (name === "clear") setModal("chat");
+    if (name === "clear") newChat();
     if (name === "diff") setPanel("diff");
     if (name === "mention") setText("@");
     if (name === "skills") setText("$");
     if (name === "resume") setModal("resume-chat");
-    if (name === "new") setModal("chat");
-    if (name === "model" || name === "settings") setModal("chat-settings");
+    if (name === "new") newChat();
+    if (name === "model") setModal("chat-model");
+    if (name === "settings") setModal("chat-settings");
     if (name === "files" || name === "terminal") setPanel(name);
     if (name === "stop" && chatId)
       void run(async () => {
@@ -439,6 +638,7 @@ export function App() {
     if (name === "help") setModal("composer-help");
   }
   async function send() {
+    if (busy || sending) return;
     const shortcut = slashCommand(text);
     if (shortcut) {
       const selected = chatCommands.find((c) => c.name === shortcut.name);
@@ -475,15 +675,19 @@ export function App() {
     )
       return;
     setSending(true);
+    const sentChatId = chatId;
     try {
       await api(`/chats/${chatId}/messages`, {
         content: text,
         client_id: clientId.current,
         attachment_ids: drafts.map((f) => f.id),
       });
-      clientId.current = crypto.randomUUID();
-      setText("");
-      setDrafts([]);
+      textDrafts.current[sentChatId] = "";
+      if (currentChat.current === sentChatId) {
+        clientId.current = crypto.randomUUID();
+        setText("");
+        setDrafts([]);
+      }
       await loadDetail();
       await loadOverview();
     } catch (e: any) {
@@ -499,7 +703,13 @@ export function App() {
       ["queued", "running", "waiting_approval", "waiting_account"].includes(
         job.state,
       ),
-    project = overview.projects.find((p: any) => p.id === chat?.project_id),
+    project = overview.projects.find(
+      (p: any) =>
+        p.id ===
+        (chat?.project_id ||
+          overview.chats.find((c: any) => c.id === chatId)?.project_id ||
+          projectId),
+    ),
     account = overview.accounts.find((a: any) => a.id === chat?.account_id);
   if (loading)
     return (
@@ -511,7 +721,11 @@ export function App() {
   if (!me) return <Login onLogin={refresh} />;
   return (
     <div className="app">
-      <aside className={"sidebar " + (mobile ? "open" : "")}>
+      <aside
+        id="workspace-navigation"
+        aria-label="Workspace navigation"
+        className={"sidebar " + (mobile ? "open" : "")}
+      >
         <div className="brand">
           <Mark small />
           <strong>workspace</strong>
@@ -523,79 +737,26 @@ export function App() {
             <PanelLeftClose size={18} />
           </button>
         </div>
-        <button className="new-chat" onClick={() => setModal("chat")}>
-          <Plus size={18} />
-          New chat<span>⌘ N</span>
-        </button>
-        <div className="search">
-          <Search size={16} />
-          <input
-            placeholder="Search chats"
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-          />
-        </div>
-        <div className="sidebar-section">
-          <span>PROJECTS</span>
-          <button
-            className="icon"
-            aria-label="Add project"
-            onClick={() => setModal("project")}
-          >
-            <Plus size={16} />
-          </button>
-        </div>
-        <nav>
-          {overview.projects.map((p: any) => (
-            <div key={p.id} className="project-nav">
-              <FolderGit2 size={17} />
-              <span>{p.name}</span>
-              <span className="muted">
-                {
-                  overview.chats.filter((c: any) => c.project_id === p.id)
-                    .length
-                }
-              </span>
-              <button
-                className="icon"
-                aria-label={"Project settings: " + p.name}
-                title="Project settings"
-                onClick={() => {
-                  setEditingProject(p);
-                  setModal("project-settings");
-                }}
-              >
-                <Settings size={14} />
-              </button>
-            </div>
-          ))}
-          {!overview.projects.length && (
-            <button className="empty-link" onClick={() => setModal("project")}>
-              Connect a GitHub project <Plus size={14} />
-            </button>
-          )}
-        </nav>
-        <div className="sidebar-section">
-          <span>{query ? "RESULTS" : "RECENT CHATS"}</span>
-        </div>
-        <nav className="chat-nav">
-          {(query ? results : overview.chats).map((c: any, i: number) => (
-            <button
-              key={c.id + "-" + i}
-              className={chatId === c.id ? "selected" : ""}
-              onClick={() => selectChat(c.id)}
-            >
-              <MessageSquare size={16} />
-              <span>{c.title}</span>
-              {c.state === "running" && <span className="dot" />}
-            </button>
-          ))}
-          {!overview.chats.length && (
-            <p className="side-hint">
-              Your conversations with agents will appear here.
-            </p>
-          )}
-        </nav>
+        <SidebarNavigation
+          accounts={overview.accounts}
+          onRefreshAccounts={loadOverview}
+          projects={overview.projects}
+          chats={overview.chats}
+          chatId={chatId}
+          projectId={project?.id}
+          query={query}
+          results={results}
+          searching={searching}
+          searchError={searchError}
+          onQuery={setQuery}
+          onChat={selectChat}
+          onManage={manageChat}
+          onProject={selectProject}
+          onHome={() => selectProject(null)}
+          onNew={newChat}
+          onAddProject={() => setModal("project")}
+          onProjectSettings={projectSettings}
+        />
         <div className="sidebar-bottom">
           <button onClick={() => setModal("accounts")}>
             <Activity size={17} />
@@ -634,19 +795,26 @@ export function App() {
       {mobile && (
         <div className="sidebar-overlay" onClick={() => setMobile(false)} />
       )}
-      <main className="main">
+      <main className="main" inert={mobile || undefined}>
         <header className="topbar">
           <button
             className="icon mobile-only"
             aria-label="Open menu"
+            aria-expanded={mobile}
+            aria-controls="workspace-navigation"
             onClick={() => setMobile(true)}
           >
             <Menu size={20} />
           </button>
           <div className="breadcrumb">
-            <span>{project?.name || "Personal workspace"}</span>
+            <button
+              className="breadcrumb-project"
+              onClick={() => selectProject(chat ? project?.id || null : null)}
+            >
+              {chat ? project?.name || "Personal chats" : "Workspace"}
+            </button>
             <ChevronRight size={14} />
-            <strong>{chat?.title || "Overview"}</strong>
+            <strong>{chat?.title || project?.name || "Home"}</strong>
           </div>
           <div className="top-actions">
             {chat && (
@@ -655,25 +823,38 @@ export function App() {
                   {connected ? "Live" : "Connecting…"}
                 </span>
                 <button
-                  className={"icon " + (panel === "files" ? "active" : "")}
+                  className={
+                    "icon labeled-action " + (panel === "files" ? "active" : "")
+                  }
+                  aria-pressed={panel === "files"}
                   title="Files"
                   aria-label="Files"
                   onClick={() => setPanel(panel === "files" ? "" : "files")}
                 >
                   <Files size={18} />
+                  <span>Files</span>
                 </button>
                 {chat.project_id && (
                   <button
-                    className={"icon " + (panel === "diff" ? "active" : "")}
+                    className={
+                      "icon labeled-action " +
+                      (panel === "diff" ? "active" : "")
+                    }
+                    aria-pressed={panel === "diff"}
                     title="Changes"
                     aria-label="Changes"
                     onClick={() => setPanel(panel === "diff" ? "" : "diff")}
                   >
                     <GitBranch size={18} />
+                    <span>Changes</span>
                   </button>
                 )}
                 <button
-                  className={"icon " + (panel === "terminal" ? "active" : "")}
+                  className={
+                    "icon labeled-action " +
+                    (panel === "terminal" ? "active" : "")
+                  }
+                  aria-pressed={panel === "terminal"}
                   title="Terminal"
                   aria-label="Terminal"
                   onClick={() =>
@@ -681,12 +862,31 @@ export function App() {
                   }
                 >
                   <TerminalIcon size={18} />
+                  <span>Terminal</span>
+                </button>
+                <button
+                  className="icon labeled-action"
+                  title="Chat settings"
+                  aria-label="Chat settings"
+                  onClick={() => setModal("chat-settings")}
+                >
+                  <Settings size={18} />
+                  <span>Settings</span>
                 </button>
               </>
             )}
+            {!chat && (
+              <button
+                className="icon mobile-only"
+                aria-label="New chat"
+                onClick={() => newChat()}
+              >
+                <Plus size={20} />
+              </button>
+            )}
           </div>
         </header>
-        {error && (
+        {error && !modal && (
           <div role="alert" className="error-banner">
             {error}
             <button
@@ -698,47 +898,33 @@ export function App() {
             </button>
           </div>
         )}
-        {!chat ? (
-          <div className="welcome">
-            <div className="eyebrow">
-              <span className="dot" /> ALWAYS ON, READY WHEN YOU ARE
-            </div>
-            <div className="welcome-symbol">
-              <Command size={34} />
-            </div>
-            <h1>
-              Your ideas.
-              <br />
-              <span>Agents at work.</span>
-            </h1>
-            <p>
-              One home for Codex and Claude Code.
-              <br />
-              Start on your computer. Pick up from your phone.
-            </p>
-            <button className="primary" onClick={() => setModal("chat")}>
-              <Plus size={18} />
-              Start a new chat
-            </button>
-            <div className="welcome-cards">
-              <button onClick={() => setModal("project")}>
-                <FolderGit2 />
-                <strong>Connect a project</strong>
-                <span>Repositories and separate task branches</span>
-                <ChevronRight size={16} />
+        {chatId && !chat ? (
+          <div className="content-loading" role="status">
+            {error ? (
+              <button
+                className="secondary"
+                onClick={() => run(() => loadDetail())}
+              >
+                Retry loading chat
               </button>
-              <button onClick={() => setModal("accounts")}>
-                <ArrowRightLeft />
-                <strong>Add your accounts</strong>
-                <span>Codex and Claude Code, together</span>
-                <ChevronRight size={16} />
-              </button>
-            </div>
-            <div className="welcome-footer">
-              <ShieldCheck size={15} />
-              Your server. Your files. Your control.
-            </div>
+            ) : (
+              <>
+                <LoaderCircle className="spin" size={22} />
+                Loading chat…
+              </>
+            )}
           </div>
+        ) : !chat ? (
+          <WorkspaceHome
+            project={project}
+            overview={overview}
+            onNew={newChat}
+            onChat={selectChat}
+            onAccounts={() => setModal("accounts")}
+            onProject={selectProject}
+            onAddProject={() => setModal("project")}
+            onSettings={projectSettings}
+          />
         ) : (
           <div className={"workspace " + (panel ? "with-panel" : "")}>
             <section className="conversation">
@@ -746,11 +932,6 @@ export function App() {
                 <span className={"provider " + chat.provider}>
                   {chat.provider === "codex" ? "◈ Codex" : "✳ Claude Code"}
                 </span>
-                <button onClick={() => setModal("chat-settings")}>
-                  {chat.model || "Default model"}
-                  <ChevronDown size={13} />
-                </button>
-                <span className="meta-separator" />
                 <button onClick={() => setModal("switch")}>
                   {account?.name || "Account"}
                   <ArrowRightLeft size={13} />
@@ -774,7 +955,14 @@ export function App() {
                   </button>
                 </div>
               )}
-              <div className="messages">
+              <div
+                className="messages"
+                onScroll={(e) => {
+                  const el = e.currentTarget;
+                  nearBottom.current =
+                    el.scrollHeight - el.scrollTop - el.clientHeight < 100;
+                }}
+              >
                 {!detail.messages.length && (
                   <div className="chat-start">
                     <span className="agent-orb">
@@ -786,12 +974,55 @@ export function App() {
                       <br />
                       {chat.project_id
                         ? "A separate branch will be created for this chat."
-                        : "Your files stay in this chat’s own workspace. No Git repository required."}
+                        : "Your files and conversation stay together in this chat."}
                     </p>
                     <span className="branch-label">
                       <GitBranch size={14} />
                       {chat.project_id ? chat.branch : "Private workspace"}
                     </span>
+                  </div>
+                )}
+                {!detail.messages.length && (
+                  <div
+                    className="prompt-suggestions"
+                    aria-label="Ideas to get started"
+                  >
+                    {(chat.project_id
+                      ? [
+                          "Explain how this project works",
+                          "Find and help me fix a bug",
+                          "Help me plan a new feature",
+                        ]
+                      : [
+                          "Help me plan a project",
+                          "Review a file I attach",
+                          "Write a script for a task",
+                        ]
+                    ).map((prompt) => (
+                      <button
+                        key={prompt}
+                        onClick={() => {
+                          setText(prompt);
+                          document
+                            .querySelector<HTMLTextAreaElement>(
+                              ".composer textarea",
+                            )
+                            ?.focus();
+                        }}
+                      >
+                        {prompt}
+                        <ChevronRight size={15} />
+                      </button>
+                    ))}
+                  </div>
+                )}
+                {job?.state === "queued" && (
+                  <div className="run-notice" role="status">
+                    <strong>Task queued</strong>
+                    <p>
+                      Your task will start when an account and server capacity
+                      are available.
+                    </p>
                   </div>
                 )}
                 {detail.messages.map((m: any) => (
@@ -1023,6 +1254,7 @@ export function App() {
                     onSend={() => void send()}
                     onCommand={command}
                     drag={drag}
+                    busy={!!busy || sending}
                   />
                   {chat.mode === "plan" && (
                     <div className="plan-banner">
@@ -1074,13 +1306,24 @@ export function App() {
                       <ChevronDown size={12} />
                     </button>
                     <button
-                      className="permission-chip"
-                      onClick={() => setModal("chat-settings")}
+                      className="permission-chip model-chip"
+                      onClick={() => setModal("chat-model")}
                       title="Model and reasoning effort"
                     >
-                      {chat.model || "Default model"} ·{" "}
-                      {chat.effort || "Default effort"}
+                      <span>
+                        {modelLabel(chat)}
+                        {" · " +
+                          effortLabel(chat.resolved_effort || chat.effort)}
+                      </span>
                       <ChevronDown size={12} />
+                    </button>
+                    <button
+                      className="icon composer-help"
+                      aria-label="Commands and help"
+                      title="Commands and help"
+                      onClick={() => setModal("composer-help")}
+                    >
+                      <CircleHelp size={18} />
                     </button>
                     <span className="spacer" />
                     {busy ? (
@@ -1118,7 +1361,7 @@ export function App() {
                 </div>
                 <div className="composer-note">
                   <span>Your agent keeps working while you are offline.</span>
-                  <span>⌘ / Ctrl + Enter</span>
+                  <span>Enter to send · Shift + Enter for a new line</span>
                 </div>
               </div>
             </section>
@@ -1128,7 +1371,7 @@ export function App() {
                   <strong>
                     {
                       {
-                        files: "Project files",
+                        files: "Chat files",
                         diff: "Code changes",
                         terminal: "Terminal",
                       }[panel]
@@ -1136,9 +1379,10 @@ export function App() {
                   </strong>
                   <button
                     className="icon"
-                    aria-label="Close panel"
+                    aria-label="Back to chat"
                     onClick={() => setPanel("")}
                   >
+                    <span>Back to chat</span>
                     <X size={18} />
                   </button>
                 </header>
@@ -1162,33 +1406,25 @@ export function App() {
         )}
       </main>
       {modal === "chat-status" && chat && (
-        <Modal title="Chat status" onClose={() => setModal("")}>
+        <Modal error={error} title="Chat status" onClose={() => setModal("")}>
           <p>Agent: {chat.provider === "codex" ? "Codex" : "Claude Code"}</p>
           <p>
             Account:{" "}
             {overview.accounts.find((a: any) => a.id === chat.account_id)?.name}
           </p>
           <p>
-            Model: {chat.model || "Agent default"} · Reasoning:{" "}
-            {chat.effort || "Agent default"}
+            Model: {modelLabel(chat)} ·{" "}
+            {effortLabel(chat.resolved_effort || chat.effort)}
           </p>
           <p>
             Mode: {chat.mode === "plan" ? "Plan" : "Execution"} · Status:{" "}
             {job?.state || "Ready"}
           </p>
-          <p>Usage reported by the provider:</p>
-          <pre>
-            {JSON.stringify(
-              overview.accounts.find((a: any) => a.id === chat.account_id)
-                ?.limits || "No usage information reported yet.",
-              null,
-              2,
-            )}
-          </pre>
+          <AccountUsage account={account} refresh={loadOverview} />
         </Modal>
       )}
       {modal === "resume-chat" && (
-        <Modal title="Resume a chat" onClose={() => setModal("")}>
+        <Modal error={error} title="Resume a chat" onClose={() => setModal("")}>
           {overview.chats
             .filter((c: any) => c.provider === chat?.provider)
             .map((c: any) => (
@@ -1207,7 +1443,11 @@ export function App() {
         </Modal>
       )}
       {modal === "composer-help" && (
-        <Modal title="Commands and references" onClose={() => setModal("")}>
+        <Modal
+          error={error}
+          title="Commands and references"
+          onClose={() => setModal("")}
+        >
           {chatCommands.map((c) => (
             <p key={c.name}>
               <strong>/{c.name}</strong> — {c.description}
@@ -1231,17 +1471,26 @@ export function App() {
         </Modal>
       )}
       {modal === "project" && (
-        <Modal title="Connect a project" onClose={() => setModal("")}>
+        <Modal
+          error={error}
+          title="Connect a project"
+          onClose={() => setModal("")}
+        >
           <ConnectProject
-            onCreated={async () => {
+            onCreated={async (p: any) => {
               await loadOverview();
+              selectProject(p.id);
               setModal("");
             }}
           />
         </Modal>
       )}
       {modal === "project-settings" && editingProject && (
-        <Modal title="Project settings" onClose={() => setModal("")}>
+        <Modal
+          error={error}
+          title="Project settings"
+          onClose={() => setModal("")}
+        >
           <ProjectSettings
             project={editingProject}
             onSaved={async () => {
@@ -1253,9 +1502,10 @@ export function App() {
         </Modal>
       )}
       {modal === "chat" && (
-        <Modal title="New chat" onClose={() => setModal("")}>
+        <Modal error={error} title="New chat" onClose={() => setModal("")}>
           <NewChat
             overview={overview}
+            initialProjectId={newProjectId}
             me={me}
             onError={setError}
             onCreated={async (c: any) => {
@@ -1269,6 +1519,7 @@ export function App() {
       )}
       {modal === "accounts" && (
         <Modal
+          error={error}
           title="Agent accounts"
           onClose={() => {
             setModal("");
@@ -1284,6 +1535,7 @@ export function App() {
       )}
       {modal === "switch" && chat && (
         <Modal
+          error={error}
           title="Continue with another account"
           onClose={() => setModal("")}
         >
@@ -1316,8 +1568,99 @@ export function App() {
             ))}
         </Modal>
       )}
+      {modal === "delete-chat" && editingChat && (
+        <Modal
+          error={error}
+          title="Delete chat?"
+          className="chat-delete-modal"
+          onClose={() => {
+            if (!chatActionBusy) setModal("");
+          }}
+        >
+          <p>
+            Delete <strong>{editingChat.title}</strong> and all its messages,
+            attachments and private workspace files? This cannot be undone.
+          </p>
+          <p className="muted">
+            Connected shared folders, your project and published GitHub branches
+            are kept. Stop any active task and close its terminal first.
+          </p>
+          <div className="chat-dialog-actions">
+            <button
+              className="secondary"
+              autoFocus
+              disabled={chatActionBusy}
+              onClick={() => setModal("")}
+            >
+              Cancel
+            </button>
+            <button
+              className="danger-button"
+              disabled={chatActionBusy}
+              onClick={async () => {
+                if (chatActionBusy) return;
+                setChatActionBusy(true);
+                await run(async () => {
+                  const result = await api(
+                    `/chats/${editingChat.id}`,
+                    undefined,
+                    "DELETE",
+                  );
+                  delete textDrafts.current[editingChat.id];
+                  setOverview((o: any) => ({
+                    ...o,
+                    chats: o.chats.filter((c: any) => c.id !== editingChat.id),
+                  }));
+                  setResults((items) =>
+                    items.filter((c) => c.id !== editingChat.id),
+                  );
+                  if (currentChat.current === editingChat.id) {
+                    currentChat.current = null;
+                    selectProject(editingChat.project_id || null);
+                    setText("");
+                    setDrafts([]);
+                  }
+                  setModal("");
+                  if (result.cleanupPending)
+                    setTimeout(
+                      () =>
+                        setError(
+                          "Chat deleted, but some private files could not be removed. Check the server logs.",
+                        ),
+                      0,
+                    );
+                });
+                setChatActionBusy(false);
+              }}
+            >
+              {chatActionBusy ? "Deleting…" : "Delete chat"}
+            </button>
+          </div>
+        </Modal>
+      )}
+      {modal === "chat-model" && chat && (
+        <Modal
+          title="Model & thinking"
+          className="chat-model-modal"
+          error={error}
+          onClose={() => setModal("")}
+        >
+          <ChatModelPicker
+            key={chat.id}
+            chat={chat}
+            onClose={() => setModal("")}
+            onError={setError}
+            onSave={async (data: any) => {
+              await api(`/chats/${chat.id}/model`, data, "PATCH");
+              await loadDetail();
+              await loadOverview();
+              setModal("");
+            }}
+          />
+        </Modal>
+      )}
       {modal === "chat-settings" && chat && (
-        <Modal title="Chat settings" onClose={() => setModal("")}>
+        <Modal error={error} title="Chat settings" onClose={() => setModal("")}>
           <ChatSettings
             chat={chat}
             accounts={overview.accounts}
@@ -1325,20 +1668,35 @@ export function App() {
             onSave={async (data: any) => {
               await api("/chats/" + chat.id, data, "PATCH");
               await loadDetail();
+              await loadOverview();
               setModal("");
             }}
             onError={setError}
           />
           <Folders scope="chats" id={chat.id} />
+          <hr />
+          <button
+            className="danger-button"
+            onClick={() => {
+              setEditingChat(chat);
+              setModal("delete-chat");
+            }}
+          >
+            Delete chat…
+          </button>
         </Modal>
       )}
       {modal === "settings" && (
         <Modal
+          error={error}
           title="Workspace settings"
           className="settings-modal"
           onClose={() => setModal("")}
         >
           <SettingsForm
+            accounts={overview.accounts}
+            defaults={overview.modelDefaults}
+            onSaved={loadOverview}
             me={me}
             projects={overview.projects}
             onError={setError}
@@ -1381,26 +1739,43 @@ function Attachment({ file: f }: { file: any }) {
     </a>
   );
 }
-function NewChat({ overview, me, onCreated, onError, onSetup }: any) {
-  const [provider, setProvider] = useState("codex");
-  const [accountId, setAccountId] = useState(
-    overview.accounts.find((a: any) => a.provider === "codex")?.id || "",
+function NewChat({
+  overview,
+  initialProjectId,
+  onCreated,
+  onError,
+  onSetup,
+}: any) {
+  const preferred =
+    overview.accounts.find((a: any) => a.status === "ready") ||
+    overview.accounts[0];
+  const [provider, setProvider] = useState(preferred?.provider || "codex");
+  const [accountId, setAccountId] = useState(preferred?.id || "");
+  const [creating, setCreating] = useState(false);
+  const accounts = overview.accounts.filter(
+    (a: any) => a.provider === provider,
   );
-  useEffect(
-    () =>
-      setAccountId(
-        overview.accounts.find((a: any) => a.provider === provider)?.id || "",
-      ),
-    [provider],
-  );
+  const selectedAccount = accounts.find((a: any) => a.id === accountId);
+  const defaults = overview.modelDefaults?.[provider];
+  const suggestedModel =
+    selectedAccount?.model_catalog?.find((m: any) => m.isDefault) ||
+    selectedAccount?.model_catalog?.[0];
+  function selectProvider(next: string) {
+    setProvider(next);
+    setAccountId(
+      overview.accounts.find(
+        (a: any) => a.provider === next && a.status === "ready",
+      )?.id ||
+        overview.accounts.find((a: any) => a.provider === next)?.id ||
+        "",
+    );
+  }
   if (!overview.accounts.length)
     return (
       <div className="setup-empty">
-        <p>
-          Connect an agent account to start your first chat. GitHub is optional.
-        </p>
+        <p>Connect your Codex or Claude Code account to start chatting.</p>
         <button className="primary" onClick={() => onSetup("accounts")}>
-          Set up
+          Connect an agent account
         </button>
       </div>
     );
@@ -1408,78 +1783,154 @@ function NewChat({ overview, me, onCreated, onError, onSetup }: any) {
     <form
       onSubmit={async (e) => {
         e.preventDefault();
+        if (creating || !accountId) return;
+        setCreating(true);
         const f = new FormData(e.currentTarget);
         try {
           const c = await api("/chats", {
             project_id: f.get("project") || null,
             provider,
-            account_id: f.get("account"),
-            model: f.get("model"),
-            effort: f.get("effort"),
+            account_id: accountId,
+            model: f.get("model") || "",
+            effort: f.get("effort") || "",
             autonomous: f.get("autonomous") === "on",
           });
           await onCreated(c);
         } catch (e: any) {
           onError(e.message);
+        } finally {
+          setCreating(false);
         }
       }}
     >
-      <Field label="Project (optional)">
-        <select name="project" defaultValue="">
-          <option value="">No repository — private workspace</option>
-          {overview.projects.map((p: any) => (
-            <option key={p.id} value={p.id}>
-              {p.name}
-            </option>
-          ))}
-        </select>
-      </Field>
-      <div className="segmented">
-        <button
-          type="button"
-          className={provider === "codex" ? "selected" : ""}
-          onClick={() => setProvider("codex")}
-        >
-          ◈ Codex
-        </button>
-        <button
-          type="button"
-          className={provider === "claude" ? "selected" : ""}
-          onClick={() => setProvider("claude")}
-        >
-          ✳ Claude Code
-        </button>
-      </div>
-      <Field label="Account">
-        <select
-          name="account"
-          required
-          value={accountId}
-          onChange={(e) => setAccountId(e.target.value)}
-        >
-          {overview.accounts
-            .filter((a: any) => a.provider === provider)
-            .map((a: any) => (
-              <option key={a.id} value={a.id}>
-                {a.name}
-                {a.status !== "ready" ? " · " + labels[a.status] : ""}
+      <fieldset className="form-fields" disabled={creating}>
+        <Field label="Project">
+          <Select
+            aria-label="Project"
+            name="project"
+            defaultValue={initialProjectId || ""}
+          >
+            <option value="">Personal chat</option>
+            {overview.projects.map((p: any) => (
+              <option key={p.id} value={p.id}>
+                {p.name}
               </option>
             ))}
-        </select>
-      </Field>
-      <ModelOptions provider={provider} accountId={accountId} />
-      <label className="checkbox">
-        <input name="autonomous" type="checkbox" />
-        Run without approval prompts
-      </label>
-      <p className="muted">
-        Allow the agent to run commands and edit files in this workspace without
-        asking. Leave off to review permission requests.
-      </p>
-      <button className="primary">
-        <Plus size={17} />
-        Create chat
-      </button>
+          </Select>
+        </Field>
+        <p className="muted">
+          Project chats use the project’s repository and folders.
+        </p>
+        <div className="segmented" role="group" aria-label="Choose your agent">
+          <button
+            type="button"
+            aria-pressed={provider === "codex"}
+            className={provider === "codex" ? "selected" : ""}
+            onClick={() => selectProvider("codex")}
+          >
+            ◈ Codex
+          </button>
+          <button
+            type="button"
+            aria-pressed={provider === "claude"}
+            className={provider === "claude" ? "selected" : ""}
+            onClick={() => selectProvider("claude")}
+          >
+            ✳ Claude Code
+          </button>
+        </div>
+        {accounts.length ? (
+          <Field label="Account">
+            <Select
+              aria-label="Account"
+              name="account"
+              required
+              value={accountId}
+              onChange={(e) => setAccountId(e.target.value)}
+            >
+              {accounts.map((a: any) => (
+                <option key={a.id} value={a.id}>
+                  {a.name} · {labels[a.status] || a.status}
+                </option>
+              ))}
+            </Select>
+          </Field>
+        ) : (
+          <div className="setup-empty">
+            <p>
+              Add a {provider === "codex" ? "Codex" : "Claude Code"} account to
+              use this agent.
+            </p>
+            <button
+              type="button"
+              className="secondary"
+              onClick={() => onSetup("accounts")}
+            >
+              Open agent accounts
+            </button>
+          </div>
+        )}
+        {selectedAccount && selectedAccount.status !== "ready" && (
+          <p className="muted">
+            You can create this chat now. Connect the account in Agent accounts
+            before sending a task.
+          </p>
+        )}
+        <p className="new-chat-model">
+          Starting model from settings:{" "}
+          <strong>
+            {defaults?.model ||
+              suggestedModel?.model ||
+              suggestedModel?.id ||
+              (provider === "claude" ? "Sonnet" : "Choose a model below")}
+          </strong>
+          {defaults?.effort || suggestedModel?.defaultReasoningEffort
+            ? " · " +
+              effortLabel(
+                defaults?.effort || suggestedModel?.defaultReasoningEffort,
+              )
+            : ""}
+          {defaults && (
+            <small>
+              From Settings → Models. You can change it below or later in the
+              chat.
+            </small>
+          )}
+        </p>
+        <details className="advanced-options">
+          <summary>Change model and permissions</summary>
+          <ModelOptions
+            key={
+              provider +
+              accountId +
+              (defaults?.model || "") +
+              (defaults?.effort || "")
+            }
+            provider={provider}
+            accountId={accountId}
+            initialModel={defaults?.model || ""}
+            initialEffort={defaults?.effort || ""}
+          />
+          <label className="checkbox">
+            <input name="autonomous" type="checkbox" />
+            Run without approval prompts
+          </label>
+          <p className="muted">
+            Allow the agent to run commands and edit files without asking for
+            approval.
+          </p>
+        </details>
+        <p className="muted">
+          Your first message names the chat. You can rename it in Chat settings.
+        </p>
+        <button
+          className="primary form-submit"
+          disabled={!accountId || creating}
+        >
+          <Plus size={17} />
+          {creating ? "Creating chat…" : "Create chat"}
+        </button>
+      </fieldset>
     </form>
   );
 }
@@ -1538,8 +1989,8 @@ function Accounts({ accounts, refresh, onError }: any) {
   return (
     <>
       <p className="accounts-intro">
-        Add as many accounts as you need, including multiple accounts for the
-        same service. Each account has its own sign-in and usage limits.
+        Add an account below, then select Connect to sign in with Codex or
+        Claude Code. You can connect multiple accounts.
       </p>
       <form
         className="account-add-form"
@@ -1563,7 +2014,9 @@ function Accounts({ accounts, refresh, onError }: any) {
           }
         }}
       >
-        <h3>Add another account</h3>
+        <h3>
+          {accounts.length ? "Add another account" : "Add your first account"}
+        </h3>
         <div className="form-row">
           <Field label="Account label">
             <input
@@ -1574,13 +2027,14 @@ function Accounts({ accounts, refresh, onError }: any) {
             />
           </Field>
           <Field label="Service">
-            <select
+            <Select
+              aria-label="Service"
               value={provider}
               onChange={(e) => setProvider(e.target.value)}
             >
               <option value="codex">Codex</option>
               <option value="claude">Claude Code</option>
-            </select>
+            </Select>
           </Field>
         </div>
         <button className="primary" disabled={adding}>
@@ -1636,13 +2090,7 @@ function Accounts({ accounts, refresh, onError }: any) {
                       <span className={"status-dot " + a.status} />
                       {labels[a.status]}
                     </small>
-                    {a.limits && (
-                      <small>
-                        {a.limits.usedPercent !== undefined
-                          ? `${a.limits.usedPercent}% used`
-                          : "Usage information received"}
-                      </small>
-                    )}
+                    <AccountUsage account={a} refresh={refresh} />
                   </div>
                   {["ready", "limited", "disconnect_failed"].includes(
                     a.status,
@@ -1806,10 +2254,13 @@ function Accounts({ accounts, refresh, onError }: any) {
   );
 }
 function ChatSettings({ chat, me, onSave, onError }: any) {
+  const [saving, setSaving] = useState(false);
   return (
     <form
       onSubmit={async (e) => {
         e.preventDefault();
+        if (saving) return;
+        setSaving(true);
         const f = new FormData(e.currentTarget);
         try {
           await onSave({
@@ -1821,11 +2272,18 @@ function ChatSettings({ chat, me, onSave, onError }: any) {
           });
         } catch (e: any) {
           onError(e.message);
+        } finally {
+          setSaving(false);
         }
       }}
     >
-      <Field label="Name">
-        <input name="title" defaultValue={chat.title} required />
+      <Field label="Chat name">
+        <input
+          name="title"
+          defaultValue={chat.title}
+          maxLength={160}
+          required
+        />
       </Field>
       <ModelOptions
         provider={chat.provider}
@@ -1834,13 +2292,17 @@ function ChatSettings({ chat, me, onSave, onError }: any) {
         initialEffort={chat.effort}
       />
       <Field label="Account switching">
-        <select name="handoff" defaultValue={chat.handoff}>
+        <Select
+          aria-label="Account switching"
+          name="handoff"
+          defaultValue={chat.handoff}
+        >
           <option value="manual">Choose manually</option>
           <option value="auto" disabled={!me.autoHandoff}>
             Automatically
             {!me.autoHandoff ? "  — requires verification and activation" : ""}
           </option>
-        </select>
+        </Select>
       </Field>
       <label className="checkbox">
         <input
@@ -1854,7 +2316,9 @@ function ChatSettings({ chat, me, onSave, onError }: any) {
         Allow the agent to run commands and edit files in this workspace without
         asking. Leave off to review permission requests.
       </p>
-      <button className="primary">Save</button>
+      <button className="primary" disabled={saving}>
+        {saving ? "Saving…" : "Save changes"}
+      </button>
     </form>
   );
 }
@@ -1864,16 +2328,36 @@ function FilePanel({ chatId, mode, onError }: any) {
     [diff, setDiff] = useState(""),
     [view, setView] = useState<any>(null),
     [message, setMessage] = useState(""),
-    [result, setResult] = useState("");
+    [result, setResult] = useState(""),
+    [loading, setLoading] = useState(true),
+    [publishing, setPublishing] = useState(false);
   useEffect(() => {
+    let live = true;
+    setLoading(true);
     (mode === "files"
       ? api(`/chats/${chatId}/files?path=${encodeURIComponent(dir)}`).then(
-          setFiles,
+          (items) => {
+            if (live) setFiles(items);
+          },
         )
-      : api(`/chats/${chatId}/diff`).then((r) => setDiff(r.diff))
-    ).catch((e: any) => onError(e.message));
+      : api(`/chats/${chatId}/diff`).then((r) => {
+          if (live) setDiff(r.diff);
+        })
+    )
+      .catch((e: any) => {
+        if (live) onError(e.message);
+      })
+      .finally(() => {
+        if (live) setLoading(false);
+      });
+    return () => {
+      live = false;
+    };
   }, [chatId, mode, dir]);
   async function publish(action: string) {
+    if (publishing) return;
+    setPublishing(true);
+    setResult("");
     try {
       const r = await api(`/chats/${chatId}/git`, {
         action,
@@ -1881,12 +2365,21 @@ function FilePanel({ chatId, mode, onError }: any) {
         client_id: crypto.randomUUID(),
       });
       setResult(r.html_url || r.output || r.status || "Done");
+      const updated = await api(`/chats/${chatId}/diff`);
+      setDiff(updated.diff);
     } catch (e: any) {
       onError(e.message);
+    } finally {
+      setPublishing(false);
     }
   }
   return (
     <div className="panel-content">
+      {loading && (
+        <p className="muted" role="status">
+          Loading {mode === "files" ? "files" : "changes"}…
+        </p>
+      )}
       {mode === "files" ? (
         <>
           <button
@@ -1896,32 +2389,37 @@ function FilePanel({ chatId, mode, onError }: any) {
               setView(null);
             }}
           >
-            ← /{dir}
+            {dir ? "← Parent folder · /" + dir : "Workspace files"}
           </button>
+          {!loading && !files.length && (
+            <p className="muted">
+              This folder is empty. Files appear as your agent works.
+            </p>
+          )}
           {files.map((f) => (
             <button
               className="file-row"
               key={f.path}
-              onClick={async () => {
+              onClick={() => {
                 if (f.directory) {
                   setDir(f.path);
                   setView(null);
                 } else {
-                  const r = await fetch(
+                  void fetch(
                     `/api/chats/${chatId}/file?path=${encodeURIComponent(f.path)}`,
-                  );
-                  if (!r.ok) {
-                    onError("Unable to open this file");
-                    return;
-                  }
-                  const blob = await r.blob();
-                  setView({
-                    path: f.path,
-                    text:
-                      blob.size < 200000
-                        ? await blob.text()
-                        : "This file is too large to preview. Download it instead.",
-                  });
+                  )
+                    .then(async (r) => {
+                      if (!r.ok) throw new Error("Unable to open this file");
+                      const blob = await r.blob();
+                      setView({
+                        path: f.path,
+                        text:
+                          blob.size < 200000
+                            ? await blob.text()
+                            : "This file is too large to preview. Download it instead.",
+                      });
+                    })
+                    .catch((e) => onError(e.message));
                 }
               }}
             >
@@ -1955,30 +2453,31 @@ function FilePanel({ chatId, mode, onError }: any) {
           <div className="button-row">
             <button
               className="secondary"
-              disabled={!message}
+              disabled={!message.trim() || publishing || loading}
               onClick={() => publish("commit")}
             >
               Commit
             </button>
             <button
               className="secondary"
-              disabled={!message}
+              disabled={!message.trim() || publishing || loading}
               onClick={() => publish("push")}
             >
               Push
             </button>
             <button
               className="primary"
-              disabled={!message}
+              disabled={!message.trim() || publishing || loading}
               onClick={() => publish("pr")}
             >
-              Create PR
+              Create pull request
             </button>
           </div>
           <p className="muted">
             Push and pull requests run only when you select the corresponding
             action.
           </p>
+          {publishing && <p role="status">Publishing changes…</p>}
           {result && (
             <p className="operation-result">
               {result.startsWith("https://github.com/") ? (
@@ -1995,9 +2494,18 @@ function FilePanel({ chatId, mode, onError }: any) {
     </div>
   );
 }
-function SettingsForm({ me, projects, onError, onAdd, onManage }: any) {
+function SettingsForm({
+  me,
+  projects,
+  accounts,
+  defaults,
+  onSaved,
+  onError,
+  onAdd,
+  onManage,
+}: any) {
   const [saved, setSaved] = useState(false),
-    [section, setSection] = useState("connections");
+    [section, setSection] = useState("models");
   async function push() {
     try {
       if (!me.vapidKey)
@@ -2027,6 +2535,7 @@ function SettingsForm({ me, projects, onError, onAdd, onManage }: any) {
         aria-label="Settings sections"
       >
         {[
+          { id: "models", label: "Models" },
           { id: "connections", label: "Connections" },
           { id: "resources", label: "Resources" },
           { id: "notifications", label: "Notifications" },
@@ -2048,6 +2557,19 @@ function SettingsForm({ me, projects, onError, onAdd, onManage }: any) {
           </button>
         ))}
       </div>
+      {section === "models" && (
+        <div
+          role="tabpanel"
+          id="settings-panel-models"
+          aria-labelledby="settings-tab-models"
+        >
+          <ModelDefaults
+            accounts={accounts}
+            defaults={defaults}
+            onSaved={onSaved}
+          />
+        </div>
+      )}
       {section === "resources" && (
         <div
           role="tabpanel"
@@ -2119,7 +2641,11 @@ function SettingsForm({ me, projects, onError, onAdd, onManage }: any) {
   );
 }
 
-function ConnectProject({ onCreated }: { onCreated: () => Promise<void> }) {
+function ConnectProject({
+  onCreated,
+}: {
+  onCreated: (project: any) => Promise<void>;
+}) {
   const [repository, setRepository] = useState("");
   const [projectTokenInput, setProjectTokenInput] = useState("");
   const [error, setError] = useState("");
@@ -2142,13 +2668,13 @@ function ConnectProject({ onCreated }: { onCreated: () => Promise<void> }) {
           setBusy(true);
           setError("");
           try {
-            await api("/projects", {
+            const created = await api("/projects", {
               repo: repository,
               ...(projectTokenInput.trim()
                 ? { token: projectTokenInput.trim() }
                 : {}),
             });
-            await onCreated();
+            await onCreated(created);
           } catch (e: any) {
             setError(e.message);
           } finally {

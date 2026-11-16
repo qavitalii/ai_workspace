@@ -12,6 +12,19 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     if (m.method === "initialize") {
       assert.equal(p.capabilities.experimentalApi, true);
       send({ id: m.id, result: {} });
+    } else if (m.method === "account/rateLimits/read") {
+      send({
+        id: m.id,
+        result: {
+          rateLimits: {
+            primary: {
+              usedPercent: 25,
+              windowDurationMins: 300,
+              resetsAt: 2000000000,
+            },
+          },
+        },
+      });
     } else if (["thread/start", "thread/resume"].includes(m.method)) {
       sandbox = p.sandbox;
       send({
