@@ -1587,3 +1587,210 @@ small,
   white-space: normal;
   line-height: 1.4;
 }
+
+.settings-tabs button {
+  color: #56634f;
+}
+.resources-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.resources-heading h3 {
+  margin: 8px 0;
+}
+.resources-heading > span,
+.resource-updated {
+  font-size: 11px;
+  color: var(--muted);
+}
+.resource-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+.resource-card {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  padding: 14px;
+  background: #f1f4ed;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+.resource-card > span {
+  font-size: 12px;
+  color: #5f6e58;
+}
+.resource-card strong {
+  font-size: 19px;
+  font-weight: 600;
+}
+.resource-card small {
+  font-size: 11px;
+  line-height: 1.5;
+  color: #697466;
+}
+.resource-card progress {
+  width: 100%;
+  height: 5px;
+  accent-color: var(--green);
+}
+.execution-settings {
+  border-top: 1px solid var(--line);
+  margin-top: 18px;
+  padding-top: 18px;
+}
+.inline-error {
+  font-size: 12px;
+  color: #a64b32;
+  line-height: 1.5;
+}
+@media (max-width: 420px) {
+  .resource-card {
+    padding: 11px;
+  }
+  .resource-card strong {
+    font-size: 16px;
+  }
+  .settings-tabs button {
+    font-size: 11px;
+  }
+}
+
+.modal.settings-modal {
+  width: min(680px, 100%);
+}
+.project-save {
+  margin-top: 18px;
+}
+.project-settings-list {
+  margin: 18px 0;
+}
+.project-settings-row {
+  width: 100%;
+  justify-content: flex-start;
+  text-align: left;
+  padding: 14px 0;
+  border-bottom: 1px solid var(--line);
+}
+.project-settings-row > span {
+  flex: 1;
+  min-width: 0;
+}
+.project-settings-row strong,
+.project-settings-row small {
+  display: block;
+  overflow-wrap: anywhere;
+}
+.project-settings-row small {
+  color: var(--muted);
+  font-size: 11px;
+  margin-top: 5px;
+}
+.device-code-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.device-code-row .device-code {
+  min-width: 0;
+  user-select: all;
+}
+.device-code-row button {
+  min-height: 40px;
+}
+
+.folder-settings {
+  margin-top: 24px;
+  border-top: 1px solid var(--border, #dfe3da);
+  padding-top: 20px;
+}
+.folder-link {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 12px 0;
+  flex-wrap: wrap;
+}
+.folder-link > div {
+  flex: 1;
+  min-width: 0;
+}
+.folder-link small,
+.folder-link code {
+  display: block;
+  overflow-wrap: anywhere;
+}
+.folder-link code {
+  font-size: 11px;
+  opacity: 0.65;
+}
+.folder-create,
+.folder-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 12px 0;
+}
+.folder-create input {
+  flex: 1;
+  min-width: 120px;
+}
+.folder-browser {
+  margin-top: 16px;
+  max-height: 260px;
+  overflow: auto;
+}
+.folder-browser .file-row {
+  display: flex;
+  gap: 8px;
+  padding: 10px 0;
+  width: 100%;
+  overflow-wrap: anywhere;
+}
+
+.composer-input {
+  position: relative;
+}
+.composer-menu {
+  position: absolute;
+  bottom: 100%;
+  left: 0;
+  right: 0;
+  max-height: 300px;
+  overflow: auto;
+  background: #fff;
+  border: 1px solid #dfe3da;
+  border-radius: 12px;
+  box-shadow: 0 8px 24px #0002;
+  padding: 8px;
+  z-index: 10;
+}
+.composer-menu > small,
+.composer-menu > p {
+  display: block;
+  padding: 6px 8px;
+  color: #677066;
+  font-size: 12px;
+}
+.composer-menu button {
+  display: block;
+  text-align: left;
+  padding: 9px;
+  width: 100%;
+  border-radius: 6px;
+}
+.composer-menu button[aria-selected="true"] {
+  background: #edf1e9;
+}
+.composer-menu button small {
+  display: block;
+  color: #677066;
+  overflow-wrap: anywhere;
+}
+.composer-actions {
+  flex-wrap: wrap;
+}

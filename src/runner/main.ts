@@ -362,6 +362,23 @@ createInterface({ input: process.stdin }).on("line", async (line) => {
       finish("interrupted");
     }
     if (c.type === "auth") await auth(c.provider);
+    if (c.type === "logout") {
+      await mkdir("/profile/.codex", { recursive: true });
+      await mkdir("/profile/.claude", { recursive: true });
+      const logout = spawn(
+        c.provider === "codex" ? "codex" : "claude",
+        c.provider === "codex"
+          ? ["logout", "-c", 'cli_auth_credentials_store="file"']
+          : ["auth", "logout"],
+        { stdio: "ignore", timeout: 25000 },
+      );
+      logout.on("error", () =>
+        emit({ type: "logout_complete", success: false }),
+      );
+      logout.on("close", (code) =>
+        emit({ type: "logout_complete", success: code === 0 }),
+      );
+    }
     if (c.type === "auth_input") terminal?.write(c.data);
     if (c.type === "models") {
       if (c.provider === "codex") {

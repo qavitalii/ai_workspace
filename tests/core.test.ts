@@ -1,3 +1,5 @@
+import { uploadPath } from "../src/server/folder-routes";
+import { folderName } from "../src/server/folders";
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import {
   mkdtemp,
@@ -22,7 +24,9 @@ import {
   validRepo,
   cleanTerminalText,
   claudeSignInUrl,
+  normalizeGithubRepo,
 } from "../src/shared";
+import { cpuUsage, memoryUsage } from "../src/server/resources";
 let root: string;
 beforeAll(async () => {
   config.key = "ab".repeat(32);
@@ -51,6 +55,46 @@ describe("workspace boundaries", () => {
   });
 });
 describe("secrets and provider failures", () => {
+  it("normalizes GitHub repository links and rejects other destinations", () => {
+    for (const value of [
+      "qavitalii/partcar",
+      " https://github.com/qavitalii/partcar ",
+      "https://github.com/qavitalii/partcar.git/",
+      "https://github.com/qavitalii/partcar?tab=readme-ov-file#readme",
+    ])
+      expect(normalizeGithubRepo(value)).toBe("qavitalii/partcar");
+    for (const value of [
+      "https://github.com.evil.test/a/b",
+      "https://user:secret@github.com/a/b",
+      "https://github.com/a/b/tree/main",
+      "https://github.com:8443/a/b",
+      "file:///a/b",
+      "a/b/c",
+      "../secret",
+      "https://github.com/a/%2e%2e",
+    ])
+      expect(normalizeGithubRepo(value)).toBeNull();
+  });
+  it("calculates CPU usage from elapsed counters and keeps missing samples unknown", () => {
+    expect(cpuUsage({ idle: 100, total: 200 }, { idle: 150, total: 400 })).toBe(
+      75,
+    );
+    expect(
+      cpuUsage({ idle: 100, total: 200 }, { idle: 100, total: 200 }),
+    ).toBeNull();
+  });
+  it("uses available memory including reclaimable cache instead of only free memory", () => {
+    expect(
+      memoryUsage(
+        "MemTotal:       1000 kB\nMemFree:         100 kB\nMemAvailable:    700 kB\n",
+      ),
+    ).toEqual({
+      totalBytes: 1024000,
+      availableBytes: 716800,
+      usedBytes: 307200,
+    });
+    expect(memoryUsage("MemTotal: 1000 kB\nMemFree: 100 kB\n")).toBeNull();
+  });
   it("extracts the native Claude login link from terminal hyperlinks", () => {
     const url = "https://claude.com/cai/oauth/authorize?code=true&state=test";
     const output = `\x1b[32mVisit: \x1b]8;;${url}\x07${url}\x1b]8;;\x07\x1b[0m\nPaste code here > `;
@@ -93,4 +137,22 @@ describe("secrets and provider failures", () => {
     ])
       expect(validRepo(r)).toBe(false);
   });
+});
+
+it("validates folder names and nested upload paths", () => {
+  expect(folderName("project-assets")).toBe("project-assets");
+  expect(uploadPath("photos/trip/photo.png")).toBe("photos/trip/photo.png");
+  for (const value of [
+    "../secret",
+    "/etc/passwd",
+    "photos/../secret",
+    "a\\b",
+    ".git/config",
+    "a//b",
+    "a/./b",
+    "a\0b",
+  ])
+    expect(() => uploadPath(value)).toThrow();
+  for (const value of ["..", ".", "/srv", "a/b", ".ssh", ""])
+    expect(() => folderName(value)).toThrow();
 });

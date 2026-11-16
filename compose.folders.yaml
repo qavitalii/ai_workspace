@@ -1,0 +1,8 @@
+# Optional: expose an existing server folder collection at the same host path.
+# Set FOLDER_ROOT in .env before adding this override to the Compose command.
+services:
+  server:
+    environment:
+      FOLDER_ROOT: ${FOLDER_ROOT:?Set FOLDER_ROOT to an absolute server path}
+    volumes:
+      - ${FOLDER_ROOT}:${FOLDER_ROOT}

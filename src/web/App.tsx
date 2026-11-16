@@ -1,7 +1,11 @@
+import { ComposerInput, chatCommands } from "./ComposerInput";
+import { ModelOptions } from "./ModelOptions";
+import { Folders } from "./Folders";
 import {
   cleanTerminalText,
   claudeSignInUrl,
   attachmentNotice,
+  normalizeGithubRepo,
 } from "../shared";
 import {
   useEffect,
@@ -25,6 +29,7 @@ import {
   X,
   ChevronDown,
   Check,
+  Copy,
   Square,
   Terminal as TerminalIcon,
   Files,
@@ -46,6 +51,8 @@ import {
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { api, upload, socketUrl } from "./api";
+import { ServerSettings } from "./ServerSettings";
+import { ProjectSettings } from "./ProjectSettings";
 const Terminal = lazy(() =>
   import("./Terminal").then((m) => ({ default: m.Terminal })),
 );
@@ -63,6 +70,8 @@ const labels: Record<string, string> = {
   limited: "Limit reached",
   authenticating: "Signing in…",
   inspecting: "Checking…",
+  disconnecting: "Disconnecting…",
+  disconnect_failed: "Sign-out failed",
 };
 function Mark({ small = false }: { small?: boolean }) {
   return (
@@ -75,7 +84,9 @@ function Modal({
   title,
   children,
   onClose,
+  className = "",
 }: {
+  className?: string;
   title: string;
   children: ReactNode;
   onClose: () => void;
@@ -86,7 +97,7 @@ function Modal({
         role="dialog"
         aria-modal="true"
         aria-label={title}
-        className="modal"
+        className={"modal " + className}
         onClick={(e) => e.stopPropagation()}
       >
         <header>
@@ -219,6 +230,7 @@ export function App() {
     ),
     [detail, setDetail] = useState<any>(null),
     [modal, setModal] = useState(""),
+    [editingProject, setEditingProject] = useState<any>(null),
     [error, setError] = useState(""),
     [mobile, setMobile] = useState(false),
     [panel, setPanel] = useState(""),
@@ -388,7 +400,25 @@ export function App() {
       );
     }
   }
+  function command(name: string) {
+    if (name === "new") setModal("chat");
+    if (name === "model" || name === "settings") setModal("chat-settings");
+    if (name === "files" || name === "terminal") setPanel(name);
+    if (name === "stop" && chatId)
+      void run(async () => {
+        await api(`/chats/${chatId}/stop`, {});
+        await loadDetail();
+      });
+    if (name === "help") setModal("composer-help");
+  }
   async function send() {
+    const shortcut = text.trim().match(/^\/([a-z]+)$/);
+    if (shortcut && chatCommands.some((c) => c.name === shortcut[1])) {
+      command(shortcut[1]);
+      setText("");
+      return;
+    }
+
     if (
       !chatId ||
       sending ||
@@ -478,6 +508,17 @@ export function App() {
                     .length
                 }
               </span>
+              <button
+                className="icon"
+                aria-label={"Project settings: " + p.name}
+                title="Project settings"
+                onClick={() => {
+                  setEditingProject(p);
+                  setModal("project-settings");
+                }}
+              >
+                <Settings size={14} />
+              </button>
             </div>
           ))}
           {!overview.projects.length && (
@@ -573,14 +614,16 @@ export function App() {
                 >
                   <Files size={18} />
                 </button>
-                <button
-                  className={"icon " + (panel === "diff" ? "active" : "")}
-                  title="Changes"
-                  aria-label="Changes"
-                  onClick={() => setPanel(panel === "diff" ? "" : "diff")}
-                >
-                  <GitBranch size={18} />
-                </button>
+                {chat.project_id && (
+                  <button
+                    className={"icon " + (panel === "diff" ? "active" : "")}
+                    title="Changes"
+                    aria-label="Changes"
+                    onClick={() => setPanel(panel === "diff" ? "" : "diff")}
+                  >
+                    <GitBranch size={18} />
+                  </button>
+                )}
                 <button
                   className={"icon " + (panel === "terminal" ? "active" : "")}
                   title="Terminal"
@@ -668,6 +711,17 @@ export function App() {
                   {chat.autonomous ? "Autonomous" : "With approvals"}
                 </span>
               </div>
+              {account && account.status === "disconnected" && (
+                <div className="run-notice">
+                  <p>Connect {account.name} to run tasks in this chat.</p>
+                  <button
+                    className="secondary"
+                    onClick={() => setModal("accounts")}
+                  >
+                    Connect account
+                  </button>
+                </div>
+              )}
               <div className="messages">
                 {!detail.messages.length && (
                   <div className="chat-start">
@@ -677,11 +731,14 @@ export function App() {
                     <h2>What are we working on?</h2>
                     <p>
                       Describe a task or attach files.
-                      <br />A separate branch will be created for this chat.
+                      <br />
+                      {chat.project_id
+                        ? "A separate branch will be created for this chat."
+                        : "Your files stay in this chat’s own workspace. No Git repository required."}
                     </p>
                     <span className="branch-label">
                       <GitBranch size={14} />
-                      {chat.branch}
+                      {chat.project_id ? chat.branch : "Private workspace"}
                     </span>
                   </div>
                 )}
@@ -891,28 +948,15 @@ export function App() {
                       </div>
                     ))}
                   </div>
-                  <textarea
+                  <ComposerInput
+                    key={chat.id}
+                    chatId={chat.id}
                     value={text}
-                    onChange={(e) => setText(e.target.value)}
-                    onPaste={(e) => {
-                      const files = Array.from(e.clipboardData.files);
-                      if (files.length) {
-                        e.preventDefault();
-                        void addFiles(files);
-                      }
-                    }}
-                    placeholder={
-                      drag
-                        ? "Drop your files here…"
-                        : "Describe a task, add context, or attach files…"
-                    }
-                    rows={3}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
-                        e.preventDefault();
-                        void send();
-                      }
-                    }}
+                    onChange={setText}
+                    onFiles={(files) => void addFiles(files)}
+                    onSend={() => void send()}
+                    onCommand={command}
+                    drag={drag}
                   />
                   <div className="composer-actions">
                     <input
@@ -939,6 +983,15 @@ export function App() {
                     >
                       <ShieldCheck size={14} />
                       {chat.autonomous ? "Autonomous" : "Ask for permission"}
+                      <ChevronDown size={12} />
+                    </button>
+                    <button
+                      className="permission-chip"
+                      onClick={() => setModal("chat-settings")}
+                      title="Model and reasoning effort"
+                    >
+                      {chat.model || "Default model"} ·{" "}
+                      {chat.effort || "Default effort"}
                       <ChevronDown size={12} />
                     </button>
                     <span className="spacer" />
@@ -1020,36 +1073,45 @@ export function App() {
           </div>
         )}
       </main>
+      {modal === "composer-help" && (
+        <Modal title="Commands and references" onClose={() => setModal("")}>
+          {chatCommands.map((c) => (
+            <p key={c.name}>
+              <strong>/{c.name}</strong> — {c.description}
+            </p>
+          ))}
+          <p>
+            <strong>@</strong> selects a workspace file or connected folder.{" "}
+            <strong>$</strong> selects a workspace SKILL.md. References are
+            inserted as explicit paths for the agent.
+          </p>
+          <p className="muted">
+            These are Workspace commands. Native CLI slash commands,
+            account-wide skills and app mentions are not automatically available
+            in this integration.
+          </p>
+        </Modal>
+      )}
       {modal === "project" && (
         <Modal title="Connect a project" onClose={() => setModal("")}>
-          <p className="muted">
-            Connect a public or private GitHub repository. Add an access token
-            in Settings for private repositories.
-          </p>
-          <form
-            onSubmit={(e) => {
-              e.preventDefault();
-              const f = new FormData(e.currentTarget);
-              void run(async () => {
-                await api("/projects", { repo: f.get("repo") });
-                await loadOverview();
-                setModal("");
-              });
+          <ConnectProject
+            onCreated={async () => {
+              await loadOverview();
+              setModal("");
             }}
-          >
-            <Field label="Repository">
-              <input
-                name="repo"
-                required
-                placeholder="owner/repository"
-                pattern="[^/ ]+/[^/ ]+"
-              />
-            </Field>
-            <button className="primary">
-              <FolderGit2 size={17} />
-              Connect
-            </button>
-          </form>
+          />
+        </Modal>
+      )}
+      {modal === "project-settings" && editingProject && (
+        <Modal title="Project settings" onClose={() => setModal("")}>
+          <ProjectSettings
+            project={editingProject}
+            onSaved={async () => {
+              await loadOverview();
+              setModal("");
+            }}
+          />
+          <Folders scope="projects" id={editingProject.id} />
         </Modal>
       )}
       {modal === "chat" && (
@@ -1129,11 +1191,25 @@ export function App() {
             }}
             onError={setError}
           />
+          <Folders scope="chats" id={chat.id} />
         </Modal>
       )}
       {modal === "settings" && (
-        <Modal title="Workspace settings" onClose={() => setModal("")}>
-          <SettingsForm me={me} onError={setError} />
+        <Modal
+          title="Workspace settings"
+          className="settings-modal"
+          onClose={() => setModal("")}
+        >
+          <SettingsForm
+            me={me}
+            projects={overview.projects}
+            onError={setError}
+            onAdd={() => setModal("project")}
+            onManage={(p: any) => {
+              setEditingProject(p);
+              setModal("project-settings");
+            }}
+          />
         </Modal>
       )}
     </div>
@@ -1169,16 +1245,23 @@ function Attachment({ file: f }: { file: any }) {
 }
 function NewChat({ overview, me, onCreated, onError, onSetup }: any) {
   const [provider, setProvider] = useState("codex");
-  if (!overview.projects.length || !overview.accounts.length)
+  const [accountId, setAccountId] = useState(
+    overview.accounts.find((a: any) => a.provider === "codex")?.id || "",
+  );
+  useEffect(
+    () =>
+      setAccountId(
+        overview.accounts.find((a: any) => a.provider === provider)?.id || "",
+      ),
+    [provider],
+  );
+  if (!overview.accounts.length)
     return (
       <div className="setup-empty">
-        <p>Connect a project and an agent account to start your first chat.</p>
-        <button
-          className="primary"
-          onClick={() =>
-            onSetup(!overview.projects.length ? "project" : "accounts")
-          }
-        >
+        <p>
+          Connect an agent account to start your first chat. GitHub is optional.
+        </p>
+        <button className="primary" onClick={() => onSetup("accounts")}>
           Set up
         </button>
       </div>
@@ -1190,10 +1273,11 @@ function NewChat({ overview, me, onCreated, onError, onSetup }: any) {
         const f = new FormData(e.currentTarget);
         try {
           const c = await api("/chats", {
-            title: f.get("title"),
-            project_id: f.get("project"),
+            project_id: f.get("project") || null,
             provider,
             account_id: f.get("account"),
+            model: f.get("model"),
+            effort: f.get("effort"),
             autonomous: f.get("autonomous") === "on",
           });
           await onCreated(c);
@@ -1202,16 +1286,9 @@ function NewChat({ overview, me, onCreated, onError, onSetup }: any) {
         }
       }}
     >
-      <Field label="Task name">
-        <input
-          name="title"
-          placeholder="For example, add authentication"
-          required
-          maxLength={160}
-        />
-      </Field>
-      <Field label="Project">
-        <select name="project">
+      <Field label="Project (optional)">
+        <select name="project" defaultValue="">
+          <option value="">No repository — private workspace</option>
           {overview.projects.map((p: any) => (
             <option key={p.id} value={p.id}>
               {p.name}
@@ -1236,20 +1313,31 @@ function NewChat({ overview, me, onCreated, onError, onSetup }: any) {
         </button>
       </div>
       <Field label="Account">
-        <select name="account" required>
+        <select
+          name="account"
+          required
+          value={accountId}
+          onChange={(e) => setAccountId(e.target.value)}
+        >
           {overview.accounts
-            .filter((a: any) => a.provider === provider && a.status === "ready")
+            .filter((a: any) => a.provider === provider)
             .map((a: any) => (
               <option key={a.id} value={a.id}>
                 {a.name}
+                {a.status !== "ready" ? " · " + labels[a.status] : ""}
               </option>
             ))}
         </select>
       </Field>
+      <ModelOptions provider={provider} accountId={accountId} />
       <label className="checkbox">
         <input name="autonomous" type="checkbox" />
-        Work autonomously in this workspace
+        Run without approval prompts
       </label>
+      <p className="muted">
+        Allow the agent to run commands and edit files in this workspace without
+        asking. Leave off to review permission requests.
+      </p>
       <button className="primary">
         <Plus size={17} />
         Create chat
@@ -1262,7 +1350,10 @@ function Accounts({ accounts, refresh, onError }: any) {
     [authId, setAuthId] = useState(""),
     [events, setEvents] = useState<any[]>([]),
     [authInput, setAuthInput] = useState(""),
+    [copiedCode, setCopiedCode] = useState(""),
+    [copyError, setCopyError] = useState(""),
     [connecting, setConnecting] = useState(false),
+    [disconnecting, setDisconnecting] = useState(""),
     [adding, setAdding] = useState(false),
     [added, setAdded] = useState("");
   useEffect(() => {
@@ -1285,6 +1376,8 @@ function Accounts({ accounts, refresh, onError }: any) {
   async function start(id: string) {
     if (connecting) return;
     setConnecting(true);
+    setCopiedCode("");
+    setCopyError("");
     try {
       await api("/accounts/" + id + "/auth", undefined, "DELETE");
       await api("/accounts/" + id + "/auth", {});
@@ -1413,27 +1506,46 @@ function Accounts({ accounts, refresh, onError }: any) {
                       </small>
                     )}
                   </div>
-                  {a.status === "limited" ? (
+                  {["ready", "limited", "disconnect_failed"].includes(
+                    a.status,
+                  ) ? (
                     <button
                       className="secondary"
+                      disabled={!!disconnecting || connecting}
                       onClick={async () => {
+                        setDisconnecting(a.id);
                         try {
-                          await api("/accounts/" + a.id + "/recheck", {});
-                          await refresh();
+                          await api("/accounts/" + a.id + "/logout", {});
+                          if (authId === a.id) {
+                            setAuthId("");
+                            setEvents([]);
+                          }
                         } catch (e: any) {
                           onError(e.message);
+                        } finally {
+                          setDisconnecting("");
+                          await refresh();
                         }
                       }}
                     >
-                      Retry
+                      {disconnecting === a.id
+                        ? "Disconnecting…"
+                        : a.status === "disconnect_failed"
+                          ? "Retry disconnect"
+                          : "Disconnect"}
                     </button>
                   ) : (
                     <button
                       className="secondary"
-                      disabled={connecting}
+                      disabled={
+                        connecting ||
+                        !!disconnecting ||
+                        a.status === "disconnecting" ||
+                        a.status === "inspecting"
+                      }
                       onClick={() => start(a.id)}
                     >
-                      {a.status === "ready" ? "Sign in again" : "Connect"}
+                      Connect
                     </button>
                   )}
                 </div>
@@ -1442,8 +1554,8 @@ function Accounts({ accounts, refresh, onError }: any) {
         ))}
       </div>
       <p className="accounts-footnote">
-        You can save any number of accounts. Up to 3 tasks can run at once, with
-        one task per account.
+        You can save any number of accounts. Set parallel task capacity in
+        Settings → Resources. One task runs per account.
       </p>
       {authId && (
         <div className="auth-flow">
@@ -1464,10 +1576,42 @@ function Accounts({ accounts, refresh, onError }: any) {
                 <a target="_blank" rel="noreferrer" href={e.verificationUrl}>
                   Open sign-in page <ExternalLink size={14} />
                 </a>
-                <code className="device-code">{e.userCode}</code>
+                <div className="device-code-row">
+                  <code className="device-code">{e.userCode}</code>
+                  <button
+                    type="button"
+                    className="secondary"
+                    aria-label="Copy device code"
+                    onClick={async () => {
+                      try {
+                        await navigator.clipboard.writeText(e.userCode);
+                        setCopiedCode(e.userCode);
+                        setCopyError("");
+                      } catch {
+                        setCopyError(
+                          "Unable to copy automatically. Select the code and copy it manually.",
+                        );
+                      }
+                    }}
+                  >
+                    {copiedCode === e.userCode ? (
+                      <Check size={16} />
+                    ) : (
+                      <Copy size={16} />
+                    )}
+                    <span role="status">
+                      {copiedCode === e.userCode ? "Copied" : "Copy code"}
+                    </span>
+                  </button>
+                </div>
               </div>
             ))}
           <pre>{authText}</pre>
+          {copyError && (
+            <p className="inline-error" role="alert">
+              {copyError}
+            </p>
+          )}
           {events.some((e) => e.type === "auth_complete" && e.success) ? (
             <p className="success">
               <Check size={17} />
@@ -1524,7 +1668,6 @@ function Accounts({ accounts, refresh, onError }: any) {
   );
 }
 function ChatSettings({ chat, me, onSave, onError }: any) {
-  const [models, setModels] = useState<any[]>([]);
   return (
     <form
       onSubmit={async (e) => {
@@ -1546,48 +1689,12 @@ function ChatSettings({ chat, me, onSave, onError }: any) {
       <Field label="Name">
         <input name="title" defaultValue={chat.title} required />
       </Field>
-      <Field label="Model (leave blank for the default)">
-        <input
-          name="model"
-          list="model-list"
-          defaultValue={chat.model}
-          maxLength={100}
-        />
-        <datalist id="model-list">
-          {models.map((m) => (
-            <option key={m.id} value={m.model || m.id}>
-              {m.displayName || m.id}
-            </option>
-          ))}
-        </datalist>
-      </Field>
-      <button
-        type="button"
-        className="text-button"
-        onClick={async () => {
-          try {
-            setModels(
-              await api("/accounts/" + chat.account_id + "/models", {}),
-            );
-          } catch (e: any) {
-            onError(e.message);
-          }
-        }}
-      >
-        <RefreshCw size={13} />
-        Load available models
-      </button>
-      <Field label="Reasoning effort">
-        <select name="effort" defaultValue={chat.effort}>
-          <option value="">Default</option>
-          <option value="low">Low</option>
-          <option value="medium">Medium</option>
-          <option value="high">High</option>
-          {chat.provider === "codex" && (
-            <option value="xhigh">Extra high</option>
-          )}
-        </select>
-      </Field>
+      <ModelOptions
+        provider={chat.provider}
+        accountId={chat.account_id}
+        initialModel={chat.model}
+        initialEffort={chat.effort}
+      />
       <Field label="Account switching">
         <select name="handoff" defaultValue={chat.handoff}>
           <option value="manual">Choose manually</option>
@@ -1603,8 +1710,12 @@ function ChatSettings({ chat, me, onSave, onError }: any) {
           type="checkbox"
           defaultChecked={chat.autonomous}
         />
-        Work autonomously in this workspace
+        Run without approval prompts
       </label>
+      <p className="muted">
+        Allow the agent to run commands and edit files in this workspace without
+        asking. Leave off to review permission requests.
+      </p>
       <button className="primary">Save</button>
     </form>
   );
@@ -1746,14 +1857,9 @@ function FilePanel({ chatId, mode, onError }: any) {
     </div>
   );
 }
-function SettingsForm({ me, onError }: any) {
+function SettingsForm({ me, projects, onError, onAdd, onManage }: any) {
   const [saved, setSaved] = useState(false),
-    [system, setSystem] = useState<any>(null);
-  useEffect(() => {
-    api("/system")
-      .then(setSystem)
-      .catch(() => {});
-  }, []);
+    [section, setSection] = useState("connections");
   async function push() {
     try {
       if (!me.vapidKey)
@@ -1777,70 +1883,186 @@ function SettingsForm({ me, onError }: any) {
   }
   return (
     <>
-      <form
-        onSubmit={async (e) => {
-          e.preventDefault();
-          const f = new FormData(e.currentTarget);
-          try {
-            await api("/settings/github", { token: f.get("token") });
-            setSaved(true);
-          } catch (e: any) {
-            onError(e.message);
-          }
-        }}
+      <div
+        className="segmented settings-tabs"
+        role="tablist"
+        aria-label="Settings sections"
       >
-        <h3>GitHub</h3>
-        <p className="muted">
-          Fine-grained token: select only the repositories you need. Contents
-          and Pull requests — read/write.
-        </p>
-        <Field
-          label={
-            system?.githubConfigured
-              ? "Token saved · replace it"
-              : "Access token"
-          }
+        {[
+          { id: "connections", label: "Connections" },
+          { id: "resources", label: "Resources" },
+          { id: "notifications", label: "Notifications" },
+        ].map((item) => (
+          <button
+            key={item.id}
+            id={"settings-tab-" + item.id}
+            type="button"
+            role="tab"
+            aria-selected={section === item.id}
+            aria-controls={"settings-panel-" + item.id}
+            className={section === item.id ? "selected" : ""}
+            onClick={() => {
+              setSection(item.id);
+              setSaved(false);
+            }}
+          >
+            {item.label}
+          </button>
+        ))}
+      </div>
+      {section === "resources" && (
+        <div
+          role="tabpanel"
+          id="settings-panel-resources"
+          aria-labelledby="settings-tab-resources"
         >
-          <input
-            name="token"
-            type="password"
-            autoComplete="off"
-            required
-            placeholder="github_pat_…"
-          />
-        </Field>
-        <button className="secondary">Save token</button>
-      </form>
-      <hr />
-      <h3>Notifications</h3>
-      <p className="muted">
-        Get notified when a task finishes or your agent needs permission.
-      </p>
-      <button className="secondary" onClick={push}>
-        <Bell size={16} />
-        Enable on this device
-      </button>
+          <ServerSettings />
+        </div>
+      )}
+      {section === "connections" && (
+        <div
+          role="tabpanel"
+          id="settings-panel-connections"
+          aria-labelledby="settings-tab-connections"
+        >
+          <h3>Projects</h3>
+          <p className="muted">
+            Each project has its own GitHub token. Chats can also run without a
+            repository.
+          </p>
+          <div className="project-settings-list">
+            {projects.map((p: any) => (
+              <button
+                key={p.id}
+                className="project-settings-row"
+                onClick={() => onManage(p)}
+              >
+                <FolderGit2 size={18} />
+                <span>
+                  <strong>{p.name}</strong>
+                  <small>
+                    {p.repo} ·{" "}
+                    {p.github_configured ? "Token saved" : "No token"}
+                  </small>
+                </span>
+                <ChevronRight size={16} />
+              </button>
+            ))}
+          </div>
+          <button className="primary" onClick={onAdd}>
+            <Plus size={16} />
+            Connect a project
+          </button>
+        </div>
+      )}
+      {section === "notifications" && (
+        <div
+          role="tabpanel"
+          id="settings-panel-notifications"
+          aria-labelledby="settings-tab-notifications"
+        >
+          <h3>Notifications</h3>
+          <p className="muted">
+            Get notified when a task finishes or your agent needs permission.
+          </p>
+          <button className="secondary" onClick={push}>
+            <Bell size={16} />
+            Enable on this device
+          </button>
+        </div>
+      )}
       {saved && (
         <p className="success">
           <Check size={16} />
           Saved
         </p>
       )}
-      {system && (
-        <>
-          <hr />
-          <h3>Server</h3>
-          <div className="system-stats">
-            <span>
-              Active agents<strong>{system.running} / 3</strong>
-            </span>
-            <span>
-              Free disk space
-              <strong>{(system.freeBytes / 1024 ** 3).toFixed(1)} GB</strong>
-            </span>
-          </div>
-        </>
-      )}
+    </>
+  );
+}
+
+function ConnectProject({ onCreated }: { onCreated: () => Promise<void> }) {
+  const [repository, setRepository] = useState("");
+  const [projectTokenInput, setProjectTokenInput] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const normalized = normalizeGithubRepo(repository);
+  return (
+    <>
+      <p className="muted">
+        Paste a GitHub repository link or enter owner/repository. Access is
+        configured for this project only.
+      </p>
+      <form
+        onSubmit={async (e) => {
+          e.preventDefault();
+          if (busy) return;
+          if (!normalized) {
+            setError("Enter owner/repository or a GitHub repository URL.");
+            return;
+          }
+          setBusy(true);
+          setError("");
+          try {
+            await api("/projects", {
+              repo: repository,
+              ...(projectTokenInput.trim()
+                ? { token: projectTokenInput.trim() }
+                : {}),
+            });
+            await onCreated();
+          } catch (e: any) {
+            setError(e.message);
+          } finally {
+            setBusy(false);
+          }
+        }}
+      >
+        <Field label="Repository">
+          <input
+            required
+            value={repository}
+            onChange={(e) => {
+              setRepository(e.target.value);
+              setError("");
+            }}
+            placeholder="https://github.com/owner/repository"
+            maxLength={2048}
+            aria-describedby="repository-help"
+            aria-invalid={!!error}
+          />
+        </Field>
+        <p className="muted" id="repository-help">
+          {normalized
+            ? "Repository: " + normalized
+            : "Also accepts owner/repository"}
+        </p>
+        <Field label="Access token (optional)">
+          <input
+            type="password"
+            autoComplete="new-password"
+            value={projectTokenInput}
+            onChange={(e) => setProjectTokenInput(e.target.value)}
+            placeholder="github_pat_…"
+            minLength={10}
+            maxLength={500}
+          />
+        </Field>
+        <p className="muted">
+          Needed for private repositories and publishing. Select this repository
+          in your token; allow Contents and Pull requests: read/write for
+          publishing.
+        </p>
+        {error && (
+          <p className="inline-error" role="alert">
+            {error}
+          </p>
+        )}
+        <button className="primary" disabled={busy}>
+          <FolderGit2 size={17} />
+          {busy ? "Connecting…" : "Connect"}
+        </button>
+      </form>
     </>
   );
 }

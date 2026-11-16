@@ -8,14 +8,15 @@ import { config } from "./config.js";
 import { unseal } from "./security.js";
 import { workspace, docker } from "./runtime.js";
 
-async function githubToken() {
-  const r = await db.query(
-    "SELECT value FROM settings WHERE key='github_token'",
-  );
-  return r.rows[0] ? unseal(r.rows[0].value) : "";
+export function projectToken(project: { github_token?: string }): string {
+  return project.github_token ? unseal(project.github_token) : "";
 }
-export async function github(pathname: string, method = "GET", body?: unknown) {
-  const token = await githubToken();
+export async function github(
+  pathname: string,
+  method = "GET",
+  body?: unknown,
+  token = "",
+) {
   const res = await fetch("https://api.github.com" + pathname, {
     method,
     signal: AbortSignal.timeout(30000),
@@ -30,7 +31,7 @@ export async function github(pathname: string, method = "GET", body?: unknown) {
   if (!res.ok)
     throw Object.assign(
       new Error("GitHub request failed (" + res.status + ")"),
-      { statusCode: 502 },
+      { statusCode: 502, githubStatus: res.status },
     );
   return res.json() as Promise<any>;
 }
@@ -44,8 +45,8 @@ export async function git(
   args: string[],
   authenticated = false,
   extraMounts: any[] = [],
+  token = "",
 ) {
-  const token = authenticated ? await githubToken() : "";
   const c = await docker.createContainer({
     Image: config.image,
     User: "1000:1000",
@@ -131,6 +132,11 @@ export async function initializeWorkspace(chat: any) {
   if (chat.initialized) return;
   const target = workspace(chat.id),
     staging = target + ".initializing";
+  if (!chat.project_id) {
+    await prepare(target);
+    await db.query("UPDATE chats SET initialized=true WHERE id=$1", [chat.id]);
+    return;
+  }
   const p = (
     await db.query("SELECT * FROM projects WHERE id=$1", [chat.project_id])
   ).rows[0];
@@ -164,6 +170,8 @@ export async function initializeWorkspace(chat: any) {
       ".",
     ],
     true,
+    [],
+    projectToken(p),
   );
   await git(staging, ["checkout", "-b", chat.branch]);
   await git(staging, ["config", "core.hooksPath", "/dev/null"]);
@@ -201,6 +209,8 @@ export async function pushBranch(chat: any, project: any) {
         "refs/heads/" + chat.branch + ":refs/heads/" + chat.branch,
       ],
       true,
+      [],
+      projectToken(project),
     );
   } finally {
     await rm(scratch, { recursive: true, force: true });

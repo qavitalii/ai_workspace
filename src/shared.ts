@@ -25,6 +25,7 @@ export type RunnerCommand =
   | { type: "terminal"; data: string }
   | { type: "resize"; cols: number; rows: number }
   | { type: "auth"; provider: Provider }
+  | { type: "logout"; provider: Provider }
   | { type: "auth_input"; data: string }
   | { type: "models"; provider: Provider };
 export function quotaError(code: unknown): boolean {
@@ -40,6 +41,28 @@ export function validRepo(value: string): boolean {
     /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(value) &&
     !value.split("/").some((x) => x === "." || x === "..")
   );
+}
+
+export function normalizeGithubRepo(input: string): string | null {
+  let value = input.trim();
+  if (/^https:\/\//i.test(value)) {
+    try {
+      const url = new URL(value);
+      if (
+        url.hostname.toLowerCase() !== "github.com" ||
+        url.port ||
+        url.username ||
+        url.password
+      )
+        return null;
+      value = url.pathname;
+    } catch {
+      return null;
+    }
+    value = value.replace(/^\//, "");
+  }
+  value = value.replace(/\/$/, "").replace(/\.git$/i, "");
+  return validRepo(value) ? value : null;
 }
 
 export function cleanTerminalText(value: string): string {

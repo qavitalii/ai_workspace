@@ -5,6 +5,7 @@ import { mkdir, chown, chmod } from "node:fs/promises";
 import path from "node:path";
 import { config } from "./config.js";
 import type { AgentEvent, RunnerCommand } from "../shared.js";
+import { folderMounts } from "./folders.js";
 export const docker = new Docker();
 export const workspace = (id: string) =>
   path.join(config.data, "workspaces", id);
@@ -29,6 +30,7 @@ export async function launch(
     : path.join(config.data, "auth-workspaces", accountId!);
   await writable(work);
   const mounts: any[] = [{ Type: "bind", Source: work, Target: "/workspace" }];
+  if (chatId) mounts.push(...(await folderMounts(chatId)));
   if (accountId) {
     await writable(profile(accountId));
     mounts.push({

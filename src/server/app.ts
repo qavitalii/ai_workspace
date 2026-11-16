@@ -1,3 +1,5 @@
+import { chatFolders } from "./folders.js";
+import { folderRoutes } from "./folder-routes.js";
 import Fastify from "fastify";
 import cookie from "@fastify/cookie";
 import helmet from "@fastify/helmet";
@@ -9,14 +11,7 @@ import { inspectWorkspace } from "./files.js";
 import { acquireWorkspace, releaseWorkspace } from "./leases.js";
 import { randomUUID } from "node:crypto";
 import { createReadStream, createWriteStream } from "node:fs";
-import {
-  mkdir,
-  unlink,
-  readdir,
-  stat,
-  readFile,
-  statfs,
-} from "node:fs/promises";
+import { mkdir, unlink, stat } from "node:fs/promises";
 import { pipeline } from "node:stream/promises";
 import path from "node:path";
 import { z } from "zod";
@@ -24,12 +19,39 @@ import { db, transaction } from "./db.js";
 import { authRoutes, authenticated } from "./auth.js";
 import { config } from "./config.js";
 import { bus, event } from "./events.js";
-import { safeName, seal, confined, redact } from "./security.js";
-import { validRepo } from "../shared.js";
+import { safeName, seal, redact } from "./security.js";
+import { normalizeGithubRepo } from "../shared.js";
+import { concurrentTasks } from "./settings.js";
+import { createResourceMonitor } from "./resources.js";
+import { disconnectAccount } from "./accounts.js";
 import { active, switchAccount } from "./worker.js";
 import { launch, workspace, type Running } from "./runtime.js";
-import { git, github, initializeWorkspace, pushBranch } from "./git.js";
+import {
+  git,
+  github,
+  initializeWorkspace,
+  pushBranch,
+  projectToken,
+} from "./git.js";
 const uuid = z.string().uuid();
+const projectFields =
+  "id,name,repo,base_branch,created_at,(github_token <> '') AS github_configured";
+async function verifyRepository(repo: string, token: string) {
+  try {
+    return await github("/repos/" + repo, "GET", undefined, token);
+  } catch (e: any) {
+    const messages: Record<number, string> = {
+      401: "GitHub rejected this project's token. Check the token and try again.",
+      403: "GitHub denied access. Check this project's token permissions or try again after the API rate limit resets.",
+      404: "Repository not found or access denied. Check the repository address and add a token for this project if it is private.",
+    };
+    if (messages[e.githubStatus])
+      throw Object.assign(new Error(messages[e.githubStatus]), {
+        statusCode: e.githubStatus === 401 ? 400 : e.githubStatus,
+      });
+    throw e;
+  }
+}
 const authRuns = new Map<
   string,
   { runtime: Running; events: any[]; timer: NodeJS.Timeout }
@@ -55,6 +77,7 @@ async function idle(id: string) {
     });
 }
 export async function createApp() {
+  const resources = createResourceMonitor();
   const app = Fastify({
     logger: {
       level: "info",
@@ -107,9 +130,12 @@ export async function createApp() {
     if (code >= 500)
       app.log.error({ message: redact(e.message) }, "Request failed");
   });
+  folderRoutes(app);
   app.get("/api/overview", async () => ({
     projects: (
-      await db.query("SELECT * FROM projects ORDER BY created_at DESC")
+      await db.query(
+        "SELECT " + projectFields + " FROM projects ORDER BY created_at DESC",
+      )
     ).rows,
     accounts: (
       await db.query("SELECT * FROM accounts ORDER BY priority,created_at")
@@ -130,47 +156,87 @@ export async function createApp() {
     ).rows;
   });
   app.get("/api/system", async () => {
-    const fs = await statfs(config.data);
+    const [metrics, maximum, jobs] = await Promise.all([
+      resources.read(),
+      concurrentTasks(),
+      db.query(
+        "SELECT count(*) FILTER (WHERE state IN ('running','waiting_approval'))::int running, count(*) FILTER (WHERE state='queued')::int queued, count(*) FILTER (WHERE state='waiting_account')::int waiting_accounts FROM jobs",
+      ),
+    ]);
     return {
-      freeBytes: fs.bavail * fs.bsize,
-      totalBytes: fs.blocks * fs.bsize,
-      running: active.size,
-      githubConfigured: !!(
-        await db.query("SELECT 1 FROM settings WHERE key='github_token'")
-      ).rowCount,
+      resources: metrics,
+      maxConcurrent: maximum,
+      running: jobs.rows[0].running,
+      queued: jobs.rows[0].queued,
+      waitingAccounts: jobs.rows[0].waiting_accounts,
     };
   });
-  app.post("/api/settings/github", async (req) => {
-    const { token } = z
-      .object({ token: z.string().min(10).max(500) })
+  app.post("/api/settings/execution", async (req) => {
+    const { maxConcurrent } = z
+      .object({
+        maxConcurrent: z.number().int().positive().refine(Number.isSafeInteger),
+      })
       .parse(req.body);
-    const r = await fetch("https://api.github.com/user", {
-      headers: { Authorization: "Bearer " + token },
+    await transaction(async (c) => {
+      await c.query("SELECT pg_advisory_xact_lock(417028)");
+      await c.query(
+        "INSERT INTO settings(key,value) VALUES('max_concurrent',$1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        [String(maxConcurrent)],
+      );
     });
-    if (!r.ok)
-      throw Object.assign(new Error("GitHub rejected this token"), {
-        statusCode: 400,
-      });
-    await db.query(
-      "INSERT INTO settings(key,value) VALUES('github_token',$1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-      [seal(token)],
-    );
-    return { ok: true };
+    return { maxConcurrent };
   });
   app.post("/api/projects", async (req) => {
     const p = z
       .object({
-        repo: z.string().refine(validRepo),
+        repo: z.string().max(2048),
+        token: z.string().min(10).max(500).optional(),
         name: z.string().min(1).max(100).optional(),
       })
       .parse(req.body);
-    const repo = await github("/repos/" + p.repo);
+    const normalized = normalizeGithubRepo(p.repo);
+    if (!normalized)
+      throw Object.assign(
+        new Error(
+          "Enter owner/repository or a GitHub repository URL, such as https://github.com/owner/repository.",
+        ),
+        { statusCode: 400 },
+      );
+    p.repo = normalized;
+    const repo = await verifyRepository(p.repo, p.token || "");
     return (
       await db.query(
-        "INSERT INTO projects(id,name,repo,base_branch) VALUES($1,$2,$3,$4) RETURNING *",
-        [randomUUID(), p.name || repo.name, p.repo, repo.default_branch],
+        "INSERT INTO projects(id,name,repo,base_branch,github_token) VALUES($1,$2,$3,$4,$5) RETURNING " +
+          projectFields,
+        [
+          randomUUID(),
+          p.name || repo.name,
+          p.repo,
+          repo.default_branch,
+          p.token ? seal(p.token) : "",
+        ],
       )
     ).rows[0];
+  });
+  app.patch("/api/projects/:id", async (req) => {
+    const id = idOf(req);
+    const p = z
+      .object({
+        name: z.string().trim().min(1).max(100).optional(),
+        token: z.string().min(10).max(500).nullable().optional(),
+      })
+      .parse(req.body);
+    const project = (await db.query("SELECT * FROM projects WHERE id=$1", [id]))
+      .rows[0];
+    if (!project)
+      throw Object.assign(new Error("Project not found"), { statusCode: 404 });
+    if (p.token) await verifyRepository(project.repo, p.token);
+    const result = await db.query(
+      "UPDATE projects SET name=COALESCE($2,name),github_token=CASE WHEN $3 THEN $4 ELSE github_token END WHERE id=$1 RETURNING " +
+        projectFields,
+      [id, p.name || null, p.token !== undefined, p.token ? seal(p.token) : ""],
+    );
+    return result.rows[0];
   });
   app.post("/api/accounts", async (req) => {
     const a = z
@@ -217,7 +283,7 @@ export async function createApp() {
         throw Object.assign(new Error("Account is busy"), { statusCode: 409 });
       const row = (
         await c.query(
-          "UPDATE accounts SET status='authenticating' WHERE id=$1 AND status NOT IN ('authenticating','inspecting') RETURNING *",
+          "UPDATE accounts SET status='authenticating' WHERE id=$1 AND status NOT IN ('authenticating','inspecting','disconnecting') RETURNING *",
           [id],
         )
       ).rows[0];
@@ -309,6 +375,9 @@ export async function createApp() {
     );
     return { ok: true };
   });
+  app.post("/api/accounts/:id/logout", async (req) =>
+    disconnectAccount(idOf(req)),
+  );
   app.post("/api/accounts/:id/recheck", async (req) => {
     const id = idOf(req);
     await db.query(
@@ -377,12 +446,14 @@ export async function createApp() {
     }
   });
   const chatSchema = z.object({
-    project_id: uuid,
-    title: z.string().min(1).max(160),
+    project_id: uuid.nullable().default(null),
+    title: z.string().trim().max(160).default(""),
     provider: z.enum(["codex", "claude"]),
     account_id: uuid,
     model: z.string().max(100).default(""),
-    effort: z.enum(["", "low", "medium", "high", "xhigh"]).default(""),
+    effort: z
+      .enum(["", "none", "minimal", "low", "medium", "high", "xhigh", "max"])
+      .default(""),
     autonomous: z.boolean().default(false),
     handoff: z.enum(["manual", "auto"]).default("manual"),
   });
@@ -409,11 +480,11 @@ export async function createApp() {
     const id = randomUUID();
     return (
       await db.query(
-        "INSERT INTO chats(id,project_id,title,provider,account_id,model,effort,autonomous,handoff,branch) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *",
+        "INSERT INTO chats(id,project_id,title,provider,account_id,model,effort,autonomous,handoff,branch,auto_title) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *",
         [
           id,
           c.project_id,
-          c.title,
+          c.title || "New chat",
           c.provider,
           c.account_id,
           c.model,
@@ -421,6 +492,7 @@ export async function createApp() {
           c.autonomous,
           c.handoff,
           "workspace/" + id.slice(0, 8),
+          !c.title,
         ],
       )
     ).rows[0];
@@ -468,7 +540,16 @@ export async function createApp() {
       .object({
         title: z.string().min(1).max(160),
         model: z.string().max(100),
-        effort: z.enum(["", "low", "medium", "high", "xhigh"]),
+        effort: z.enum([
+          "",
+          "none",
+          "minimal",
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max",
+        ]),
         autonomous: z.boolean(),
         handoff: z.enum(["manual", "auto"]),
       })
@@ -478,7 +559,7 @@ export async function createApp() {
         statusCode: 400,
       });
     await db.query(
-      "UPDATE chats SET title=$2,model=$3,effort=$4,autonomous=$5,handoff=$6 WHERE id=$1",
+      "UPDATE chats SET title=$2,auto_title=false,model=$3,effort=$4,autonomous=$5,handoff=$6 WHERE id=$1",
       [id, p.title, p.model, p.effort, p.autonomous, p.handoff],
     );
     return { ok: true };
@@ -522,6 +603,16 @@ export async function createApp() {
         "INSERT INTO messages(id,chat_id,role,content,client_id) VALUES($1,$2,$3,$4,$5)",
         [mid, id, "user", p.content, p.client_id],
       );
+      const title = p.content.trim().replace(/\s+/g, " ");
+      if (title)
+        await c.query(
+          "UPDATE chats SET title=$2,auto_title=false WHERE id=$1 AND auto_title=true",
+          [
+            id,
+            Array.from(title).slice(0, 64).join("") +
+              (Array.from(title).length > 64 ? "…" : ""),
+          ],
+        );
       await c.query(
         "UPDATE attachments SET message_id=$1 WHERE id=ANY($2::uuid[])",
         [mid, p.attachment_ids],
@@ -722,6 +813,21 @@ export async function createApp() {
       createReadStream(path.join(config.data, "uploads", f.storage_name)),
     );
   });
+  app.get("/api/chats/:id/context", async (req) => {
+    const id = idOf(req),
+      chat = await chatBy(id);
+    const entries = chat.initialized
+      ? await inspectWorkspace(id, "", "index")
+      : [];
+    const folders = await chatFolders(id);
+    for (const f of folders)
+      entries.push({
+        kind: "file",
+        name: "Folders/" + f.name,
+        path: "/workspace/.workspace-folders/" + f.name,
+      });
+    return { entries, initialized: chat.initialized };
+  });
   app.get("/api/chats/:id/files", async (req) => {
     const id = idOf(req);
     await chatBy(id);
@@ -749,15 +855,22 @@ export async function createApp() {
       .type("application/octet-stream");
     return reply.send(data);
   });
-  app.get("/api/chats/:id/diff", async (req) => ({
-    diff: await git(workspace(idOf(req)), [
-      "diff",
-      "HEAD",
-      "--",
-      ".",
-      ":!.workspace-attachments",
-    ]),
-  }));
+  app.get("/api/chats/:id/diff", async (req) => {
+    const chat = await chatBy(idOf(req));
+    if (!chat.project_id)
+      throw Object.assign(new Error("This chat has no Git repository."), {
+        statusCode: 409,
+      });
+    return {
+      diff: await git(workspace(chat.id), [
+        "diff",
+        "HEAD",
+        "--",
+        ".",
+        ":!.workspace-attachments",
+      ]),
+    };
+  });
   app.post("/api/chats/:id/git", async (req) => {
     const id = idOf(req);
     await idle(id);
@@ -765,14 +878,21 @@ export async function createApp() {
       throw Object.assign(new Error("Close the terminal before publishing"), {
         statusCode: 409,
       });
-    const chat = await chatBy(id),
-      p = z
-        .object({
-          action: z.enum(["commit", "push", "pr"]),
-          message: z.string().min(1).max(500),
-          client_id: uuid,
-        })
-        .parse(req.body);
+    const chat = await chatBy(id);
+    if (!chat.project_id)
+      throw Object.assign(
+        new Error(
+          "This chat has no Git repository. Files and terminal remain available.",
+        ),
+        { statusCode: 409 },
+      );
+    const p = z
+      .object({
+        action: z.enum(["commit", "push", "pr"]),
+        message: z.string().min(1).max(500),
+        client_id: uuid,
+      })
+      .parse(req.body);
     const previous = (
       await db.query("SELECT * FROM publications WHERE id=$1", [p.client_id])
     ).rows[0];
@@ -809,15 +929,23 @@ export async function createApp() {
             "/pulls?head=" +
             encodeURIComponent(project.repo.split("/")[0] + ":" + chat.branch) +
             "&state=open",
+          "GET",
+          undefined,
+          projectToken(project),
         );
         result =
           existing[0] ||
-          (await github("/repos/" + project.repo + "/pulls", "POST", {
-            title: p.message,
-            head: chat.branch,
-            base: project.base_branch,
-            body: "Created with AI Workspace.",
-          }));
+          (await github(
+            "/repos/" + project.repo + "/pulls",
+            "POST",
+            {
+              title: p.message,
+              head: chat.branch,
+              base: project.base_branch,
+              body: "Created with AI Workspace.",
+            },
+            projectToken(project),
+          ));
       }
       await db.query(
         "UPDATE publications SET status='completed',result=$2 WHERE id=$1",

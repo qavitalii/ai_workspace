@@ -7,7 +7,14 @@ import { config } from "./config.js";
 export async function inspectWorkspace(
   chatId: string,
   relative: string,
-  mode: "list" | "file",
+  mode: "list" | "file" | "index",
+) {
+  return inspectDirectory(workspace(chatId), relative, mode);
+}
+export async function inspectDirectory(
+  source: string,
+  relative: string,
+  mode: "list" | "file" | "index",
 ) {
   if (
     relative.includes("\0") ||
@@ -15,7 +22,7 @@ export async function inspectWorkspace(
     relative.startsWith("/")
   )
     throw Object.assign(new Error("Invalid path"), { statusCode: 400 });
-  const script = `const fs=require('fs'),path=require('path');const p=fs.realpathSync(path.resolve('/workspace',process.argv[1]));if(p!='/workspace'&&!p.startsWith('/workspace/'))throw Error('Path escapes workspace');if(process.argv[2]==='list'){process.stdout.write(JSON.stringify(fs.readdirSync(p,{withFileTypes:true}).filter(f=>!f.isSymbolicLink()&&f.name!=='.git').slice(0,500).map(f=>({name:f.name,path:path.posix.join(process.argv[1],f.name),directory:f.isDirectory()}))));}else{const s=fs.statSync(p);if(!s.isFile()||s.size>100*1024*1024)throw Error('File must be regular and at most 100 MB');fs.createReadStream(p).pipe(process.stdout);}`;
+  const script = `const fs=require('fs'),path=require('path');const p=fs.realpathSync(path.resolve('/workspace',process.argv[1]));if(p!='/workspace'&&!p.startsWith('/workspace/'))throw Error('Path escapes workspace');if(process.argv[2]==='index'){const out=[],skip=new Set(['.git','node_modules','.workspace-folders','.workspace-attachments','.venv','dist']);let visited=0;function walk(dir,depth){if(depth>8||visited>5000)return;for(const f of fs.readdirSync(dir,{withFileTypes:true})){if(++visited>5000)return;if(f.isSymbolicLink()||skip.has(f.name))continue;const next=path.join(dir,f.name),rel=path.relative('/workspace',next);if(f.isDirectory())walk(next,depth+1);else if(f.isFile()){out.push({kind:'file',name:rel,path:'/workspace/'+rel});if(f.name==='SKILL.md')out.push({kind:'skill',name:path.basename(dir),path:'/workspace/'+rel});}}}walk(p,0);process.stdout.write(JSON.stringify(out));}else if(process.argv[2]==='list'){process.stdout.write(JSON.stringify(fs.readdirSync(p,{withFileTypes:true}).filter(f=>!f.isSymbolicLink()&&f.name!=='.git').slice(0,500).map(f=>({name:f.name,path:path.posix.join(process.argv[1],f.name),directory:f.isDirectory()}))));}else{const s=fs.statSync(p);if(!s.isFile()||s.size>100*1024*1024)throw Error('File must be regular and at most 100 MB');fs.createReadStream(p).pipe(process.stdout);}`;
   const c = await docker.createContainer({
     Image: config.image,
     User: "1000:1000",
@@ -31,7 +38,7 @@ export async function inspectWorkspace(
       Mounts: [
         {
           Type: "bind",
-          Source: workspace(chatId),
+          Source: source,
           Target: "/workspace",
           ReadOnly: true,
         },
@@ -71,7 +78,7 @@ export async function inspectWorkspace(
         { statusCode: 400 },
       );
     const resultBuffer = Buffer.concat(chunks);
-    return mode === "list" ? JSON.parse(resultBuffer.toString()) : resultBuffer;
+    return mode !== "file" ? JSON.parse(resultBuffer.toString()) : resultBuffer;
   } finally {
     clearTimeout(timer);
     (stream as import("node:stream").Duplex).destroy();

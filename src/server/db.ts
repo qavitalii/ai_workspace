@@ -21,8 +21,17 @@ CREATE TABLE IF NOT EXISTS owner(id int PRIMARY KEY CHECK(id=1),password_hash te
 CREATE TABLE IF NOT EXISTS sessions(token_hash text PRIMARY KEY,expires_at timestamptz NOT NULL);
 CREATE TABLE IF NOT EXISTS settings(key text PRIMARY KEY,value text NOT NULL);
 CREATE TABLE IF NOT EXISTS projects(id uuid PRIMARY KEY,name text NOT NULL,repo text NOT NULL,base_branch text NOT NULL DEFAULT 'main',created_at timestamptz NOT NULL DEFAULT now());
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS github_token text;
+UPDATE projects SET github_token=COALESCE((SELECT value FROM settings WHERE key='github_token'),'') WHERE github_token IS NULL;
+ALTER TABLE projects ALTER COLUMN github_token SET DEFAULT '';
+ALTER TABLE projects ALTER COLUMN github_token SET NOT NULL;
 CREATE TABLE IF NOT EXISTS accounts(id uuid PRIMARY KEY,provider text NOT NULL CHECK(provider IN ('codex','claude')),name text NOT NULL,status text NOT NULL DEFAULT 'disconnected',priority int NOT NULL DEFAULT 0,reset_at timestamptz,limits jsonb,created_at timestamptz NOT NULL DEFAULT now());
 CREATE TABLE IF NOT EXISTS chats(id uuid PRIMARY KEY,project_id uuid NOT NULL REFERENCES projects(id),title text NOT NULL,provider text NOT NULL CHECK(provider IN ('codex','claude')),account_id uuid REFERENCES accounts(id),model text NOT NULL DEFAULT '',effort text NOT NULL DEFAULT '',autonomous boolean NOT NULL DEFAULT false,handoff text NOT NULL DEFAULT 'manual' CHECK(handoff IN ('manual','auto')),session_id text,session_account uuid,summary text NOT NULL DEFAULT '',branch text NOT NULL,initialized boolean NOT NULL DEFAULT false,created_at timestamptz NOT NULL DEFAULT now());
+ALTER TABLE chats ALTER COLUMN project_id DROP NOT NULL;
+ALTER TABLE chats ADD COLUMN IF NOT EXISTS auto_title boolean NOT NULL DEFAULT false;
+CREATE TABLE IF NOT EXISTS folder_links(id uuid PRIMARY KEY,name text NOT NULL,chat_id uuid REFERENCES chats(id) ON DELETE CASCADE,project_id uuid REFERENCES projects(id) ON DELETE CASCADE,read_only boolean NOT NULL DEFAULT true,CHECK((chat_id IS NULL) <> (project_id IS NULL)));
+CREATE UNIQUE INDEX IF NOT EXISTS folder_link_chat ON folder_links(chat_id,name) WHERE chat_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS folder_link_project ON folder_links(project_id,name) WHERE project_id IS NOT NULL;
 CREATE TABLE IF NOT EXISTS messages(id uuid PRIMARY KEY,chat_id uuid NOT NULL REFERENCES chats(id),role text NOT NULL,content text NOT NULL,client_id uuid,created_at timestamptz NOT NULL DEFAULT now(),UNIQUE(chat_id,client_id));
 CREATE TABLE IF NOT EXISTS attachments(id uuid PRIMARY KEY,chat_id uuid NOT NULL REFERENCES chats(id),message_id uuid REFERENCES messages(id),name text NOT NULL,mime text NOT NULL,size bigint NOT NULL,storage_name text NOT NULL,client_id uuid NOT NULL,created_at timestamptz NOT NULL DEFAULT now(),UNIQUE(chat_id,client_id));
 CREATE TABLE IF NOT EXISTS jobs(id uuid PRIMARY KEY,chat_id uuid NOT NULL REFERENCES chats(id),message_id uuid NOT NULL REFERENCES messages(id),account_id uuid REFERENCES accounts(id),state text NOT NULL DEFAULT 'queued',attempt int NOT NULL DEFAULT 0,error text,container_id text,created_at timestamptz NOT NULL DEFAULT now(),updated_at timestamptz NOT NULL DEFAULT now());
