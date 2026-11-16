@@ -1,4 +1,7 @@
-import { ComposerInput, chatCommands } from "./ComposerInput";
+import { AgentQuestions } from "./AgentQuestions";
+import { GithubTokenHelp } from "./GithubTokenHelp";
+import { commandsFor, slashCommand } from "../commands";
+import { ComposerInput } from "./ComposerInput";
 import { ModelOptions } from "./ModelOptions";
 import { Folders } from "./Folders";
 import {
@@ -306,7 +309,15 @@ export function App() {
           }));
         if (["tool", "log", "handoff"].includes(ev.type))
           setLiveLogs((s) => [...s.slice(-149), ev]);
-        if (["status", "approval", "handoff"].includes(ev.type)) {
+        if (
+          [
+            "status",
+            "approval",
+            "handoff",
+            "request_resolved",
+            "commands",
+          ].includes(ev.type)
+        ) {
           void loadDetail(chatId);
           void loadOverview();
         }
@@ -400,7 +411,23 @@ export function App() {
       );
     }
   }
+  const chatCommands = commandsFor(
+    detail?.chat.provider || "codex",
+    detail?.chat.native_commands || [],
+  );
   function command(name: string) {
+    if (name === "plan")
+      void run(async () => {
+        await api(`/chats/${chatId}/mode`, { mode: "plan" });
+        await loadDetail();
+      });
+    if (["permissions", "rename"].includes(name)) setModal("chat-settings");
+    if (["status", "usage"].includes(name)) setModal("chat-status");
+    if (name === "clear") setModal("chat");
+    if (name === "diff") setPanel("diff");
+    if (name === "mention") setText("@");
+    if (name === "skills") setText("$");
+    if (name === "resume") setModal("resume-chat");
     if (name === "new") setModal("chat");
     if (name === "model" || name === "settings") setModal("chat-settings");
     if (name === "files" || name === "terminal") setPanel(name);
@@ -412,11 +439,32 @@ export function App() {
     if (name === "help") setModal("composer-help");
   }
   async function send() {
-    const shortcut = text.trim().match(/^\/([a-z]+)$/);
-    if (shortcut && chatCommands.some((c) => c.name === shortcut[1])) {
-      command(shortcut[1]);
-      setText("");
-      return;
+    const shortcut = slashCommand(text);
+    if (shortcut) {
+      const selected = chatCommands.find((c) => c.name === shortcut.name);
+      if (!selected || selected.unavailable) {
+        setError(
+          selected?.unavailable ||
+            "Unknown command. Type / to see available commands.",
+        );
+        return;
+      }
+      if (
+        !selected.native &&
+        !(shortcut.name === "plan" && shortcut.arguments)
+      ) {
+        if (shortcut.arguments) {
+          setError(
+            "Use /" +
+              shortcut.name +
+              " without arguments to open its controls.",
+          );
+          return;
+        }
+        setText("");
+        command(shortcut.name);
+        return;
+      }
     }
 
     if (
@@ -708,7 +756,11 @@ export function App() {
                   <ArrowRightLeft size={13} />
                 </button>
                 <span className="chat-mode">
-                  {chat.autonomous ? "Autonomous" : "With approvals"}
+                  {chat.mode === "plan"
+                    ? "Plan mode"
+                    : chat.autonomous
+                      ? "Autonomous"
+                      : "With approvals"}
                 </span>
               </div>
               {account && account.status === "disconnected" && (
@@ -813,39 +865,51 @@ export function App() {
                       ))}
                   </details>
                 )}
-                {detail.approvals.map((a: any) => (
-                  <div className="approval" key={a.id}>
-                    <ShieldCheck size={20} />
-                    <div>
-                      <strong>Your permission is needed</strong>
-                      <pre>{a.description}</pre>
-                      <div className="button-row">
-                        <button
-                          className="primary"
-                          onClick={() =>
-                            run(async () => {
-                              await api("/approvals/" + a.id, { allow: true });
-                              await loadDetail();
-                            })
-                          }
-                        >
-                          Allow
-                        </button>
-                        <button
-                          className="secondary"
-                          onClick={() =>
-                            run(async () => {
-                              await api("/approvals/" + a.id, { allow: false });
-                              await loadDetail();
-                            })
-                          }
-                        >
-                          Deny
-                        </button>
+                {detail.approvals.map((a: any) =>
+                  a.kind === "question" ? (
+                    <AgentQuestions
+                      key={a.id}
+                      request={a}
+                      onAnswered={loadDetail}
+                    />
+                  ) : (
+                    <div className="approval" key={a.id}>
+                      <ShieldCheck size={20} />
+                      <div>
+                        <strong>Your permission is needed</strong>
+                        <pre>{a.description}</pre>
+                        <div className="button-row">
+                          <button
+                            className="primary"
+                            onClick={() =>
+                              run(async () => {
+                                await api("/approvals/" + a.id, {
+                                  allow: true,
+                                });
+                                await loadDetail();
+                              })
+                            }
+                          >
+                            Allow
+                          </button>
+                          <button
+                            className="secondary"
+                            onClick={() =>
+                              run(async () => {
+                                await api("/approvals/" + a.id, {
+                                  allow: false,
+                                });
+                                await loadDetail();
+                              })
+                            }
+                          >
+                            Deny
+                          </button>
+                        </div>
                       </div>
                     </div>
-                  </div>
-                ))}
+                  ),
+                )}
                 {job &&
                   ["failed", "interrupted", "waiting_account"].includes(
                     job.state,
@@ -951,6 +1015,8 @@ export function App() {
                   <ComposerInput
                     key={chat.id}
                     chatId={chat.id}
+                    commands={chatCommands}
+                    provider={chat.provider}
                     value={text}
                     onChange={setText}
                     onFiles={(files) => void addFiles(files)}
@@ -958,6 +1024,28 @@ export function App() {
                     onCommand={command}
                     drag={drag}
                   />
+                  {chat.mode === "plan" && (
+                    <div className="plan-banner">
+                      <span>
+                        Plan mode · review the plan before implementing
+                      </span>
+                      <button
+                        type="button"
+                        className="text-button"
+                        disabled={busy}
+                        onClick={() =>
+                          run(async () => {
+                            await api(`/chats/${chatId}/mode`, {
+                              mode: "default",
+                            });
+                            await loadDetail();
+                          })
+                        }
+                      >
+                        Switch to execution
+                      </button>
+                    </div>
+                  )}
                   <div className="composer-actions">
                     <input
                       ref={fileInput}
@@ -1073,11 +1161,59 @@ export function App() {
           </div>
         )}
       </main>
+      {modal === "chat-status" && chat && (
+        <Modal title="Chat status" onClose={() => setModal("")}>
+          <p>Agent: {chat.provider === "codex" ? "Codex" : "Claude Code"}</p>
+          <p>
+            Account:{" "}
+            {overview.accounts.find((a: any) => a.id === chat.account_id)?.name}
+          </p>
+          <p>
+            Model: {chat.model || "Agent default"} · Reasoning:{" "}
+            {chat.effort || "Agent default"}
+          </p>
+          <p>
+            Mode: {chat.mode === "plan" ? "Plan" : "Execution"} · Status:{" "}
+            {job?.state || "Ready"}
+          </p>
+          <p>Usage reported by the provider:</p>
+          <pre>
+            {JSON.stringify(
+              overview.accounts.find((a: any) => a.id === chat.account_id)
+                ?.limits || "No usage information reported yet.",
+              null,
+              2,
+            )}
+          </pre>
+        </Modal>
+      )}
+      {modal === "resume-chat" && (
+        <Modal title="Resume a chat" onClose={() => setModal("")}>
+          {overview.chats
+            .filter((c: any) => c.provider === chat?.provider)
+            .map((c: any) => (
+              <p key={c.id}>
+                <button
+                  className="text-button"
+                  onClick={() => {
+                    selectChat(c.id);
+                    setModal("");
+                  }}
+                >
+                  {c.title}
+                </button>
+              </p>
+            ))}
+        </Modal>
+      )}
       {modal === "composer-help" && (
         <Modal title="Commands and references" onClose={() => setModal("")}>
           {chatCommands.map((c) => (
             <p key={c.name}>
               <strong>/{c.name}</strong> — {c.description}
+              {c.unavailable && (
+                <small className="muted"> · {c.unavailable}</small>
+              )}
             </p>
           ))}
           <p>
@@ -1086,9 +1222,11 @@ export function App() {
             inserted as explicit paths for the agent.
           </p>
           <p className="muted">
-            These are Workspace commands. Native CLI slash commands,
-            account-wide skills and app mentions are not automatically available
-            in this integration.
+            Commands match the selected agent. Some open Workspace controls;
+            native actions run through the agent. Claude Code adds commands
+            reported by its session after the first message. Unavailable
+            commands are listed here for clarity and are not sent as ordinary
+            prompts.
           </p>
         </Modal>
       )}
@@ -2048,11 +2186,7 @@ function ConnectProject({ onCreated }: { onCreated: () => Promise<void> }) {
             maxLength={500}
           />
         </Field>
-        <p className="muted">
-          Needed for private repositories and publishing. Select this repository
-          in your token; allow Contents and Pull requests: read/write for
-          publishing.
-        </p>
+        <GithubTokenHelp />
         {error && (
           <p className="inline-error" role="alert">
             {error}

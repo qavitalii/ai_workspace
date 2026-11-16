@@ -1,3 +1,4 @@
+import { slashCommand } from "../commands.js";
 import { foldersBusy, chatFolders } from "./folders.js";
 import { randomUUID } from "node:crypto";
 import { db, transaction } from "./db.js";
@@ -30,7 +31,10 @@ export async function recover() {
     "UPDATE jobs SET state='interrupted',error='Server restarted. Inspect files and command results before resuming.',updated_at=now() WHERE state IN ('running','waiting_approval')",
   );
   await db.query(
-    "UPDATE accounts SET status='disconnected' WHERE status IN ('authenticating','inspecting')",
+    "UPDATE accounts SET status='disconnected' WHERE status='authenticating'",
+  );
+  await db.query(
+    "UPDATE accounts SET status='ready' WHERE status='inspecting'",
   );
   await db.query(
     "UPDATE accounts SET status='disconnect_failed' WHERE status='disconnecting'",
@@ -159,11 +163,33 @@ async function run(job: any) {
         typeof reset === "number" ? new Date(reset * 1000) : null,
       ]);
     }
-    if (e.type === "approval") {
+    if (e.type === "commands")
+      await db.query("UPDATE chats SET native_commands=$2 WHERE id=$1", [
+        chat.id,
+        JSON.stringify(e.commands),
+      ]);
+    if (e.type === "request_resolved") {
+      await db.query(
+        "UPDATE approvals SET decision=false WHERE job_id=$1 AND request_id=$2 AND decision IS NULL",
+        [job.id, e.id],
+      );
+      await db.query(
+        "UPDATE jobs SET state='running' WHERE id=$1 AND state='waiting_approval' AND NOT EXISTS (SELECT 1 FROM approvals WHERE job_id=$1 AND decision IS NULL)",
+        [job.id],
+      );
+    }
+    if (e.type === "approval" || e.type === "question") {
       const id = randomUUID();
       await db.query(
-        "INSERT INTO approvals(id,job_id,request_id,description) VALUES($1,$2,$3,$4)",
-        [id, job.id, e.id, String(e.description).slice(0, 16000)],
+        "INSERT INTO approvals(id,job_id,request_id,description,kind,questions) VALUES($1,$2,$3,$4,$5,$6)",
+        [
+          id,
+          job.id,
+          e.id,
+          String(e.description || "Your agent has a question").slice(0, 16000),
+          e.type === "question" ? "question" : "permission",
+          e.questions ? JSON.stringify(e.questions) : null,
+        ],
       );
       await db.query("UPDATE jobs SET state='waiting_approval' WHERE id=$1", [
         job.id,
@@ -228,7 +254,12 @@ async function run(job: any) {
         job.message_id,
       ])
     ).rows[0].content;
+    const shortcut = slashCommand(latest);
     const native = chat.session_id && chat.session_account === job.account_id;
+    if (shortcut?.name === "compact" && !native)
+      throw new Error(
+        "This account has no session to compact. Send a message first.",
+      );
     let prompt =
       (native
         ? ""
@@ -236,7 +267,7 @@ async function run(job: any) {
           ? "Context from earlier work (verify actual files and command outcomes):\n" +
             chat.summary +
             "\n\n"
-          : "") + latest;
+          : "") + (shortcut?.name === "plan" ? shortcut.arguments : latest);
     if (job.attempt > 0)
       prompt +=
         "\nThis is a continuation. Inspect existing changes before acting; never blindly repeat external operations.";
@@ -289,7 +320,23 @@ async function run(job: any) {
       type: "start",
       input: {
         provider: chat.provider,
-        prompt,
+        prompt:
+          shortcut?.name === "plan"
+            ? prompt
+            : shortcut && chat.provider === "claude"
+              ? latest
+              : shortcut?.name === "review"
+                ? shortcut.arguments
+                : prompt,
+        mode: chat.mode,
+        operation:
+          shortcut && shortcut.name !== "plan"
+            ? chat.provider === "claude"
+              ? "native"
+              : shortcut.name === "compact"
+                ? "compact"
+                : "review"
+            : undefined,
         model: chat.model,
         effort: chat.effort,
         autonomous: chat.autonomous,

@@ -1,3 +1,5 @@
+import { commandsFor, slashCommand } from "../commands.js";
+import { accountModels } from "./models.js";
 import { chatFolders } from "./folders.js";
 import { folderRoutes } from "./folder-routes.js";
 import Fastify from "fastify";
@@ -326,7 +328,7 @@ export async function createApp() {
             .stop()
             .then(() =>
               db.query(
-                "UPDATE accounts SET status=$2,reset_at=NULL WHERE id=$1 AND status='authenticating'",
+                "UPDATE accounts SET status=$2,reset_at=NULL,model_catalog=NULL,models_updated_at=NULL WHERE id=$1 AND status='authenticating'",
                 [id, e.success ? "ready" : "disconnected"],
               ),
             )
@@ -398,63 +400,10 @@ export async function createApp() {
     return { ok: true };
   });
   app.post("/api/accounts/:id/models", async (req) => {
-    const id = idOf(req),
-      a = await transaction(async (c) => {
-        await c.query("SELECT pg_advisory_xact_lock(417028)");
-        if (
-          (
-            await c.query(
-              "SELECT 1 FROM jobs WHERE account_id=$1 AND state IN ('running','waiting_approval')",
-              [id],
-            )
-          ).rowCount
-        )
-          throw Object.assign(new Error("Account is busy"), {
-            statusCode: 409,
-          });
-        const a = (
-          await c.query(
-            "UPDATE accounts SET status='inspecting' WHERE id=$1 AND status='ready' RETURNING *",
-            [id],
-          )
-        ).rows[0];
-        if (!a)
-          throw Object.assign(new Error("Account unavailable"), {
-            statusCode: 409,
-          });
-        return a;
-      });
-    let r: Running | undefined;
-    try {
-      return await new Promise<any>(async (resolve, reject) => {
-        const timer = setTimeout(
-          () => reject(new Error("Model request timed out")),
-          30000,
-        );
-        try {
-          r = await launch(null, id, (e) => {
-            if (e.type === "models") {
-              clearTimeout(timer);
-              resolve(e.models);
-            }
-            if (e.type === "failed") {
-              clearTimeout(timer);
-              reject(new Error(e.error));
-            }
-          });
-          r.send({ type: "models", provider: a.provider });
-        } catch (e) {
-          clearTimeout(timer);
-          reject(e);
-        }
-      });
-    } finally {
-      await r?.stop();
-      await db.query(
-        "UPDATE accounts SET status='ready' WHERE id=$1 AND status='inspecting'",
-        [id],
-      );
-    }
+    const p = z
+      .object({ refresh: z.boolean().default(false) })
+      .parse(req.body || {});
+    return accountModels(idOf(req), p.refresh);
   });
   const chatSchema = z.object({
     project_id: uuid.nullable().default(null),
@@ -564,6 +513,16 @@ export async function createApp() {
     );
     return { ok: true };
   });
+  app.post("/api/chats/:id/mode", async (req) => {
+    const id = idOf(req),
+      p = z.object({ mode: z.enum(["default", "plan"]) }).parse(req.body);
+    await transaction(async (c) => {
+      await c.query("SELECT id FROM chats WHERE id=$1 FOR UPDATE", [id]);
+      await idle(id);
+      await c.query("UPDATE chats SET mode=$2 WHERE id=$1", [id, p.mode]);
+    });
+    return { ok: true };
+  });
   app.post("/api/chats/:id/messages", async (req) => {
     const id = idOf(req),
       p = z
@@ -578,7 +537,11 @@ export async function createApp() {
         statusCode: 400,
       });
     return transaction(async (c) => {
-      await c.query("SELECT id FROM chats WHERE id=$1 FOR UPDATE", [id]);
+      const chat = (
+        await c.query("SELECT * FROM chats WHERE id=$1 FOR UPDATE", [id])
+      ).rows[0];
+      if (!chat)
+        throw Object.assign(new Error("Chat not found"), { statusCode: 404 });
       const previous = (
         await c.query(
           "SELECT id FROM messages WHERE chat_id=$1 AND client_id=$2",
@@ -586,6 +549,60 @@ export async function createApp() {
         )
       ).rows[0];
       if (previous) return previous;
+      const shortcut = slashCommand(p.content);
+      if (shortcut) {
+        const command = commandsFor(chat.provider, chat.native_commands).find(
+          (c) => c.name === shortcut.name,
+        );
+        if (
+          !command ||
+          command.unavailable ||
+          (!command.native && shortcut.name !== "plan")
+        )
+          throw Object.assign(
+            new Error(
+              command?.unavailable ||
+                "Use the command menu for supported actions. Unknown commands are not sent as prompts.",
+            ),
+            { statusCode: 400 },
+          );
+        if (shortcut.name === "plan") {
+          if (!shortcut.arguments.trim())
+            throw Object.assign(
+              new Error(
+                "Add a task after /plan, or switch mode using the command menu.",
+              ),
+              { statusCode: 400 },
+            );
+          await c.query("UPDATE chats SET mode='plan' WHERE id=$1", [id]);
+        }
+        if (
+          shortcut.name === "compact" &&
+          (!chat.session_id || chat.session_account !== chat.account_id)
+        )
+          throw Object.assign(
+            new Error(
+              "Send a message with this account before compacting its session.",
+            ),
+            { statusCode: 400 },
+          );
+        if (command.native && p.attachment_ids.length)
+          throw Object.assign(
+            new Error(
+              "Send attachments in a separate message before running this command.",
+            ),
+            { statusCode: 400 },
+          );
+        if (
+          chat.provider === "codex" &&
+          shortcut.name === "compact" &&
+          shortcut.arguments
+        )
+          throw Object.assign(
+            new Error("Codex /compact does not take arguments."),
+            { statusCode: 400 },
+          );
+      }
       const files = (
         await c.query(
           "SELECT id FROM attachments WHERE chat_id=$1 AND id=ANY($2::uuid[]) AND message_id IS NULL FOR UPDATE",
@@ -695,7 +712,7 @@ export async function createApp() {
     await transaction(async (c) => {
       const a = (
         await c.query(
-          "SELECT * FROM approvals WHERE id=$1 AND decision IS NULL FOR UPDATE",
+          "SELECT * FROM approvals WHERE id=$1 AND decision IS NULL AND kind='permission' FOR UPDATE",
           [id],
         )
       ).rows[0];
@@ -708,7 +725,53 @@ export async function createApp() {
         allow,
       ]);
       active.get(a.job_id)!.send({ type: "approve", id: a.request_id, allow });
-      await c.query("UPDATE jobs SET state='running' WHERE id=$1", [a.job_id]);
+      await c.query(
+        "UPDATE jobs SET state='running' WHERE id=$1 AND state='waiting_approval' AND NOT EXISTS (SELECT 1 FROM approvals WHERE job_id=$1 AND decision IS NULL)",
+        [a.job_id],
+      );
+    });
+    return { ok: true };
+  });
+  app.post("/api/questions/:id", async (req) => {
+    const id = idOf(req),
+      p = z
+        .object({
+          answers: z.record(
+            z.string(),
+            z.object({
+              answers: z.array(z.string().min(1).max(10000)).min(1).max(20),
+            }),
+          ),
+        })
+        .parse(req.body);
+    await transaction(async (c) => {
+      const a = (
+        await c.query(
+          "SELECT * FROM approvals WHERE id=$1 AND decision IS NULL AND kind='question' FOR UPDATE",
+          [id],
+        )
+      ).rows[0];
+      if (!a || !active.has(a.job_id))
+        throw Object.assign(new Error("This question is no longer active"), {
+          statusCode: 409,
+        });
+      const ids = a.questions.map((q: any) => q.id);
+      if (
+        ids.length !== Object.keys(p.answers).length ||
+        ids.some((key: string) => !p.answers[key])
+      )
+        throw Object.assign(
+          new Error("Answer every question before continuing."),
+          { statusCode: 400 },
+        );
+      await c.query("UPDATE approvals SET decision=true WHERE id=$1", [id]);
+      active
+        .get(a.job_id)!
+        .send({ type: "answer", id: a.request_id, answers: p.answers });
+      await c.query(
+        "UPDATE jobs SET state='running' WHERE id=$1 AND state='waiting_approval' AND NOT EXISTS (SELECT 1 FROM approvals WHERE job_id=$1 AND decision IS NULL)",
+        [a.job_id],
+      );
     });
     return { ok: true };
   });

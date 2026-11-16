@@ -88,7 +88,7 @@ On Linux VPS deployments, metrics describe the runtime host and the filesystem c
 
 ## 4. GitHub and agent accounts
 
-Create a GitHub fine-grained PAT under Settings → Developer settings → Personal access tokens → Fine-grained tokens. Select only the required repositories. Grant `Contents` and `Pull requests` read/write permissions. Organization-owned repositories may require administrator approval.
+Open [Create a fine-grained GitHub token](https://github.com/settings/personal-access-tokens/new), or go to GitHub Settings → Developer settings → Personal access tokens → Fine-grained tokens. Choose a name and expiration, select the repository owner, then **Only select repositories**. Select only the required repositories. Grant `Contents` and `Pull requests` read/write permissions. Click **Generate token** and paste the value into the project’s **Access token** field. GitHub only shows the value at creation. Organization-owned repositories may require administrator approval.
 
 Each project has its own token. Supply it when connecting a repository, or use the project settings button / Settings → Connections to replace or remove it. There is no global token for new projects. Upgrading copies a previously saved global token into existing projects; it never applies it to newly created projects. Each token is encrypted in the database. It is not stored in Git remote URLs or provided to agent containers. Read-only Git inspection and commits run without GitHub credentials. Publishing exports a bundle into a fresh trusted repository before pushing with credentials.
 
@@ -197,6 +197,21 @@ Keep this override in subsequent `up`/update commands. Each direct subdirectory 
 
 ## 9. Models, commands and references
 
-Select **Model** and **Reasoning effort** while creating a chat, or use the model button above Send / `/model` before the next task. **Load available models** queries the connected account; Codex model metadata determines advertised reasoning levels when available. Blank/default delegates selection to the official agent. Claude aliases are offered as convenience values; support depends on account and model. Changes are blocked while a task is active.
+Select **Model** and **Reasoning effort** while creating a chat, or use the model button above Send / `/model` before the next task. The Codex model catalog loads automatically when an account is selected. **Refresh models** requests a new catalog; concurrent requests share one lookup, and a per-account one-hour cache avoids launching another CLI on every visit. A cached catalog remains available during an active run; refresh waits until the account is idle. Sign-in/sign-out clears the cache. Codex model metadata determines advertised reasoning levels when available. Blank/default delegates selection to the official agent. Claude aliases are offered as convenience values; support depends on account and model. Changes are blocked while a task is active.
 
-The composer offers keyboard and touch suggestions: `/` for Workspace commands, `@` for workspace paths and connected folders, `$` for workspace `SKILL.md` files. Arrow keys select, Enter inserts/executes, Escape closes; Ctrl/Cmd+Enter sends. `/help` lists the supported commands. File/skill references become explicit paths in the prompt. Indexing skips symlinks, Git internals, dependency/build folders and scans at most 5,000 entries to depth eight. Repository files appear after checkout initialization. Account-wide native plugins, app mentions and arbitrary native CLI slash commands are not automatically exposed by this interface.
+The composer offers keyboard and touch suggestions: `/` for commands specific to the selected agent, `@` for workspace paths and connected folders, `$` for workspace `SKILL.md` files. Arrow keys select, Enter inserts/executes, Escape closes; Ctrl/Cmd+Enter sends. `/help` lists the supported commands. File/skill references become explicit paths in the prompt. Indexing skips symlinks, Git internals, dependency/build folders and scans at most 5,000 entries to depth eight. Repository files appear after checkout initialization. Unknown commands are rejected instead of silently spending a model turn as plain text. Native command selection inserts a draft; press Send to run it. `/help` also explains commands not yet available in this integration.
+
+| Commands | Codex | Claude Code |
+| --- | --- | --- |
+| `/plan` or `/plan task description` | Native App Server plan collaboration mode, read-only execution sandbox | Native CLI plan permission mode |
+| `/model`, `/permissions`, `/rename`, `/status` | Workspace controls | Workspace controls |
+| `/compact` | Native session compaction; requires an existing session with this account | Available when reported by the native session |
+| `/review [instructions]` | Native review of uncommitted changes, or a custom review | Only if the native session advertises a command with this name |
+| `/diff`, `/mention`, `/new` | Changes panel, file references, new chat | Use Files or New chat controls |
+| `/clear`, `/usage` | Use New chat or `/status` | New chat (preserves history); provider-reported usage |
+| `/context` and workspace/custom commands | Not exposed | Added from the CLI’s `system/init.slash_commands` after the first message |
+| `/skills`, `/resume`, `/files`, `/terminal`, `/settings`, `/stop`, `/help` | Workspace actions | Workspace actions |
+
+Plan mode persists across turns. The composer shows **Plan mode** and **Switch to execution**; switching is blocked while a task is active. Planning questions are saved as pending requests and can be answered after reconnecting, including from a phone. Stopping or restarting expires pending requests. Claude may request explicit permission to exit planning during a run. Replies to secret questions are sent to the agent without being copied to the event log.
+
+The web interface does not provide every interactive terminal command. MCP/plugin management, native session forks, terminal themes and account-wide app mentions are not implemented here. Claude commands are discovered per chat and forwarded only when advertised; availability may change with CLI versions. Codex plan mode uses the experimental collaboration API of the pinned CLI version. See [Codex App Server](https://developers.openai.com/codex/app-server) and [Claude SDK skills and commands](https://code.claude.com/docs/en/agent-sdk/slash-commands).

@@ -9,7 +9,13 @@ const emit = (data: unknown) =>
 let child: ChildProcessWithoutNullStreams | undefined,
   terminal: any,
   threadId: string | undefined,
-  ended = false;
+  ended = false,
+  compacting = false;
+const questionAnswers = new Map<
+  string,
+  (answers: Record<string, { answers: string[] }>) => void
+>();
+const rpcQuestions = new Map<string, unknown>();
 const approvals = new Map<string, (allow: boolean) => void>();
 const rpcPending = new Map<
   number,
@@ -112,6 +118,10 @@ async function codex() {
             description: p.command || p.reason || "Allow file changes?",
             details: p,
           });
+        } else if (m.method === "item/tool/requestUserInput") {
+          const id = String(m.id);
+          rpcQuestions.set(id, m.id);
+          emit({ type: "question", id, questions: p.questions });
         } else {
           send({
             id: m.id,
@@ -124,6 +134,22 @@ async function codex() {
         }
         return;
       }
+      if (m.method === "serverRequest/resolved") {
+        rpcQuestions.delete(String(p.requestId));
+        rpcApprovals.delete(String(p.requestId));
+        emit({ type: "request_resolved", id: String(p.requestId) });
+      }
+      if (m.method === "item/completed" && p.item?.type === "plan")
+        emit({ type: "delta", text: "\n\n" + p.item.text });
+      if (
+        compacting &&
+        m.method === "item/completed" &&
+        p.item?.type === "contextCompaction"
+      )
+        finish("completed", {
+          result:
+            "Agent context compacted. Chat history and workspace files are preserved.",
+        });
       if (m.method === "item/agentMessage/delta")
         emit({ type: "delta", text: p.delta });
       if (m.method === "item/commandExecution/outputDelta")
@@ -159,7 +185,7 @@ async function codex() {
       title: "AI Workspace",
       version: "0.1.0",
     },
-    capabilities: {},
+    capabilities: { experimentalApi: true },
   });
   send({ method: "initialized" });
 }
@@ -167,8 +193,18 @@ async function runCodex(input: RunInput) {
   await codex();
   const args: any = {
     cwd: "/workspace",
-    approvalPolicy: input.autonomous ? "never" : "untrusted",
-    sandbox: input.autonomous ? "danger-full-access" : "workspace-write",
+    approvalPolicy:
+      input.mode === "plan"
+        ? "untrusted"
+        : input.autonomous
+          ? "never"
+          : "untrusted",
+    sandbox:
+      input.mode === "plan"
+        ? "read-only"
+        : input.autonomous
+          ? "danger-full-access"
+          : "workspace-write",
     ...(input.model ? { model: input.model } : {}),
   };
   const r = await rpc(
@@ -177,6 +213,21 @@ async function runCodex(input: RunInput) {
   );
   threadId = r.thread.id;
   emit({ type: "session", id: threadId });
+  if (input.operation === "compact") {
+    compacting = true;
+    await rpc("thread/compact/start", { threadId });
+    return;
+  }
+  if (input.operation === "review") {
+    await rpc("review/start", {
+      threadId,
+      target: input.prompt
+        ? { type: "custom", instructions: input.prompt }
+        : { type: "uncommittedChanges" },
+      delivery: "inline",
+    });
+    return;
+  }
   const prompt: any[] = [{ type: "text", text: input.prompt }];
   for (const f of input.attachments)
     if (["image/png", "image/jpeg", "image/webp", "image/gif"].includes(f.mime))
@@ -184,6 +235,14 @@ async function runCodex(input: RunInput) {
   await rpc("turn/start", {
     threadId,
     input: prompt,
+    collaborationMode: {
+      mode: input.mode || "default",
+      settings: {
+        model: input.model || r.model,
+        reasoning_effort: input.effort || r.reasoningEffort || null,
+        developer_instructions: null,
+      },
+    },
     ...(input.effort ? { effort: input.effort } : {}),
   });
 }
@@ -204,20 +263,49 @@ async function runClaude(input: RunInput) {
     try {
       const p = JSON.parse(raw),
         id = randomUUID();
-      emit({
-        type: "approval",
-        id,
-        description: p.tool_name || "Allow this action?",
-        details: p.input,
-      });
-      const allowed = await new Promise<boolean>((resolve) =>
-        approvals.set(id, resolve),
-      );
+      let updatedInput = p.input || {};
+      let allowed: boolean;
+      if (
+        p.tool_name === "AskUserQuestion" &&
+        Array.isArray(p.input?.questions)
+      ) {
+        const questions = p.input.questions.map((q: any, i: number) => ({
+          ...q,
+          id: String(i),
+        }));
+        emit({ type: "question", id, questions });
+        const answers = await new Promise<
+          Record<string, { answers: string[] }>
+        >((resolve) => questionAnswers.set(id, resolve));
+        updatedInput = {
+          ...p.input,
+          answers: Object.fromEntries(
+            questions.map((q: any) => [
+              q.question,
+              answers[q.id].answers.join(", "),
+            ]),
+          ),
+        };
+        allowed = true;
+      } else {
+        emit({
+          type: "approval",
+          id,
+          description:
+            p.tool_name === "ExitPlanMode"
+              ? "Allow Claude to leave planning mode and implement the plan in this run?"
+              : p.tool_name || "Allow this action?",
+          details: p.input,
+        });
+        allowed = await new Promise<boolean>((resolve) =>
+          approvals.set(id, resolve),
+        );
+      }
       res.setHeader("Content-Type", "application/json");
       res.end(
         JSON.stringify(
           allowed
-            ? { behavior: "allow", updatedInput: p.input || {} }
+            ? { behavior: "allow", updatedInput }
             : { behavior: "deny", message: "Denied by owner" },
         ),
       );
@@ -240,11 +328,12 @@ async function runClaude(input: RunInput) {
   if (input.sessionId) args.push("--resume", input.sessionId);
   if (input.model) args.push("--model", input.model);
   if (input.effort) args.push("--effort", input.effort);
-  if (input.autonomous) args.push("--dangerously-skip-permissions");
+  if (input.autonomous && input.mode !== "plan")
+    args.push("--dangerously-skip-permissions");
   else
     args.push(
       "--permission-mode",
-      "default",
+      input.mode === "plan" ? "plan" : "default",
       "--mcp-config",
       JSON.stringify({
         mcpServers: {
@@ -264,6 +353,12 @@ async function runClaude(input: RunInput) {
     } catch {
       return;
     }
+    if (
+      m.type === "system" &&
+      m.subtype === "init" &&
+      Array.isArray(m.slash_commands)
+    )
+      emit({ type: "commands", commands: m.slash_commands });
     if (m.type === "system" && m.session_id)
       emit({ type: "session", id: m.session_id });
     if (m.type === "stream_event") {
@@ -341,6 +436,7 @@ createInterface({ input: process.stdin }).on("line", async (line) => {
     const c = JSON.parse(line) as RunnerCommand;
     if (c.type === "start") {
       ended = false;
+      compacting = false;
       await mkdir("/profile/.codex", { recursive: true });
       await mkdir("/profile/.claude", { recursive: true });
       if (c.input.provider === "codex") await runCodex(c.input);
@@ -354,6 +450,15 @@ createInterface({ input: process.stdin }).on("line", async (line) => {
       }
       approvals.get(c.id)?.(c.allow);
       approvals.delete(c.id);
+    }
+    if (c.type === "answer") {
+      const rid = rpcQuestions.get(c.id);
+      if (rid !== undefined) {
+        send({ id: rid, result: { answers: c.answers } });
+        rpcQuestions.delete(c.id);
+      }
+      questionAnswers.get(c.id)?.(c.answers);
+      questionAnswers.delete(c.id);
     }
     if (c.type === "stop") {
       if (threadId) await rpc("turn/interrupt", { threadId }).catch(() => {});

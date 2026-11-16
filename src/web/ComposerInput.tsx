@@ -1,16 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import { api } from "./api";
-export const chatCommands = [
-  { name: "model", description: "Choose model and reasoning effort" },
-  { name: "settings", description: "Chat settings and connected folders" },
-  { name: "files", description: "Browse workspace files" },
-  { name: "terminal", description: "Open the terminal" },
-  { name: "stop", description: "Stop the current task" },
-  { name: "new", description: "Create a new chat" },
-  { name: "help", description: "Show supported commands and references" },
-];
+import type { ChatCommand } from "../commands";
 export function ComposerInput({
   chatId,
+  commands,
+  provider,
   value,
   onChange,
   onFiles,
@@ -19,6 +13,8 @@ export function ComposerInput({
   drag,
 }: {
   chatId: string;
+  commands: ChatCommand[];
+  provider: string;
   value: string;
   onChange: (v: string) => void;
   onFiles: (files: File[]) => void;
@@ -67,14 +63,24 @@ export function ComposerInput({
   }, [chatId, symbol]);
   const options = (
     symbol === "/"
-      ? chatCommands
+      ? commands.filter((c) => !c.unavailable)
       : entries.filter((e) => e.kind === (symbol === "$" ? "skill" : "file"))
-  )
-    .filter((e) => e.name.toLowerCase().includes(query))
-    .slice(0, 8);
+  ).filter((e) => e.name.toLowerCase().includes(query));
   const open = !!symbol && !dismissed;
+  useEffect(() => {
+    if (open)
+      document
+        .getElementById("suggestion-" + index)
+        ?.scrollIntoView({ block: "nearest" });
+  }, [open, index]);
   function choose(item: any) {
     if (symbol === "/") {
+      if (item.native) {
+        onChange("/" + item.name + " ");
+        setDismissed(true);
+        input.current?.focus();
+        return;
+      }
       onChange(
         value.slice(0, cursor - (query.length + 1)) + value.slice(cursor),
       );
@@ -106,7 +112,9 @@ export function ComposerInput({
           id="composer-suggestions"
           aria-label={
             symbol === "/"
-              ? "Chat commands"
+              ? provider === "codex"
+                ? "Codex commands"
+                : "Claude Code commands"
               : symbol === "$"
                 ? "Workspace skills"
                 : "Workspace files"
@@ -114,7 +122,9 @@ export function ComposerInput({
         >
           <small>
             {symbol === "/"
-              ? "Chat commands"
+              ? provider === "codex"
+                ? "Codex commands"
+                : "Claude Code commands"
               : symbol === "$"
                 ? "Workspace skills"
                 : "Workspace files"}{" "}

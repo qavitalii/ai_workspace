@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api } from "./api";
 
 export function ModelOptions({
@@ -17,12 +17,46 @@ export function ModelOptions({
     [models, setModels] = useState<any[]>([]),
     [busy, setBusy] = useState(false),
     [error, setError] = useState("");
+  const generation = useRef(0);
+  const forceRefresh = useRef<string | null>(null);
+  const [refresh, setRefresh] = useState(0);
   useEffect(() => {
     setModels([]);
     setError("");
     setModel(initialModel);
     setEffort(initialEffort);
   }, [provider, accountId]);
+  useEffect(() => {
+    const current = ++generation.current;
+    setError("");
+    if (!accountId || provider !== "codex") {
+      setBusy(false);
+      return;
+    }
+    setBusy(true);
+    api("/accounts/" + accountId + "/models", {
+      refresh: forceRefresh.current === accountId,
+    })
+      .then((items) => {
+        if (generation.current === current) setModels(items);
+      })
+      .catch((e) => {
+        if (generation.current === current)
+          setError(
+            e.message ===
+              "The operation could not be completed. Check the server status."
+              ? "The model list is temporarily unavailable. Try again."
+              : e.message,
+          );
+      })
+      .finally(() => {
+        if (generation.current === current) setBusy(false);
+      });
+    forceRefresh.current = null;
+    return () => {
+      generation.current++;
+    };
+  }, [provider, accountId, refresh]);
   const selected = models.find((m) => (m.model || m.id) === model);
   const advertised = selected?.supportedReasoningEfforts?.map((e: any) =>
     typeof e === "string" ? e : e.reasoningEffort,
@@ -65,24 +99,16 @@ export function ModelOptions({
           type="button"
           className="text-button"
           disabled={!accountId || busy}
-          onClick={async () => {
-            setBusy(true);
-            setError("");
-            try {
-              setModels(await api("/accounts/" + accountId + "/models", {}));
-            } catch (e: any) {
-              setError(
-                e.message ===
-                  "The operation could not be completed. Check the server status."
-                  ? "The agent’s model list is temporarily unavailable. Try loading it again."
-                  : e.message,
-              );
-            } finally {
-              setBusy(false);
-            }
+          onClick={() => {
+            forceRefresh.current = accountId;
+            setRefresh((n) => n + 1);
           }}
         >
-          {busy ? "Loading…" : "Load available models"}
+          {busy
+            ? "Loading models…"
+            : error
+              ? "Retry loading models"
+              : "Refresh models"}
         </button>
       )}
       <label className="field">

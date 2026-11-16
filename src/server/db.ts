@@ -26,9 +26,13 @@ UPDATE projects SET github_token=COALESCE((SELECT value FROM settings WHERE key=
 ALTER TABLE projects ALTER COLUMN github_token SET DEFAULT '';
 ALTER TABLE projects ALTER COLUMN github_token SET NOT NULL;
 CREATE TABLE IF NOT EXISTS accounts(id uuid PRIMARY KEY,provider text NOT NULL CHECK(provider IN ('codex','claude')),name text NOT NULL,status text NOT NULL DEFAULT 'disconnected',priority int NOT NULL DEFAULT 0,reset_at timestamptz,limits jsonb,created_at timestamptz NOT NULL DEFAULT now());
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS model_catalog jsonb;
+ALTER TABLE accounts ADD COLUMN IF NOT EXISTS models_updated_at timestamptz;
 CREATE TABLE IF NOT EXISTS chats(id uuid PRIMARY KEY,project_id uuid NOT NULL REFERENCES projects(id),title text NOT NULL,provider text NOT NULL CHECK(provider IN ('codex','claude')),account_id uuid REFERENCES accounts(id),model text NOT NULL DEFAULT '',effort text NOT NULL DEFAULT '',autonomous boolean NOT NULL DEFAULT false,handoff text NOT NULL DEFAULT 'manual' CHECK(handoff IN ('manual','auto')),session_id text,session_account uuid,summary text NOT NULL DEFAULT '',branch text NOT NULL,initialized boolean NOT NULL DEFAULT false,created_at timestamptz NOT NULL DEFAULT now());
 ALTER TABLE chats ALTER COLUMN project_id DROP NOT NULL;
 ALTER TABLE chats ADD COLUMN IF NOT EXISTS auto_title boolean NOT NULL DEFAULT false;
+ALTER TABLE chats ADD COLUMN IF NOT EXISTS mode text NOT NULL DEFAULT 'default';
+ALTER TABLE chats ADD COLUMN IF NOT EXISTS native_commands jsonb NOT NULL DEFAULT '[]';
 CREATE TABLE IF NOT EXISTS folder_links(id uuid PRIMARY KEY,name text NOT NULL,chat_id uuid REFERENCES chats(id) ON DELETE CASCADE,project_id uuid REFERENCES projects(id) ON DELETE CASCADE,read_only boolean NOT NULL DEFAULT true,CHECK((chat_id IS NULL) <> (project_id IS NULL)));
 CREATE UNIQUE INDEX IF NOT EXISTS folder_link_chat ON folder_links(chat_id,name) WHERE chat_id IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS folder_link_project ON folder_links(project_id,name) WHERE project_id IS NOT NULL;
@@ -42,6 +46,8 @@ CREATE TABLE IF NOT EXISTS workspace_leases(chat_id uuid PRIMARY KEY REFERENCES 
 CREATE TABLE IF NOT EXISTS events(id bigserial PRIMARY KEY,chat_id uuid REFERENCES chats(id),job_id uuid REFERENCES jobs(id),type text NOT NULL,data jsonb NOT NULL,created_at timestamptz NOT NULL DEFAULT now());
 CREATE INDEX IF NOT EXISTS events_chat ON events(chat_id,id);
 CREATE TABLE IF NOT EXISTS approvals(id uuid PRIMARY KEY,job_id uuid NOT NULL REFERENCES jobs(id),request_id text NOT NULL,description text NOT NULL,decision boolean,created_at timestamptz NOT NULL DEFAULT now());
+ALTER TABLE approvals ADD COLUMN IF NOT EXISTS kind text NOT NULL DEFAULT 'permission';
+ALTER TABLE approvals ADD COLUMN IF NOT EXISTS questions jsonb;
 CREATE TABLE IF NOT EXISTS push_subscriptions(endpoint text PRIMARY KEY,subscription jsonb NOT NULL);
 CREATE TABLE IF NOT EXISTS publications(id uuid PRIMARY KEY,chat_id uuid NOT NULL REFERENCES chats(id),kind text NOT NULL,status text NOT NULL,result jsonb,created_at timestamptz NOT NULL DEFAULT now());
 `);

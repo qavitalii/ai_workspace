@@ -1,3 +1,4 @@
+import { commandsFor, slashCommand } from "../src/commands";
 import { uploadPath } from "../src/server/folder-routes";
 import { folderName } from "../src/server/folders";
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
@@ -155,4 +156,25 @@ it("validates folder names and nested upload paths", () => {
     expect(() => uploadPath(value)).toThrow();
   for (const value of ["..", ".", "/srv", "a/b", ".ssh", ""])
     expect(() => folderName(value)).toThrow();
+});
+
+describe("provider command menus", () => {
+  it("keeps provider-only commands separate and requires native discovery for Claude skills", () => {
+    const codex = commandsFor("codex"),
+      claude = commandsFor("claude", ["context", "custom-skill"]);
+    expect(codex.find((c) => c.name === "plan")?.unavailable).toBeUndefined();
+    expect(codex.some((c) => c.name === "review")).toBe(true);
+    expect(claude.some((c) => c.name === "review")).toBe(false);
+    expect(claude.find((c) => c.name === "custom-skill")).toMatchObject({
+      native: true,
+    });
+    expect(
+      commandsFor("claude").find((c) => c.name === "context")?.unavailable,
+    ).toBeTruthy();
+    expect(slashCommand("/plan Build a page")).toEqual({
+      name: "plan",
+      arguments: "Build a page",
+    });
+    expect(slashCommand("Open /workspace/file.txt")).toBeNull();
+  });
 });

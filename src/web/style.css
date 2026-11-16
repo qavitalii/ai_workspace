@@ -1794,3 +1794,7 @@ small,
 .composer-actions {
   flex-wrap: wrap;
 }
+
+.plan-banner { display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px; padding:8px 12px; font-size:13px; }
+.approval fieldset { border:0; padding:12px 0; min-width:0; }
+.approval > div { min-width:0; width:100%; }

@@ -1,3 +1,4 @@
+import { accountModels } from "../src/server/models";
 import {
   availableFolders,
   folderPath,
@@ -83,6 +84,174 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
       "INSERT INTO chats(id,project_id,title,provider,account_id,branch) VALUES($1,$2,'Test','codex',$3,'workspace/test')",
       [chat, project, account],
     );
+  });
+  it("deduplicates model loading and serves a cached catalog while the account is busy", async () => {
+    const models = [
+      {
+        id: "test-model",
+        supportedReasoningEfforts: [{ reasoningEffort: "high" }],
+      },
+    ];
+    const start = vi.fn(async (_chat, _id, emit) => ({
+      id: "models-test",
+      send: () => emit({ type: "models", models }),
+      stop: async () => {},
+    }));
+    expect(
+      await Promise.all([
+        accountModels(account, false, start),
+        accountModels(account, false, start),
+      ]),
+    ).toEqual([models, models]);
+    expect(start).toHaveBeenCalledTimes(1);
+    const mid = randomUUID();
+    await db.query(
+      "INSERT INTO messages(id,chat_id,role,content) VALUES($1,$2,'user','test')",
+      [mid, chat],
+    );
+    await db.query(
+      "INSERT INTO jobs(id,chat_id,message_id,account_id,state) VALUES($1,$2,$3,$4,'running')",
+      [randomUUID(), chat, mid, account],
+    );
+    expect(await accountModels(account, false, start)).toEqual(models);
+    await expect(accountModels(account, true, start)).rejects.toThrow(
+      "available",
+    );
+    expect(start).toHaveBeenCalledTimes(1);
+  });
+  it("releases the model lease after a failed native catalog request", async () => {
+    const start = vi.fn(async (_chat, _id, emit) => ({
+      id: "bad-models",
+      send: () => emit({ type: "failed" }),
+      stop: async () => {},
+    }));
+    await expect(accountModels(account, false, start)).rejects.toThrow(
+      "temporarily unavailable",
+    );
+    expect(
+      (
+        await db.query(
+          "SELECT status,model_catalog FROM accounts WHERE id=$1",
+          [account],
+        )
+      ).rows[0],
+    ).toMatchObject({ status: "ready", model_catalog: null });
+  });
+  it("persists plan mode and rejects unknown commands without creating a model turn", async () => {
+    const post = (url: string, payload: any) =>
+      app.inject({ method: "POST", url, headers, payload });
+    expect(
+      (
+        await post(`/api/chats/${chat}/messages`, {
+          content: "/fake-command",
+          client_id: randomUUID(),
+        })
+      ).statusCode,
+    ).toBe(400);
+    expect(
+      (
+        await post(`/api/chats/${chat}/messages`, {
+          content: "/compact",
+          client_id: randomUUID(),
+        })
+      ).statusCode,
+    ).toBe(400);
+    const payload = {
+      content: "/plan Design the API",
+      client_id: randomUUID(),
+    };
+    const first = await post(`/api/chats/${chat}/messages`, payload);
+    expect(first.statusCode).toBe(200);
+    expect((await post(`/api/chats/${chat}/messages`, payload)).json().id).toBe(
+      first.json().id,
+    );
+    expect(
+      (await db.query("SELECT mode FROM chats WHERE id=$1", [chat])).rows[0]
+        .mode,
+    ).toBe("plan");
+    expect(
+      (await post(`/api/chats/${chat}/mode`, { mode: "default" })).statusCode,
+    ).toBe(409);
+    await db.query("UPDATE jobs SET state='completed' WHERE chat_id=$1", [
+      chat,
+    ]);
+    expect(
+      (await post(`/api/chats/${chat}/mode`, { mode: "default" })).statusCode,
+    ).toBe(200);
+  });
+  it("routes only Claude commands reported by this chat's native session", async () => {
+    await db.query(
+      "UPDATE chats SET provider='claude',native_commands='[\"context\",\"my-skill\"]' WHERE id=$1",
+      [chat],
+    );
+    const post = (content: string) =>
+      app.inject({
+        method: "POST",
+        url: `/api/chats/${chat}/messages`,
+        headers,
+        payload: { content, client_id: randomUUID() },
+      });
+    expect((await post("/review")).statusCode).toBe(400);
+    expect((await post("/my-skill inspect files")).statusCode).toBe(200);
+  });
+  it("retains unanswered questions on reconnect and accepts one complete answer", async () => {
+    const mid = randomUUID(),
+      jid = randomUUID(),
+      id = randomUUID();
+    await db.query(
+      "INSERT INTO messages(id,chat_id,role,content) VALUES($1,$2,'user','plan')",
+      [mid, chat],
+    );
+    await db.query(
+      "INSERT INTO jobs(id,chat_id,message_id,state) VALUES($1,$2,$3,'waiting_approval')",
+      [jid, chat, mid],
+    );
+    await db.query(
+      "INSERT INTO approvals(id,job_id,request_id,description,kind,questions) VALUES($1,$2,'native-1','Choose','question',$3)",
+      [id, jid, JSON.stringify([{ id: "choice", question: "Which?" }])],
+    );
+    const send = vi.fn();
+    active.set(jid, { id: "test", send, stop: async () => {} });
+    try {
+      const detail = await app.inject({
+        method: "GET",
+        url: `/api/chats/${chat}`,
+        headers,
+      });
+      expect(detail.json().approvals[0].questions[0].id).toBe("choice");
+      const wrong = await app.inject({
+        method: "POST",
+        url: `/api/approvals/${id}`,
+        headers,
+        payload: { allow: true },
+      });
+      expect(wrong.statusCode).toBe(409);
+      const answer = (answers: any) =>
+        app.inject({
+          method: "POST",
+          url: `/api/questions/${id}`,
+          headers,
+          payload: { answers },
+        });
+      expect((await answer({})).statusCode).toBe(400);
+      expect(
+        (await answer({ choice: { answers: ["First"] } })).statusCode,
+      ).toBe(200);
+      expect(send).toHaveBeenCalledWith({
+        type: "answer",
+        id: "native-1",
+        answers: { choice: { answers: ["First"] } },
+      });
+      expect(
+        (await answer({ choice: { answers: ["First"] } })).statusCode,
+      ).toBe(409);
+      expect(
+        (await db.query("SELECT state FROM jobs WHERE id=$1", [jid])).rows[0]
+          .state,
+      ).toBe("running");
+    } finally {
+      active.delete(jid);
+    }
   });
   it("disconnects through the native runner before releasing the account", async () => {
     const start = vi.fn(async (_chat, id, emit) => {

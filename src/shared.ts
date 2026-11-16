@@ -15,12 +15,19 @@ export type RunInput = {
   model?: string;
   effort?: string;
   autonomous: boolean;
+  mode?: "default" | "plan";
+  operation?: "compact" | "review" | "native";
   sessionId?: string;
   attachments: { path: string; mime: string }[];
 };
 export type RunnerCommand =
   | { type: "start"; input: RunInput }
   | { type: "approve"; id: string; allow: boolean }
+  | {
+      type: "answer";
+      id: string;
+      answers: Record<string, { answers: string[] }>;
+    }
   | { type: "stop" }
   | { type: "terminal"; data: string }
   | { type: "resize"; cols: number; rows: number }

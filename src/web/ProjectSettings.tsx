@@ -1,3 +1,4 @@
+import { GithubTokenHelp } from "./GithubTokenHelp";
 import { useState } from "react";
 import { api } from "./api";
 
@@ -76,10 +77,7 @@ export function ProjectSettings({
           />
         </label>
       )}
-      <p className="muted">
-        Select this repository in your fine-grained token. For publishing, allow
-        Contents and Pull requests: read/write.
-      </p>
+      <GithubTokenHelp />
       {project.github_configured && (
         <button
           type="button"

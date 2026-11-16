@@ -28,9 +28,10 @@ export async function disconnectAccount(id: string, start = launch) {
         new Error("Stop the active task before disconnecting this account"),
         { statusCode: 409 },
       );
-    await c.query("UPDATE accounts SET status='disconnecting' WHERE id=$1", [
-      id,
-    ]);
+    await c.query(
+      "UPDATE accounts SET status='disconnecting',model_catalog=NULL,models_updated_at=NULL WHERE id=$1",
+      [id],
+    );
     return account;
   });
   let runtime: Running | undefined;
