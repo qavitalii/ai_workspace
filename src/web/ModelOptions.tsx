@@ -93,6 +93,11 @@ export function ModelOptions({
           onChange={(e) => setEffort(e.target.value)}
         >
           <option value="">Agent default</option>
+          {effort && !levels.includes(effort) && (
+            <option value={effort}>
+              {effort[0].toUpperCase() + effort.slice(1)} (saved)
+            </option>
+          )}
           {levels.map((l: string) => (
             <option key={l} value={l}>
               {l === "xhigh" ? "Extra high" : l[0].toUpperCase() + l.slice(1)}
