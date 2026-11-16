@@ -170,7 +170,7 @@ Read project release notes before updating. Current schema changes are additive.
 
 Check configuration with `./ops/compose.sh config --quiet`. Plain `docker compose config` can print resolved secrets; do not share its output.
 
-## 8. Files and connected folders
+## 9. Files and connected folders
 
 For files that belong to a message, use the paperclip, drag/drop, or image paste. Originals stay with the chat; agents receive workspace copies.
 
@@ -193,9 +193,9 @@ To use an existing collection elsewhere on the server, put `FOLDER_ROOT=/srv/age
 ./ops/compose.sh -f compose.yaml -f compose.local.yaml -f compose.folders.yaml up -d --wait
 ```
 
-Keep this override in subsequent `up`/update commands. Each direct subdirectory appears in the folder picker. The path must be shared with Docker Desktop when running locally. Only selected subfolders are mounted into agents; the supervisor needs the collection mounted at the identical absolute path. Choose a dedicated data directory, not your home directory, system directories, Docker socket directory, or Workspace's private credential/database directories. External collections are **not** part of the built-in backup and need their own backup. Files on a laptop are copied to the server by upload; keeping a laptop folder live requires a separately configured sync service.
+Keep this override in subsequent Compose commands. The current `ops/update.sh` does not include this optional override: for external folders, perform its backup, fast-forward pull, build, and restart steps manually, passing the same `-f` files to both build and restart. Each direct subdirectory appears in the folder picker. The path must be shared with Docker Desktop when running locally. Only selected subfolders are mounted into agents; the supervisor needs the collection mounted at the identical absolute path. Choose a dedicated data directory, not your home directory, system directories, Docker socket directory, or Workspace's private credential/database directories. External collections are **not** part of the built-in backup and need their own backup. Files on a laptop are copied to the server by upload; keeping a laptop folder live requires a separately configured sync service.
 
-## 9. Models, commands and references
+## 10. Models, commands and references
 
 Select **Model** and **Reasoning effort** while creating a chat, or use the model button above Send / `/model` before the next task. The Codex model catalog loads automatically when an account is selected. **Refresh models** requests a new catalog; concurrent requests share one lookup, and a per-account one-hour cache avoids launching another CLI on every visit. A cached catalog remains available during an active run; refresh waits until the account is idle. Sign-in/sign-out clears the cache. Codex model metadata determines advertised reasoning levels when available. Blank/default delegates selection to the official agent. Claude aliases are offered as convenience values; support depends on account and model. Changes are blocked while a task is active.
 

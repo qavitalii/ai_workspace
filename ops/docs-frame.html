@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AI Workspace — desktop screenshot</title>
+    <style>
+      * {
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+      }
+      body {
+        padding: 48px;
+        background:
+          radial-gradient(ellipse at 20% 0%, #e8eee4, transparent 70%), #dce5df;
+        font:
+          13px system-ui,
+          sans-serif;
+      }
+      .window {
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        border: 1px solid #b8c6ba;
+        border-radius: 16px;
+        background: #fafbf8;
+        box-shadow:
+          0 24px 60px #203c2926,
+          0 3px 12px #203c2914;
+      }
+      .bar {
+        height: 44px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 0 18px;
+        border-bottom: 1px solid #dce2d9;
+        color: #536050;
+        background: #f2f5ef;
+      }
+      .dots {
+        display: flex;
+        gap: 7px;
+        width: 90px;
+      }
+      .dots i {
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        background: #cad3c7;
+      }
+      .label {
+        font-weight: 550;
+        letter-spacing: 0.2px;
+      }
+      .preview {
+        width: 90px;
+        text-align: right;
+        font-size: 11px;
+        color: #788572;
+      }
+      iframe {
+        display: block;
+        border: 0;
+        width: 100%;
+        height: calc(100% - 44px);
+      }
+    </style>
+  </head>
+  <body>
+    <div class="window">
+      <div class="bar">
+        <span class="dots" aria-hidden="true"><i></i><i></i><i></i></span
+        ><span class="label">AI Workspace</span
+        ><span class="preview">Demo</span>
+      </div>
+      <iframe title="Complete desktop workspace" src="/"></iframe>
+    </div>
+    <script>
+      if (new URLSearchParams(location.search).get("view") === "chat") {
+        document.querySelector("iframe").src = "/?chat=demo-chat";
+      }
+    </script>
+  </body>
+</html>

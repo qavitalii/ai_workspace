@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AI Workspace — mobile showcase</title>
+    <style>
+      * {
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        margin: 0;
+        width: 100%;
+        height: 100%;
+      }
+      body {
+        background:
+          radial-gradient(ellipse at 10% 0%, #edf2e8, transparent 65%), #dce5df;
+        color: #223d2b;
+        font-family: system-ui, sans-serif;
+      }
+      header {
+        text-align: center;
+        padding-top: 46px;
+      }
+      .eyebrow {
+        font-size: 12px;
+        font-weight: 650;
+        letter-spacing: 2.5px;
+        text-transform: uppercase;
+        color: #647662;
+        margin: 0 0 12px;
+      }
+      h1 {
+        font-size: 40px;
+        font-weight: 550;
+        letter-spacing: -1.5px;
+        margin: 0;
+      }
+      .subtitle {
+        font-size: 16px;
+        color: #63705f;
+        margin: 12px 0 0;
+      }
+      .devices {
+        display: flex;
+        justify-content: center;
+        gap: 92px;
+        margin-top: 32px;
+      }
+      figure {
+        margin: 0;
+      }
+      figcaption {
+        font-size: 13px;
+        font-weight: 600;
+        letter-spacing: 0.3px;
+        text-align: center;
+        color: #53674e;
+        margin-bottom: 14px;
+      }
+      .phone {
+        width: 410px;
+        padding: 8px;
+        background: #1f2c24;
+        border: 1px solid #647465;
+        border-radius: 38px;
+        box-shadow:
+          0 26px 46px #203c292b,
+          0 4px 10px #203c2926;
+      }
+      .screen {
+        border-radius: 29px;
+        overflow: hidden;
+        background: #fafbf8;
+      }
+      .top {
+        height: 24px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: #fafbf8;
+      }
+      .top::after {
+        content: "";
+        width: 58px;
+        height: 5px;
+        border-radius: 5px;
+        background: #23372b;
+      }
+      iframe {
+        display: block;
+        border: 0;
+        width: 390px;
+        height: 844px;
+        background: #fafbf8;
+      }
+      .bottom {
+        height: 20px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: #fafbf8;
+      }
+      .bottom::after {
+        content: "";
+        width: 104px;
+        height: 4px;
+        border-radius: 5px;
+        background: #23372b;
+      }
+      .note {
+        text-align: center;
+        color: #6d7b67;
+        font-size: 11px;
+        margin: 22px 0 0;
+        letter-spacing: 0.2px;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <p class="eyebrow">AI Workspace · Mobile</p>
+      <h1>Your workspace. Wherever you are.</h1>
+      <p class="subtitle">Find your projects. Continue the conversation.</p>
+    </header>
+    <div class="devices">
+      <figure>
+        <figcaption>01 — Projects &amp; recent chats</figcaption>
+        <div class="phone">
+          <div class="screen">
+            <div class="top"></div>
+            <iframe title="Mobile workspace home" src="/"></iframe>
+            <div class="bottom"></div>
+          </div>
+        </div>
+      </figure>
+      <figure>
+        <figcaption>02 — Conversation &amp; controls</figcaption>
+        <div class="phone">
+          <div class="screen">
+            <div class="top"></div>
+            <iframe title="Mobile conversation" src="/?chat=demo-chat"></iframe>
+            <div class="bottom"></div>
+          </div>
+        </div>
+      </figure>
+    </div>
+    <p class="note">
+      Actual interface · Fictional demo data · Decorative device frames
+    </p>
+  </body>
+</html>

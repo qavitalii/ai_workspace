@@ -2,6 +2,20 @@
 
 A private, self-hosted web workspace for **Codex** and **Claude Code**. Work with agents from your computer or phone: persistent chats, attachments, GitHub projects, isolated containers, diffs, a terminal, and permission prompts. Closing your browser does not stop an agent.
 
+[Getting started](#run-locally--three-commands) · [Deployment](docs/deployment.md) · [Architecture](docs/architecture.md) · [Contributing](CONTRIBUTING.md)
+
+![Workspace home with projects, recent chats, and account limits](docs/screenshots/workspace.jpg)
+
+**Your agents, your server, any device.** Keep work moving across persistent conversations, isolated project workspaces, and explicit review and publishing steps.
+
+| Work with agents | Stay in control | Pick up anywhere |
+| --- | --- | --- |
+| Codex and Claude Code accounts | Container isolation and approval prompts | Responsive browser interface |
+| Files, images, folders, and skills | Review diffs before commit, push, and PR | Persistent chats and event replay |
+| Per-chat models and reasoning | Password + authenticator sign-in | Self-host locally or on a VPS |
+
+Screenshots show the actual interface with fictional accounts, repositories, messages, and usage values. They are not evidence of live provider execution. [Screenshot details](docs/screenshots/README.md).
+
 > **Status: initial release for local validation.** The application, Docker deployment, and automated tests can run now. Real subscription sign-in, model execution, and switching between your own accounts require verification with your accounts before unattended production use. Automatic account switching is disabled by default.
 
 ## Run locally — three commands
@@ -103,7 +117,7 @@ The supervisor has Docker socket access and is a trusted component with administ
 
 ### Files, folders, models and shortcuts
 
-Chat and project settings include **Folders**: upload files or directories, connect an existing server folder, select read-only or read/write access, browse/download files, and disconnect without deleting data. Project folders are inherited by its chats; shared writers are serialized. See [folder setup and external server paths](docs/deployment.md#8-files-and-connected-folders).
+Chat and project settings include **Folders**: upload files or directories, connect an existing server folder, select read-only or read/write access, browse/download files, and disconnect without deleting data. Project folders are inherited by its chats; shared writers are serialized. See [folder setup and external server paths](docs/deployment.md#9-files-and-connected-folders).
 
 Choose a model and reasoning effort before the first message or from the composer. Type `/` for Workspace commands, `@` for files/folders, and `$` for workspace skills. These are supported Workspace features, not a claim of complete parity with every native CLI command or plugin.
 
@@ -112,3 +126,25 @@ Choose a model and reasoning effort before the first message or from the compose
 **Settings → Models** saves a starting model and thinking depth separately for Codex and Claude Code. New chats copy those values; existing chats keep their own settings. Override the model when creating a chat or in chat settings. The UI displays the provider-reported model once available, including the exact model behind a Claude alias. Older chats without a reported model show that it has not been reported yet.
 
 The sidebar labels each chat with its agent and model, and shows remaining limits for each account. Open **Details** for reset times and the last report timestamp. Codex limits can be refreshed without starting an inference task when the account is idle. Claude reports limits during tasks and may omit utilization; missing percentages are shown as unknown, never as a full balance. Expired windows require a fresh report. Credits or usage costs are not treated as subscription percentages.
+
+## Screenshots
+
+### A persistent conversation
+
+![A Codex conversation with model controls and file, diff, and terminal actions](docs/screenshots/conversation.jpg)
+
+### On your phone
+
+Keep your projects and conversations close, with a mobile layout for browsing chats, reviewing replies, and choosing how your agent works.
+
+![Mobile workspace home and conversation shown side by side in decorative phone frames](docs/screenshots/mobile-showcase.jpg)
+
+## Project information
+
+- [Contributing and local checks](CONTRIBUTING.md)
+- [Security and sensitive data](SECURITY.md)
+- [Publication readiness](docs/publication.md)
+
+This is an independent project and is not affiliated with OpenAI or Anthropic. You supply your own eligible provider accounts. Provider access is not included.
+
+Licensed under the [GNU General Public License v3.0 only](LICENSE) (`GPL-3.0-only`). Third-party dependencies and the separately installed provider CLIs retain their own licenses and terms.
