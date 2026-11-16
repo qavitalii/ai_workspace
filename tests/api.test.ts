@@ -145,6 +145,22 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
         .rows[0].status,
     ).toBe("disconnect_failed");
   });
+  it("preserves model and reasoning choices reported by the agent", async () => {
+    const result = await app.inject({
+      method: "POST",
+      url: "/api/chats",
+      headers,
+      payload: {
+        provider: "codex",
+        account_id: account,
+        model: "gpt-6.1",
+        effort: "ultra",
+      },
+    });
+    expect(result.statusCode).toBe(200);
+    expect(result.json().model).toBe("gpt-6.1");
+    expect(result.json().effort).toBe("ultra");
+  });
   it("creates unnamed chats and titles them once from the first message", async () => {
     const created = await app.inject({
       method: "POST",

@@ -452,7 +452,17 @@ export async function createApp() {
     account_id: uuid,
     model: z.string().max(100).default(""),
     effort: z
-      .enum(["", "none", "minimal", "low", "medium", "high", "xhigh", "max"])
+      .enum([
+        "",
+        "none",
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra",
+      ])
       .default(""),
     autonomous: z.boolean().default(false),
     handoff: z.enum(["manual", "auto"]).default("manual"),

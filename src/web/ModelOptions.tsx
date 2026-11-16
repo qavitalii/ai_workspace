@@ -71,7 +71,12 @@ export function ModelOptions({
             try {
               setModels(await api("/accounts/" + accountId + "/models", {}));
             } catch (e: any) {
-              setError(e.message);
+              setError(
+                e.message ===
+                  "The operation could not be completed. Check the server status."
+                  ? "The agent’s model list is temporarily unavailable. Try loading it again."
+                  : e.message,
+              );
             } finally {
               setBusy(false);
             }
