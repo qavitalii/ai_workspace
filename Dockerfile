@@ -23,7 +23,7 @@ CMD ["node","dist/node/server/main.js"]
 FROM node:22-bookworm-slim AS runner
 ARG CODEX_VERSION=0.169.0
 ARG CLAUDE_VERSION=2.1.325
-RUN apt-get update && apt-get install -y --no-install-recommends git python3 python3-pip curl ca-certificates ripgrep jq unzip procps bubblewrap && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends git openssh-client python3 python3-pip curl ca-certificates ripgrep jq unzip procps bubblewrap && rm -rf /var/lib/apt/lists/*
 RUN npm install -g @openai/codex@${CODEX_VERSION} @anthropic-ai/claude-code@${CLAUDE_VERSION} && npm cache clean --force
 WORKDIR /app
 COPY --from=dependencies /app/node_modules ./node_modules
@@ -31,6 +31,8 @@ COPY --from=dependencies /app/dist/node ./dist/node
 COPY package.json ./
 COPY --chmod=755 ops/git-askpass.sh /usr/local/bin/workspace-git-askpass
 RUN mkdir -p /profile /workspace && chown node:node /profile /workspace
+RUN mkdir -p /run/workspace-ssh /private && chown node:node /run/workspace-ssh /private && chmod 700 /run/workspace-ssh /private \
+    && printf 'Include /run/workspace-ssh/config\n' > /etc/ssh/ssh_config.d/00-workspace.conf
 ENV HOME=/profile CODEX_HOME=/profile/.codex CLAUDE_CONFIG_DIR=/profile/.claude
 USER node
 WORKDIR /workspace

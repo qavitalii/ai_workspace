@@ -56,7 +56,7 @@ export function AccountUsage({
           className="usage-summary"
           aria-expanded={expanded}
           aria-label={
-            sidebar
+            compact
               ? `Limits for ${account.name}: ${windows.length ? windows.map((w) => `${w.label}, ${w.resetsAt && w.resetsAt * 1000 <= Date.now() ? "awaiting update" : w.remaining === null ? "not reported" : `${w.remaining}% left`}`).join("; ") : "not reported"}. ${expanded ? "Hide" : "Show"} details`
               : undefined
           }
@@ -65,7 +65,7 @@ export function AccountUsage({
           {windows.length ? (
             windows.map((w, i) => (
               <span key={i} title={w.label}>
-                {sidebar
+                {compact
                   ? w.label
                       .replace(/^codex · /i, "")
                       .replace(/ hours?\b/, "h")

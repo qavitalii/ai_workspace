@@ -1,9 +1,13 @@
+import { GB, outputStorage, isOutputLimit } from "./output-storage.js";
 import { commandsFor, slashCommand } from "../commands.js";
 import { accountUsage } from "./usage.js";
 import { accountModels } from "./models.js";
 import { chatFolders } from "./folders.js";
 import { folderRoutes } from "./folder-routes.js";
+import { sshRoutes } from "./ssh-routes.js";
+import { projectRoutes } from "./project-routes.js";
 import Fastify from "fastify";
+import { proxyTrust } from "./proxy.js";
 import cookie from "@fastify/cookie";
 import helmet from "@fastify/helmet";
 import multipart from "@fastify/multipart";
@@ -14,7 +18,7 @@ import { inspectWorkspace } from "./files.js";
 import { acquireWorkspace, releaseWorkspace } from "./leases.js";
 import { randomUUID } from "node:crypto";
 import { createReadStream, createWriteStream } from "node:fs";
-import { mkdir, unlink, stat, rm } from "node:fs/promises";
+import { mkdir, unlink, stat } from "node:fs/promises";
 import { pipeline } from "node:stream/promises";
 import path from "node:path";
 import { z } from "zod";
@@ -26,9 +30,15 @@ import { safeName, seal, redact } from "./security.js";
 import { normalizeGithubRepo } from "../shared.js";
 import { concurrentTasks, modelDefaults } from "./settings.js";
 import { createResourceMonitor } from "./resources.js";
-import { disconnectAccount } from "./accounts.js";
+import { disconnectAccount, deleteAccount } from "./accounts.js";
 import { active, switchAccount } from "./worker.js";
-import { launch, workspace, type Running } from "./runtime.js";
+import {
+  workspacePath,
+  createWorkspace,
+  mainWorkspace,
+  workspaceBy,
+} from "./workspaces.js";
+import { launch, type Running } from "./runtime.js";
 import {
   git,
   github,
@@ -50,6 +60,8 @@ const effortSchema = z.enum([
 const uuid = z.string().uuid();
 const projectFields =
   "id,name,repo,base_branch,created_at,(github_token <> '') AS github_configured";
+const chatFields =
+  "c.*,w.name AS workspace_name,w.kind AS workspace_kind,w.branch,w.initialized";
 async function verifyRepository(repo: string, token: string) {
   try {
     return await github("/repos/" + repo, "GET", undefined, token);
@@ -73,14 +85,21 @@ const authRuns = new Map<
 const terminals = new Map<string, Running>();
 const idOf = (req: any, key = "id") => uuid.parse(req.params[key]);
 async function chatBy(id: string) {
-  const c = (await db.query("SELECT * FROM chats WHERE id=$1", [id])).rows[0];
+  const c = (
+    await db.query(
+      "SELECT " +
+        chatFields +
+        " FROM chats c JOIN workspaces w ON w.id=c.workspace_id WHERE c.id=$1",
+      [id],
+    )
+  ).rows[0];
   if (!c) throw Object.assign(new Error("Chat not found"), { statusCode: 404 });
   return c;
 }
-async function idle(id: string) {
+async function idle(id: string, connection: Pick<typeof db, "query"> = db) {
   if (
     (
-      await db.query(
+      await connection.query(
         "SELECT 1 FROM jobs WHERE chat_id=$1 AND state IN ('running','waiting_approval','queued')",
         [id],
       )
@@ -92,6 +111,7 @@ async function idle(id: string) {
 }
 export async function createApp() {
   const resources = createResourceMonitor();
+  const terminalCleanups = new Set<() => Promise<void>>();
   const app = Fastify({
     logger: {
       level: "info",
@@ -101,10 +121,14 @@ export async function createApp() {
         "req.body.password",
         "req.body.token",
         "req.body.code",
+        "req.body.private_key",
+        "req.body.passphrase",
       ],
     },
     bodyLimit: 1024 * 1024,
-    trustProxy: false,
+    trustProxy: config.trustedProxyIps.trim()
+      ? proxyTrust(config.trustedProxyIps)
+      : false,
   });
   await app.register(cookie);
   await app.register(helmet, {
@@ -130,7 +154,7 @@ export async function createApp() {
     const code =
       e instanceof z.ZodError
         ? 400
-        : e.code === "23505"
+        : e.code === "23505" || isOutputLimit(e)
           ? 409
           : e.statusCode || 500;
     reply.code(code).send({
@@ -145,6 +169,7 @@ export async function createApp() {
       app.log.error({ message: redact(e.message) }, "Request failed");
   });
   folderRoutes(app);
+  sshRoutes(app);
   app.get("/api/overview", async () => ({
     modelDefaults: await modelDefaults(),
     projects: (
@@ -152,12 +177,19 @@ export async function createApp() {
         "SELECT " + projectFields + " FROM projects ORDER BY created_at DESC",
       )
     ).rows,
+    workspaces: (
+      await db.query(
+        "SELECT * FROM workspaces ORDER BY (kind='main') DESC,created_at",
+      )
+    ).rows,
     accounts: (
       await db.query("SELECT * FROM accounts ORDER BY priority,created_at")
     ).rows,
     chats: (
       await db.query(
-        "SELECT c.*,j.state FROM chats c LEFT JOIN LATERAL (SELECT state FROM jobs WHERE chat_id=c.id ORDER BY created_at DESC LIMIT 1) j ON true ORDER BY c.created_at DESC",
+        "SELECT " +
+          chatFields +
+          ",j.state FROM chats c JOIN workspaces w ON w.id=c.workspace_id LEFT JOIN LATERAL (SELECT state FROM jobs WHERE chat_id=c.id ORDER BY created_at DESC LIMIT 1) j ON true ORDER BY c.created_at DESC",
       )
     ).rows,
   }));
@@ -171,20 +203,31 @@ export async function createApp() {
     ).rows;
   });
   app.get("/api/system", async () => {
-    const [metrics, maximum, jobs] = await Promise.all([
+    const [metrics, maximum, jobs, output] = await Promise.all([
       resources.read(),
       concurrentTasks(),
       db.query(
         "SELECT count(*) FILTER (WHERE state IN ('running','waiting_approval'))::int running, count(*) FILTER (WHERE state='queued')::int queued, count(*) FILTER (WHERE state='waiting_account')::int waiting_accounts FROM jobs",
       ),
+      outputStorage(),
     ]);
     return {
+      output,
       resources: metrics,
       maxConcurrent: maximum,
       running: jobs.rows[0].running,
       queued: jobs.rows[0].queued,
       waitingAccounts: jobs.rows[0].waiting_accounts,
     };
+  });
+  app.post("/api/settings/output", async (req) => {
+    const { limitGb } = z
+      .object({ limitGb: z.number().min(0.01).max(10000) })
+      .parse(req.body);
+    await db.query("UPDATE output_storage SET limit_bytes=$1 WHERE id=1", [
+      Math.round(limitGb * GB),
+    ]);
+    return outputStorage();
   });
   app.get("/api/settings/models", async () => modelDefaults());
   app.post("/api/settings/models/:provider", async (req) => {
@@ -218,14 +261,32 @@ export async function createApp() {
     });
     return { maxConcurrent };
   });
+  projectRoutes(app);
   app.post("/api/projects", async (req) => {
     const p = z
       .object({
-        repo: z.string().max(2048),
+        repo: z.string().max(2048).default(""),
         token: z.string().min(10).max(500).optional(),
         name: z.string().min(1).max(100).optional(),
       })
       .parse(req.body);
+    if (!p.repo.trim()) {
+      if (!p.name?.trim())
+        throw Object.assign(new Error("Enter a project name."), {
+          statusCode: 400,
+        });
+      return transaction(async (c) => {
+        const project = (
+          await c.query(
+            "INSERT INTO projects(id,name,repo) VALUES($1,$2,'') RETURNING " +
+              projectFields,
+            [randomUUID(), p.name!.trim()],
+          )
+        ).rows[0];
+        await createWorkspace(project.id, "main", "Main folder", c);
+        return project;
+      });
+    }
     const normalized = normalizeGithubRepo(p.repo);
     if (!normalized)
       throw Object.assign(
@@ -236,20 +297,25 @@ export async function createApp() {
       );
     p.repo = normalized;
     const repo = await verifyRepository(p.repo, p.token || "");
-    return (
-      await db.query(
-        "INSERT INTO projects(id,name,repo,base_branch,github_token) VALUES($1,$2,$3,$4,$5) RETURNING " +
-          projectFields,
-        [
-          randomUUID(),
-          p.name || repo.name,
-          p.repo,
-          repo.default_branch,
-          p.token ? seal(p.token) : "",
-        ],
-      )
-    ).rows[0];
+    return transaction(async (c) => {
+      const project = (
+        await c.query(
+          "INSERT INTO projects(id,name,repo,base_branch,github_token) VALUES($1,$2,$3,$4,$5) RETURNING " +
+            projectFields,
+          [
+            randomUUID(),
+            p.name || repo.name,
+            p.repo,
+            repo.default_branch,
+            p.token ? seal(p.token) : "",
+          ],
+        )
+      ).rows[0];
+      await createWorkspace(project.id, "main", "Main folder", c);
+      return project;
+    });
   });
+
   app.patch("/api/projects/:id", async (req) => {
     const id = idOf(req);
     const p = z
@@ -262,6 +328,10 @@ export async function createApp() {
       .rows[0];
     if (!project)
       throw Object.assign(new Error("Project not found"), { statusCode: 404 });
+    if (p.token && !project.repo)
+      throw Object.assign(new Error("This project has no GitHub repository."), {
+        statusCode: 400,
+      });
     if (p.token) await verifyRepository(project.repo, p.token);
     const result = await db.query(
       "UPDATE projects SET name=COALESCE($2,name),github_token=CASE WHEN $3 THEN $4 ELSE github_token END WHERE id=$1 RETURNING " +
@@ -283,6 +353,19 @@ export async function createApp() {
         [randomUUID(), a.provider, a.name],
       )
     ).rows[0];
+  });
+  app.delete("/api/accounts/:id", async (req) => {
+    const id = idOf(req);
+    const result = await deleteAccount(
+      id,
+      z.object({ name: z.string() }).parse(req.body).name,
+    );
+    const auth = authRuns.get(id);
+    if (auth) {
+      clearTimeout(auth.timer);
+      authRuns.delete(id);
+    }
+    return result;
   });
   app.patch("/api/accounts/:id", async (req) => {
     const id = idOf(req),
@@ -315,7 +398,7 @@ export async function createApp() {
         throw Object.assign(new Error("Account is busy"), { statusCode: 409 });
       const row = (
         await c.query(
-          "UPDATE accounts SET status='authenticating' WHERE id=$1 AND status NOT IN ('authenticating','inspecting','disconnecting') RETURNING *",
+          "UPDATE accounts SET status='authenticating' WHERE id=$1 AND status NOT IN ('authenticating','inspecting','disconnecting','deleting','delete_failed') RETURNING *",
           [id],
         )
       ).rows[0];
@@ -357,7 +440,7 @@ export async function createApp() {
           clearTimeout(s.timer);
           void s.runtime.stop();
           void db.query(
-            "UPDATE accounts SET status='disconnected' WHERE id=$1",
+            "UPDATE accounts SET status='disconnected' WHERE id=$1 AND status='authenticating'",
             [id],
           );
         }
@@ -374,9 +457,10 @@ export async function createApp() {
       runtime.send({ type: "auth", provider: a.provider });
       return { ok: true };
     } catch (e) {
-      await db.query("UPDATE accounts SET status='disconnected' WHERE id=$1", [
-        id,
-      ]);
+      await db.query(
+        "UPDATE accounts SET status='disconnected' WHERE id=$1 AND status='authenticating'",
+        [id],
+      );
       throw e;
     }
   });
@@ -427,6 +511,7 @@ export async function createApp() {
   });
   const chatSchema = z.object({
     project_id: uuid.nullable().default(null),
+    workspace_id: uuid.optional(),
     title: z.string().trim().max(160).default(""),
     provider: z.enum(["codex", "claude"]),
     account_id: uuid,
@@ -462,12 +547,45 @@ export async function createApp() {
         statusCode: 400,
       });
     const id = randomUUID();
-    return (
-      await db.query(
-        "INSERT INTO chats(id,project_id,title,provider,account_id,model,effort,autonomous,handoff,branch,auto_title) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *",
+    await transaction(async (connection) => {
+      await connection.query("SELECT pg_advisory_xact_lock(417028)");
+      if (
+        !(
+          await connection.query(
+            "SELECT 1 FROM accounts WHERE id=$1 AND provider=$2 AND status NOT IN ('deleting','delete_failed')",
+            [c.account_id, c.provider],
+          )
+        ).rowCount
+      )
+        throw Object.assign(new Error("Choose an available account."), {
+          statusCode: 409,
+        });
+      const w = c.workspace_id
+        ? await workspaceBy(c.workspace_id, connection)
+        : c.project_id
+          ? await mainWorkspace(c.project_id, connection)
+          : await createWorkspace(
+              null,
+              "personal",
+              c.title || "Personal folder " + id.slice(0, 8),
+              connection,
+              id,
+            );
+      if (w.status !== "ready")
+        throw Object.assign(new Error("This folder is not ready."), {
+          statusCode: 409,
+        });
+      if (w.project_id !== c.project_id)
+        throw Object.assign(
+          new Error("This folder does not belong to the selected project."),
+          { statusCode: 400 },
+        );
+      await connection.query(
+        "INSERT INTO chats(id,project_id,workspace_id,title,provider,account_id,model,effort,autonomous,handoff,branch,auto_title,initialized) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
         [
           id,
           c.project_id,
+          w.id,
           c.title || "New chat",
           c.provider,
           c.account_id,
@@ -475,12 +593,15 @@ export async function createApp() {
           c.effort,
           c.autonomous,
           c.handoff,
-          "workspace/" + id.slice(0, 8),
+          w.branch,
           !c.title,
+          w.initialized,
         ],
-      )
-    ).rows[0];
+      );
+    });
+    return chatBy(id);
   });
+
   app.get("/api/chats/:id", async (req) => {
     const id = idOf(req);
     return {
@@ -532,7 +653,7 @@ export async function createApp() {
   });
   app.delete("/api/chats/:id", async (req) => {
     const id = idOf(req);
-    const attachments = await transaction(async (c) => {
+    await transaction(async (c) => {
       // Serialize with the scheduler, terminal leases and new messages.
       await c.query("SELECT pg_advisory_xact_lock(417028)");
       if (
@@ -570,11 +691,6 @@ export async function createApp() {
           ),
           { statusCode: 409 },
         );
-      const files = (
-        await c.query("SELECT storage_name FROM attachments WHERE chat_id=$1", [
-          id,
-        ])
-      ).rows;
       await c.query(
         "DELETE FROM approvals WHERE job_id IN (SELECT id FROM jobs WHERE chat_id=$1)",
         [id],
@@ -585,22 +701,16 @@ export async function createApp() {
       );
       await c.query("DELETE FROM publications WHERE chat_id=$1", [id]);
       await c.query("DELETE FROM jobs WHERE chat_id=$1", [id]);
-      await c.query("DELETE FROM attachments WHERE chat_id=$1", [id]);
+      await c.query(
+        "UPDATE attachments SET chat_id=NULL,message_id=NULL WHERE chat_id=$1",
+        [id],
+      );
       await c.query("DELETE FROM messages WHERE chat_id=$1", [id]);
       await c.query("DELETE FROM chats WHERE id=$1", [id]);
-      return files;
     });
-    const cleanup = await Promise.allSettled([
-      rm(workspace(id), { recursive: true, force: true }),
-      ...attachments.map((f) =>
-        rm(path.join(config.data, "uploads", f.storage_name), { force: true }),
-      ),
-    ]);
-    const cleanupPending = cleanup.some((r) => r.status === "rejected");
-    if (cleanupPending)
-      app.log.error({ chatId: id }, "Deleted chat has files requiring cleanup");
-    return { ok: true, cleanupPending };
+    return { ok: true, cleanupPending: false };
   });
+
   app.patch("/api/chats/:id/model", async (req) => {
     const id = idOf(req);
     const p = z
@@ -621,6 +731,26 @@ export async function createApp() {
         "UPDATE chats SET resolved_model=CASE WHEN model=$2 THEN resolved_model ELSE '' END,resolved_effort=CASE WHEN model=$2 AND effort=$3 THEN resolved_effort ELSE '' END,model=$2,effort=$3 WHERE id=$1",
         [id, p.model, p.effort],
       );
+    });
+    return { ok: true };
+  });
+  app.patch("/api/chats/:id/permissions", async (req) => {
+    const id = idOf(req);
+    const { autonomous } = z
+      .object({ autonomous: z.boolean() })
+      .parse(req.body);
+    await transaction(async (c) => {
+      await c.query("SELECT pg_advisory_xact_lock(417028)");
+      if (
+        !(await c.query("SELECT id FROM chats WHERE id=$1 FOR UPDATE", [id]))
+          .rowCount
+      )
+        throw Object.assign(new Error("Chat not found"), { statusCode: 404 });
+      await idle(id, c);
+      await c.query("UPDATE chats SET autonomous=$2 WHERE id=$1", [
+        id,
+        autonomous,
+      ]);
     });
     return { ok: true };
   });
@@ -670,11 +800,29 @@ export async function createApp() {
         statusCode: 400,
       });
     return transaction(async (c) => {
+      await c.query("SELECT pg_advisory_xact_lock(417028)");
       const chat = (
         await c.query("SELECT * FROM chats WHERE id=$1 FOR UPDATE", [id])
       ).rows[0];
       if (!chat)
         throw Object.assign(new Error("Chat not found"), { statusCode: 404 });
+      if (
+        chat.account_id &&
+        (
+          await c.query(
+            "SELECT 1 FROM accounts WHERE id=$1 AND status IN ('deleting','delete_failed')",
+            [chat.account_id],
+          )
+        ).rowCount
+      )
+        throw Object.assign(
+          new Error("Choose another account before sending a message."),
+          { statusCode: 409 },
+        );
+      if ((await workspaceBy(chat.workspace_id, c)).status !== "ready")
+        throw Object.assign(new Error("This folder is not ready."), {
+          statusCode: 409,
+        });
       const previous = (
         await c.query(
           "SELECT id FROM messages WHERE chat_id=$1 AND client_id=$2",
@@ -853,6 +1001,13 @@ export async function createApp() {
         throw Object.assign(new Error("This request is no longer active"), {
           statusCode: 409,
         });
+      if (allow && a.details == null)
+        throw Object.assign(
+          new Error(
+            "Action details are unavailable. Deny this request and retry the action.",
+          ),
+          { statusCode: 409 },
+        );
       await c.query("UPDATE approvals SET decision=$2 WHERE id=$1", [
         id,
         allow,
@@ -955,7 +1110,7 @@ export async function createApp() {
           });
         return (
           await c.query(
-            "INSERT INTO attachments(id,chat_id,name,mime,size,storage_name,client_id) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING *",
+            "INSERT INTO attachments(id,chat_id,workspace_id,name,mime,size,storage_name,client_id) VALUES($1,$2,(SELECT workspace_id FROM chats WHERE id=$2),$3,$4,$5,$6,$7) RETURNING *",
             [id, chatId, name, part.mimetype, s.size, storage, clientId],
           )
         ).rows[0];
@@ -975,7 +1130,7 @@ export async function createApp() {
   app.delete("/api/attachments/:id", async (req) => {
     const f = (
       await db.query(
-        "DELETE FROM attachments WHERE id=$1 AND message_id IS NULL RETURNING *",
+        "DELETE FROM attachments WHERE id=$1 AND message_id IS NULL AND chat_id IS NOT NULL RETURNING *",
         [idOf(req)],
       )
     ).rows[0];
@@ -1053,12 +1208,19 @@ export async function createApp() {
   });
   app.get("/api/chats/:id/diff", async (req) => {
     const chat = await chatBy(idOf(req));
-    if (!chat.project_id)
+    if (
+      !chat.project_id ||
+      !(
+        await db.query("SELECT repo FROM projects WHERE id=$1", [
+          chat.project_id,
+        ])
+      ).rows[0]?.repo
+    )
       throw Object.assign(new Error("This chat has no Git repository."), {
         statusCode: 409,
       });
     return {
-      diff: await git(workspace(chat.id), [
+      diff: await git(workspacePath(chat.workspace_id), [
         "diff",
         "HEAD",
         "--",
@@ -1075,7 +1237,14 @@ export async function createApp() {
         statusCode: 409,
       });
     const chat = await chatBy(id);
-    if (!chat.project_id)
+    if (
+      !chat.project_id ||
+      !(
+        await db.query("SELECT repo FROM projects WHERE id=$1", [
+          chat.project_id,
+        ])
+      ).rows[0]?.repo
+    )
       throw Object.assign(
         new Error(
           "This chat has no Git repository. Files and terminal remain available.",
@@ -1109,13 +1278,23 @@ export async function createApp() {
       ).rows[0];
       let result: any = {};
       if (p.action === "commit") {
-        await git(workspace(id), ["add", "--all", "--", "."]);
-        await git(workspace(id), [
+        await git(workspacePath(chat.workspace_id), [
+          "add",
+          "--all",
+          "--",
+          ".",
+        ]);
+        await git(workspacePath(chat.workspace_id), [
           "reset",
           "--",
           ".workspace-attachments",
+          ".workspace-folders",
         ]).catch(() => {});
-        result.output = await git(workspace(id), ["commit", "-m", p.message]);
+        result.output = await git(workspacePath(chat.workspace_id), [
+          "commit",
+          "-m",
+          p.message,
+        ]);
       } else if (p.action === "push") {
         result.output = await pushBranch(chat, project);
       } else {
@@ -1207,25 +1386,45 @@ export async function createApp() {
       return;
     }
     const send = (e: any) => {
-      if (e.chat_id === chatId && socket.readyState === 1)
-        socket.send(JSON.stringify(e));
+      if (e.chat_id === chatId && socket.readyState === 1) {
+        if (socket.bufferedAmount > 4 * 1024 * 1024)
+          socket.close(1013, "Reconnect to catch up");
+        else socket.send(JSON.stringify(e));
+      }
     };
-    const listener = (e: any) => (buffering ? buffer.push(e) : send(e));
+    let bufferedBytes = 0;
+    const listener = (e: any) => {
+      if (e.chat_id !== chatId || socket.readyState !== 1) return;
+      if (!buffering) return send(e);
+      bufferedBytes += Buffer.byteLength(JSON.stringify(e));
+      if (bufferedBytes > 4 * 1024 * 1024) {
+        buffer = [];
+        socket.close(1013, "Reconnect to catch up");
+      } else buffer.push(e);
+    };
+    const refresh = (id: string) => {
+      if (id === chatId && socket.readyState === 1)
+        socket.send(JSON.stringify({ type: "refresh" }));
+    };
     bus.on("event", listener);
-    socket.on("close", () => bus.off("event", listener));
+    bus.on("refresh", refresh);
+    socket.on("close", () => {
+      bus.off("event", listener);
+      bus.off("refresh", refresh);
+    });
     void (async () => {
       try {
         let cursor = after;
         while (socket.readyState === 1) {
           const rows = (
             await db.query(
-              "SELECT * FROM events WHERE chat_id=$1 AND id>$2 ORDER BY id LIMIT 500",
+              "SELECT * FROM events WHERE chat_id=$1 AND id>$2 ORDER BY id LIMIT 20",
               [chatId, cursor],
             )
           ).rows;
           for (const e of rows) send(e);
           if (rows.length) cursor = rows.at(-1).id;
-          if (rows.length < 500) break;
+          if (rows.length < 20) break;
         }
         for (const e of buffer) if (BigInt(e.id) > BigInt(cursor)) send(e);
         buffer = [];
@@ -1248,47 +1447,63 @@ export async function createApp() {
         })
         .catch(() => socket.close(1011));
     }, 60000);
-    socket.on("close", () => clearInterval(authTimer));
     let runtime: Running | undefined,
       closed = false,
       leased = false;
-    void (async () => {
+    let starting: Promise<void>, cleaning: Promise<void> | undefined;
+    const cleanup = () =>
+      (cleaning ||= (async () => {
+        // A socket can close (or a runner can fail) before launch returns.
+        // Keep the lease until that runner has been obtained and stopped.
+        await starting;
+        await runtime?.stop();
+        if (leased) {
+          await releaseWorkspace(id);
+          leased = false;
+        }
+        if (runtime && terminals.get(id) === runtime) terminals.delete(id);
+        terminalCleanups.delete(cleanup);
+      })().catch((error) => {
+        cleaning = undefined;
+        throw error;
+      }));
+    terminalCleanups.add(cleanup);
+    function disconnect(error?: string) {
+      if (!closed && error && socket.readyState === 1)
+        socket.send(
+          JSON.stringify({ type: "terminal", data: "\r\n" + error + "\r\n" }),
+        );
+      closed = true;
+      clearInterval(authTimer);
+      if (socket.readyState === 1) socket.close(error ? 1011 : 1000);
+      // Do not wait for the WebSocket close handshake to release the folder.
+      void cleanup().catch((error) => {
+        app.log.error(
+          { message: redact(error.message) },
+          "Terminal cleanup failed",
+        );
+      });
+    }
+    starting = (async () => {
       try {
         const chat = await chatBy(id);
         await idle(id);
         if (terminals.has(id)) throw new Error("Terminal already open");
         await acquireWorkspace(id, "terminal");
         leased = true;
-        if (closed) {
-          await releaseWorkspace(id);
-          leased = false;
-          return;
-        }
+        if (closed) return;
         await initializeWorkspace(chat);
         runtime = await launch(id, null, (e) => {
-          if (socket.readyState === 1) socket.send(JSON.stringify(e));
+          if (closed) return;
+          if (e.type === "failed") disconnect(e.error || "Terminal failed.");
+          else if (e.type === "exit" || e.type === "interrupted") disconnect();
+          else if (socket.readyState === 1) socket.send(JSON.stringify(e));
         });
-        if (closed) {
-          await runtime.stop();
-          await releaseWorkspace(id);
-          leased = false;
-          return;
-        }
+        if (closed) return;
         terminals.set(id, runtime);
         runtime.send({ type: "terminal", data: "" });
       } catch (e: any) {
-        if (leased) {
-          await releaseWorkspace(id);
-          leased = false;
-        }
-        if (socket.readyState !== 1) return;
-        socket.send(
-          JSON.stringify({
-            type: "terminal",
-            data: "\r\n" + e.message + "\r\n",
-          }),
-        );
-        socket.close();
+        disconnect(e.message);
       }
     })();
     socket.on("message", (raw) => {
@@ -1310,17 +1525,7 @@ export async function createApp() {
         socket.close(1008);
       }
     });
-    socket.on("close", () => {
-      closed = true;
-      terminals.delete(id);
-      void (async () => {
-        await runtime?.stop();
-        if (leased && runtime) {
-          await releaseWorkspace(id);
-          leased = false;
-        }
-      })();
-    });
+    socket.on("close", () => disconnect());
   });
   await app.register(serveStatic, {
     root: path.resolve("dist/web"),
@@ -1336,7 +1541,7 @@ export async function createApp() {
       clearTimeout(s.timer);
       await s.runtime.stop();
     }
-    for (const r of terminals.values()) await r.stop();
+    await Promise.all([...terminalCleanups].map((cleanup) => cleanup()));
   });
   return app;
 }

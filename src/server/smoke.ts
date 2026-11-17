@@ -1,16 +1,32 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rm, writeFile, symlink } from "node:fs/promises";
+import { readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { launch, workspace, type Running } from "./runtime.js";
 import { git } from "./git.js";
-import { inspectWorkspace, syncAttachments } from "./files.js";
-import { config } from "./config.js";
+import { inspectWorkspace } from "./files.js";
+import { db, transaction } from "./db.js";
+import { createWorkspace } from "./workspaces.js";
 
 // No provider credentials or inference calls. Uses only temporary UUID workspaces.
 const ids = Array.from({ length: 3 }, () => randomUUID()),
   runners: Running[] = [];
 try {
+  await transaction(async (c) => {
+    for (const id of ids) {
+      const w = await createWorkspace(
+        null,
+        "personal",
+        "Temporary smoke check",
+        c,
+        id,
+      );
+      await c.query(
+        "INSERT INTO chats(id,workspace_id,title,provider,branch) VALUES($1,$1,'Temporary smoke check','codex',$2)",
+        [id, w.branch],
+      );
+    }
+  });
   for (const [i, id] of ids.entries()) {
     let resolve!: () => void, reject!: (e: Error) => void;
     const ready = new Promise<void>((a, b) => {
@@ -62,37 +78,13 @@ try {
     "workspace-0",
   );
   await assert.rejects(() => inspectWorkspace(ids[0], "../secret", "file"));
-  const uploadName = ids[0] + "-probe.txt";
-  await mkdir(path.join(config.data, "uploads"), { recursive: true });
-  await writeFile(
-    path.join(config.data, "uploads", uploadName),
-    "attachment probe",
-    { mode: 0o600 },
-  );
-  try {
-    await symlink(
-      "/outside-workspace",
-      path.join(workspace(ids[0]), ".workspace-attachments"),
-    );
-    await syncAttachments(ids[0], [uploadName]);
-    assert.equal(
-      (
-        await inspectWorkspace(
-          ids[0],
-          ".workspace-attachments/" + uploadName,
-          "file",
-        )
-      ).toString(),
-      "attachment probe",
-    );
+  {
     const large = Buffer.alloc(3 * 1024 ** 2, "workspace");
     await writeFile(path.join(workspace(ids[0]), "large.bin"), large);
     assert.deepEqual(
       await inspectWorkspace(ids[0], "large.bin", "file"),
       large,
     );
-  } finally {
-    await rm(path.join(config.data, "uploads", uploadName), { force: true });
   }
   let resolveModels!: (x: any) => void, rejectModels!: (e: Error) => void;
   const models = new Promise<any>((resolve, reject) => {
@@ -117,10 +109,15 @@ try {
   ]);
   assert.ok(Array.isArray(list));
   console.log(
-    "PASS: three isolated runners, terminal I/O, persistent files, Git helper, safe attachment staging, complete large-file reads, Codex app-server handshake and model catalog. No inference calls.",
+    "PASS: three isolated runners, terminal I/O, persistent files, Git helper, complete large-file reads, Codex app-server handshake and model catalog. No inference calls.",
   );
 } finally {
   for (const r of runners) await r.stop();
+  await transaction(async (c) => {
+    await c.query("DELETE FROM chats WHERE id=ANY($1::uuid[])", [ids]);
+    await c.query("DELETE FROM workspaces WHERE id=ANY($1::uuid[])", [ids]);
+  });
+  await db.end();
   for (const id of ids)
     await rm(workspace(id), { recursive: true, force: true });
 }

@@ -64,7 +64,7 @@ export async function chatFolders(
 ) {
   return (
     await query.query(
-      "SELECT f.* FROM folder_links f JOIN chats c ON c.id=$1 WHERE f.chat_id=c.id OR f.project_id=c.project_id ORDER BY f.name",
+      "SELECT f.*, (f.read_only OR w.kind='copy') AS read_only FROM folder_links f JOIN chats c ON c.id=$1 JOIN workspaces w ON w.id=c.workspace_id WHERE f.chat_id=c.id OR f.project_id=c.project_id ORDER BY f.name",
       [chatId],
     )
   ).rows;
@@ -93,8 +93,10 @@ export async function foldersBusy(
       `SELECT 1 FROM folder_links mine JOIN chats c ON c.id=$1
     JOIN folder_links other ON other.name=mine.name
     JOIN chats o ON other.chat_id=o.id OR other.project_id=o.project_id
+    JOIN workspaces mw ON mw.id=c.workspace_id
+    JOIN workspaces ow ON ow.id=o.workspace_id
     WHERE (mine.chat_id=c.id OR mine.project_id=c.project_id) AND o.id<>c.id
-    AND (NOT mine.read_only OR NOT other.read_only)
+    AND ((NOT mine.read_only AND mw.kind<>'copy') OR (NOT other.read_only AND ow.kind<>'copy'))
     AND (EXISTS(SELECT 1 FROM jobs j WHERE j.chat_id=o.id AND j.state IN ('running','waiting_approval'))
       OR EXISTS(SELECT 1 FROM workspace_leases w WHERE w.chat_id=o.id)) LIMIT 1`,
       [chatId],

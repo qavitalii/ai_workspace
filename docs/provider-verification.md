@@ -16,6 +16,17 @@ The automated tests do not use your subscriptions and cannot replace real authen
 2. Repeat the attachment, permission, and resume checks. If a protocol feature fails, record the issue; do not enable bypass mode to hide broken approvals.
 3. Verify billing uses your intended subscription. Runners do not inherit API keys from the host shell.
 
+## Shared folders, copies and conflict resolution
+
+Use disposable files/projects and repeat this workflow with each provider you intend to use. The automated suite tests preparation and transfer with simulated agent edits; it does not establish that a live model resolves conflicts correctly.
+
+1. Open two chats in main. Save a file through **Files** and confirm both can read it. Confirm overlapping tasks wait rather than writing the same folder concurrently. Attach a separate file to one message and verify the original is read-only; save a working copy explicitly.
+2. Create two working copies from a Git project with an uncommitted edit and an uploaded file. With two available accounts, run separate tasks and confirm changes stay in their selected folders. Read Git status/history; use the app’s Git actions for commits. Repeat with a **Files only** project.
+3. Edit the same text differently in main and one copy. Open **Review changes → Resolve with agent**, select the account, and confirm the resolution chat opens in a separate folder. Exercise normal permission prompts, a stop/resume, and an ambiguous choice requiring clarification.
+4. Ask the agent to finish and explain its checks. Review the resolution folder. Confirm incomplete resolutions cannot transfer; then transfer the reviewed result and check both intended changes, unrelated files and the untouched original copy. Also check a binary or delete/modify conflict.
+5. Change main after a review and verify stale transfer is rejected. Refresh and review again. Delete a disposable copy after transferring; confirm main and other copies remain. Deleting a chat alone must preserve its files and originals.
+6. Delete a disposable saved account through **Delete account**. Confirm its chats/files remain and another account can continue them. This removes local sign-in data, not the upstream provider account.
+
 ## Switching accounts
 
 1. Connect two of your own accounts for the same provider.

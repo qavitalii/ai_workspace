@@ -1,6 +1,7 @@
+import { workspaceLabel } from "./WorkspaceFiles";
 import { AccountUsage } from "./AccountUsage";
 import { modelLabel } from "../usage";
-import { useEffect, useState, useRef, useId } from "react";
+import { useEffect, useState, useRef, useId, type ReactNode } from "react";
 import {
   ChevronDown,
   ChevronRight,
@@ -28,6 +29,59 @@ export const chatStatus: Record<string, string> = {
   completed: "Completed",
 };
 
+function SidebarMenu({
+  label,
+  className = "",
+  children,
+}: {
+  label: string;
+  className?: string;
+  children: (close: () => void) => ReactNode;
+}) {
+  const menu = useRef<HTMLDivElement>(null);
+  const id = useId();
+  const [open, setOpen] = useState(false);
+  const [position, setPosition] = useState({ top: 0, left: 0 });
+  return (
+    <>
+      <button
+        className={"icon sidebar-actions " + className}
+        title={label}
+        aria-label={label}
+        aria-controls={id}
+        aria-expanded={open}
+        onClick={(e) => {
+          const rect = e.currentTarget.getBoundingClientRect();
+          setPosition({
+            top: Math.max(
+              8,
+              Math.min(rect.bottom + 4, window.innerHeight - 112),
+            ),
+            left: Math.max(
+              8,
+              Math.min(rect.right - 184, window.innerWidth - 192),
+            ),
+          });
+          menu.current?.togglePopover();
+        }}
+      >
+        <MoreHorizontal size={16} />
+      </button>
+      <div
+        ref={menu}
+        id={id}
+        popover="auto"
+        className="chat-action-menu sidebar-action-menu"
+        style={position}
+        aria-label={label}
+        onToggle={(e) => setOpen(e.newState === "open")}
+      >
+        {children(() => menu.current?.hidePopover())}
+      </div>
+    </>
+  );
+}
+
 export function SidebarChats({ chats, ...props }: any) {
   return chats.map((chat: any) => (
     <SidebarChat key={chat.id} chat={chat} {...props} />
@@ -38,10 +92,7 @@ function SidebarChat({ chat, activeId, onSelect, onManage }: any) {
     [title, setTitle] = useState(chat.title),
     [saving, setSaving] = useState(false),
     [error, setError] = useState("");
-  const [position, setPosition] = useState({ top: 0, left: 0 });
-  const menu = useRef<HTMLDivElement>(null),
-    input = useRef<HTMLInputElement>(null);
-  const menuId = useId();
+  const input = useRef<HTMLInputElement>(null);
   useEffect(() => {
     if (renaming) {
       input.current?.focus();
@@ -49,7 +100,7 @@ function SidebarChat({ chat, activeId, onSelect, onManage }: any) {
     }
   }, [renaming]);
   return (
-    <div className="chat-row">
+    <div className={"chat-row " + (activeId === chat.id ? "active" : "")}>
       {renaming ? (
         <form
           className="chat-inline-rename"
@@ -107,9 +158,21 @@ function SidebarChat({ chat, activeId, onSelect, onManage }: any) {
           <button
             className={"chat-link " + (activeId === chat.id ? "selected" : "")}
             aria-current={activeId === chat.id ? "page" : undefined}
+            aria-label={[
+              chat.title,
+              chat.provider === "codex" ? "Codex" : "Claude Code",
+              modelLabel(chat),
+              workspaceLabel(chat),
+              chatStatus[chat.state],
+            ]
+              .filter(Boolean)
+              .join(" · ")}
             onClick={() => onSelect(chat.id)}
             title={
-              chat.title + (chat.state ? " · " + chatStatus[chat.state] : "")
+              chat.title +
+              " · " +
+              workspaceLabel(chat) +
+              (chat.state ? " · " + chatStatus[chat.state] : "")
             }
           >
             <MessageSquare size={16} />
@@ -117,87 +180,72 @@ function SidebarChat({ chat, activeId, onSelect, onManage }: any) {
               <span>{chat.title}</span>
               <small
                 className="chat-description"
-                title={`${chat.provider === "codex" ? "Codex" : "Claude Code"} · ${modelLabel(chat)}`}
+                title={`${chat.provider === "codex" ? "Codex" : "Claude Code"} · ${modelLabel(chat)} · ${workspaceLabel(chat)}`}
               >
-                <span className={"chat-agent " + chat.provider}>
-                  {chat.provider === "codex" ? "Codex" : "Claude"}
+                <span className="chat-details">
+                  <span className={"chat-agent " + chat.provider}>
+                    {chat.provider === "codex" ? "Codex" : "Claude"}
+                  </span>
+                  <span aria-hidden="true"> · </span>
+                  <span className="chat-model">{modelLabel(chat)}</span>
                 </span>
-                <span aria-hidden="true">·</span>
-                <span className="chat-model">{modelLabel(chat)}</span>
+                {[
+                  "running",
+                  "queued",
+                  "waiting_approval",
+                  "waiting_account",
+                  "failed",
+                  "interrupted",
+                ].includes(chat.state) ? (
+                  <span
+                    className={"chat-state " + chat.state}
+                    title={chatStatus[chat.state]}
+                  >
+                    {chat.state === "waiting_approval"
+                      ? "Needs reply"
+                      : chatStatus[chat.state]}
+                  </span>
+                ) : (
+                  ["copy", "saved"].includes(chat.workspace_kind) && (
+                    <span className="chat-location-tag">
+                      {chat.workspace_kind === "copy" ? "Copy" : "Saved"}
+                    </span>
+                  )
+                )}
               </small>
             </span>
-            {[
-              "running",
-              "queued",
-              "waiting_approval",
-              "waiting_account",
-              "failed",
-              "interrupted",
-            ].includes(chat.state) && (
-              <span
-                className={"chat-state " + chat.state}
-                aria-label={chatStatus[chat.state]}
-              >
-                {chat.state === "running"
-                  ? "Working"
-                  : chat.state === "queued"
-                    ? "Queued"
-                    : "!"}
-              </span>
+          </button>
+          <SidebarMenu
+            label={"Actions for " + chat.title}
+            className="chat-actions"
+          >
+            {(close) => (
+              <>
+                <button
+                  autoFocus
+                  onClick={() => {
+                    close();
+                    setTitle(chat.title);
+                    setError("");
+                    setRenaming(true);
+                  }}
+                >
+                  <Pencil size={15} />
+                  Rename
+                </button>
+                <button
+                  className="delete-action"
+                  onClick={() => {
+                    close();
+                    onManage(chat, "delete");
+                  }}
+                >
+                  <Trash2 size={15} />
+                  Delete
+                </button>
+              </>
             )}
-          </button>
-          <button
-            className="icon chat-actions"
-            title="Chat actions"
-            aria-label={"Actions for " + chat.title}
-            aria-controls={menuId}
-            onClick={(e) => {
-              const rect = e.currentTarget.getBoundingClientRect();
-              setPosition({
-                top: Math.max(
-                  8,
-                  Math.min(rect.bottom + 4, window.innerHeight - 96),
-                ),
-                left: Math.max(
-                  8,
-                  Math.min(rect.right - 160, window.innerWidth - 168),
-                ),
-              });
-              menu.current?.togglePopover();
-            }}
-          >
-            <MoreHorizontal size={17} />
-          </button>
-          <div
-            ref={menu}
-            id={menuId}
-            popover="auto"
-            className="chat-action-menu"
-            style={position}
-            aria-label={"Actions for " + chat.title}
-          >
-            <button
-              onClick={() => {
-                menu.current?.hidePopover();
-                setTitle(chat.title);
-                setError("");
-                setRenaming(true);
-              }}
-            >
-              <Pencil size={15} />
-              Rename
-            </button>
-            <button
-              className="delete-action"
-              onClick={() => {
-                menu.current?.hidePopover();
-                onManage(chat, "delete");
-              }}
-            >
-              <Trash2 size={15} />
-              Delete
-            </button>
-          </div>
+          </SidebarMenu>
         </>
       )}
     </div>
@@ -258,6 +306,9 @@ export function SidebarNavigation({
           <>
             <div className="sidebar-section">
               <span>Search results</span>
+              <small aria-live="polite">
+                {searching ? "" : results.length}
+              </small>
             </div>
             {searching && (
               <p className="side-hint" role="status">
@@ -269,7 +320,7 @@ export function SidebarNavigation({
                 {searchError}
               </p>
             )}
-            {!searching && !results.length && (
+            {!searching && !searchError && !results.length && (
               <p className="side-hint">
                 No chats found. Try another title or a word from a message.
               </p>
@@ -295,6 +346,7 @@ export function SidebarNavigation({
               className={
                 "home-link " + (!chatId && !projectId ? "selected" : "")
               }
+              aria-current={!chatId && !projectId ? "page" : undefined}
               onClick={onHome}
             >
               <Home size={17} />
@@ -350,30 +402,53 @@ export function SidebarNavigation({
                     >
                       <FolderGit2 size={17} />
                       <span>{project.name}</span>
-                      <small>{projectChats.length}</small>
+                      <small aria-label={`${projectChats.length} chats`}>
+                        {projectChats.length}
+                      </small>
                     </button>
-                    <button
-                      className="icon project-add"
-                      aria-label={"New chat in " + project.name}
-                      title="New chat"
-                      onClick={() => onNew(project.id)}
+                    <SidebarMenu
+                      label={"Actions for project " + project.name}
+                      className="project-actions"
                     >
-                      <Plus size={15} />
-                    </button>
-                    <button
-                      className="icon"
-                      title="Project settings"
-                      aria-label={"Settings for " + project.name}
-                      onClick={() => onProjectSettings(project)}
-                    >
-                      <Settings size={15} />
-                    </button>
+                      {(close) => (
+                        <>
+                          <button
+                            autoFocus
+                            onClick={() => {
+                              close();
+                              onNew(project.id);
+                            }}
+                          >
+                            <Plus size={15} />
+                            New chat
+                          </button>
+                          <button
+                            onClick={() => {
+                              close();
+                              onProjectSettings(project);
+                            }}
+                          >
+                            <Settings size={15} />
+                            Project settings
+                          </button>
+                        </>
+                      )}
+                    </SidebarMenu>
                   </div>
                   <div
                     className="project-chats"
                     id={"project-chats-" + project.id}
                     hidden={!open}
                   >
+                    {!projectChats.length && (
+                      <button
+                        className="project-empty"
+                        onClick={() => onNew(project.id)}
+                      >
+                        <Plus size={13} />
+                        Start a chat
+                      </button>
+                    )}
                     <SidebarChats
                       chats={projectChats}
                       activeId={chatId}
@@ -400,6 +475,9 @@ export function SidebarNavigation({
                 <Plus size={17} />
               </button>
             </div>
+            {!chats.some((c: any) => !c.project_id) && (
+              <p className="side-hint">Your personal chats appear here.</p>
+            )}
             <SidebarChats
               chats={chats.filter((c: any) => !c.project_id)}
               activeId={chatId}
@@ -408,21 +486,23 @@ export function SidebarNavigation({
             />
           </>
         )}
-        {!!accounts?.length && (
-          <details className="sidebar-usage" open>
-            <summary>Account limits</summary>
-            {accounts.map((a: any) => (
-              <AccountUsage
-                key={a.id}
-                account={a}
-                refresh={onRefreshAccounts}
-                compact
-                sidebar
-              />
-            ))}
-          </details>
-        )}
       </nav>
+      {!!accounts?.length && (
+        <details className="sidebar-usage">
+          <summary>
+            Account limits <span>{accounts.length} accounts</span>
+          </summary>
+          {accounts.map((a: any) => (
+            <AccountUsage
+              key={a.id}
+              account={a}
+              refresh={onRefreshAccounts}
+              compact
+              sidebar
+            />
+          ))}
+        </details>
+      )}
     </>
   );
 }

@@ -4,6 +4,8 @@ await build({
     "src/server/main.ts",
     "src/server/setup.ts",
     "src/server/smoke.ts",
+    "src/server/folder-helper.ts",
+    "src/server/ssh-helper.ts",
     "src/runner/main.ts",
     "src/runner/permissions.ts",
   ],

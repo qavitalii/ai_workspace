@@ -4,18 +4,26 @@ export const config = {
     process.env.DATABASE_URL ||
     "postgres://workspace:workspace@127.0.0.1:54329/workspace",
   origin: process.env.APP_ORIGIN || "http://localhost:5173",
+  trustedProxyIps: process.env.TRUSTED_PROXY_IPS || "",
   port: Number(process.env.PORT || 3000),
   data: path.resolve(process.env.DATA_ROOT || ".data"),
   folderRoot: process.env.FOLDER_ROOT || "",
   production: process.env.NODE_ENV === "production",
   key: process.env.ENCRYPTION_KEY || "",
   image: process.env.RUNNER_IMAGE || "ai-workspace-runner:0.1.0",
+  outputLimitGb: Number(process.env.OUTPUT_LIMIT_GB || 1),
   maxConcurrent: Number(process.env.MAX_CONCURRENT || 3),
   maxFile: Number(process.env.MAX_FILE_MB || 25) * 1024 * 1024,
   maxAttachments: Number(process.env.MAX_ATTACHMENTS || 10),
   autoHandoff: process.env.ENABLE_AUTO_HANDOFF === "true",
 };
 export function validateConfig() {
+  if (
+    !Number.isFinite(config.outputLimitGb) ||
+    config.outputLimitGb < 0.01 ||
+    config.outputLimitGb > 10000
+  )
+    throw new Error("OUTPUT_LIMIT_GB must be between 0.01 and 10000 GB.");
   if (
     ![
       config.maxConcurrent,

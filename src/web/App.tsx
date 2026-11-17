@@ -1,3 +1,6 @@
+import { ChangesPanel } from "./ChangesPanel";
+import { SshSettings, SshAccess } from "./SshSettings";
+import { RemovalConfirmation } from "./FolderActions";
 import { Select } from "./Select";
 import { ChatModelPicker } from "./ChatModelPicker";
 import { ModelDefaults } from "./ModelDefaults";
@@ -5,6 +8,7 @@ import { AccountUsage } from "./AccountUsage";
 import { modelLabel, effortLabel } from "../usage";
 import { SidebarNavigation } from "./Sidebar";
 import { WorkspaceHome } from "./WorkspaceHome";
+import { AgentPermission } from "./AgentPermission";
 import { AgentQuestions } from "./AgentQuestions";
 import { GithubTokenHelp } from "./GithubTokenHelp";
 import { commandsFor, slashCommand } from "../commands";
@@ -28,6 +32,10 @@ import {
 } from "react";
 import {
   ArrowUp,
+  ArrowDown,
+  Maximize2,
+  Minimize2,
+  Trash2,
   Plus,
   FolderGit2,
   Settings,
@@ -60,6 +68,8 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { api, upload, socketUrl } from "./api";
 import { ServerSettings } from "./ServerSettings";
+import { ProjectWorkspaces } from "./ProjectWorkspaces";
+import { WorkspaceFiles, workspaceLabel } from "./WorkspaceFiles";
 import { ProjectSettings } from "./ProjectSettings";
 const Terminal = lazy(() =>
   import("./Terminal").then((m) => ({ default: m.Terminal })),
@@ -80,6 +90,8 @@ const labels: Record<string, string> = {
   inspecting: "Checking…",
   disconnecting: "Disconnecting…",
   disconnect_failed: "Sign-out failed",
+  deleting: "Deleting…",
+  delete_failed: "Removal incomplete — retry Delete",
 };
 function Mark({ small = false }: { small?: boolean }) {
   return (
@@ -259,6 +271,7 @@ export function App() {
     [loading, setLoading] = useState(true),
     [overview, setOverview] = useState<any>({
       projects: [],
+      workspaces: [],
       chats: [],
       accounts: [],
     }),
@@ -268,6 +281,8 @@ export function App() {
     [projectId, setProjectId] = useState<string | null>(
       new URLSearchParams(location.search).get("project"),
     ),
+    [newWorkspaceId, setNewWorkspaceId] = useState<string | null>(null),
+    [viewingWorkspace, setViewingWorkspace] = useState<any>(null),
     [newProjectId, setNewProjectId] = useState<string | null>(null),
     [detail, setDetail] = useState<any>(null),
     [modal, setModal] = useState(""),
@@ -276,6 +291,8 @@ export function App() {
     [editingProject, setEditingProject] = useState<any>(null),
     [error, setError] = useState(""),
     [mobile, setMobile] = useState(false),
+    [showLatest, setShowLatest] = useState(false),
+    [panelExpanded, setPanelExpanded] = useState(false),
     [panel, setPanel] = useState(""),
     [query, setQuery] = useState(""),
     [results, setResults] = useState<any[]>([]),
@@ -292,10 +309,26 @@ export function App() {
     fileInput = useRef<HTMLInputElement>(null),
     bottom = useRef<HTMLDivElement>(null),
     nearBottom = useRef(true),
+    responseScroll = useRef<string | null>(null),
     textDrafts = useRef<Record<string, string>>({}),
     currentChat = useRef(chatId);
   currentChat.current = chatId;
-  const loadOverview = () => api("/overview").then(setOverview);
+  const loadOverview = () =>
+    api("/overview").then((next) => {
+      setOverview(next);
+      if (
+        currentChat.current &&
+        !next.chats.some((c: any) => c.id === currentChat.current)
+      ) {
+        setChatId(null);
+        setDetail(null);
+        setPanel("");
+        setDrafts([]);
+        setText("");
+        history.replaceState({}, "", projectId ? "?project=" + projectId : "/");
+      }
+      return next;
+    });
   useEffect(() => {
     if (chatId) textDrafts.current[chatId] = text;
   }, [text]);
@@ -345,10 +378,17 @@ export function App() {
     const controls = () =>
       Array.from(
         sidebar.querySelectorAll<HTMLElement>("button, input, a[href]"),
-      ).filter((el) => !el.closest("[hidden]") && !el.hasAttribute("disabled"));
+      ).filter(
+        (el) => el.getClientRects().length > 0 && !el.hasAttribute("disabled"),
+      );
     controls()[0]?.focus();
     function keyboard(e: KeyboardEvent) {
-      if (e.key === "Escape") setMobile(false);
+      if (
+        e.key === "Escape" &&
+        !e.defaultPrevented &&
+        !document.querySelector("dialog[open], [popover]:popover-open")
+      )
+        setMobile(false);
       if (e.key !== "Tab" || document.querySelector("dialog[open]")) return;
       const items = controls(),
         first = items[0],
@@ -388,6 +428,15 @@ export function App() {
       }
     }
   };
+  async function refreshAfterResponse() {
+    responseScroll.current = chatId;
+    try {
+      await loadDetail();
+    } catch (error) {
+      responseScroll.current = null;
+      throw error;
+    }
+  }
   async function refresh() {
     try {
       setMe(await api("/me"));
@@ -412,6 +461,7 @@ export function App() {
     setDrafts([]);
     setConnected(false);
     nearBottom.current = true;
+    setShowLatest(false);
     clientId.current = crypto.randomUUID();
     void loadDetail(chatId).catch((e) => setError(e.message));
     let ws: WebSocket,
@@ -429,8 +479,23 @@ export function App() {
       ws.onmessage = (e) => {
         if (dead) return;
         const ev = JSON.parse(e.data);
+        if (ev.type === "refresh") {
+          setStreams({});
+          void loadDetail(chatId);
+          void loadOverview();
+          return;
+        }
         if (BigInt(ev.id) <= BigInt(cursor)) return;
         cursor = ev.id;
+        if (
+          ev.type === "status" &&
+          !["running", "waiting_approval"].includes(ev.data.state)
+        )
+          setStreams((previous) => {
+            const next = { ...previous };
+            delete next[ev.job_id];
+            return next;
+          });
         if (ev.type === "delta")
           setStreams((s) => ({
             ...s,
@@ -469,6 +534,22 @@ export function App() {
   useEffect(() => {
     if (nearBottom.current) bottom.current?.scrollIntoView({ block: "end" });
   }, [detail?.messages.length, streams]);
+  useEffect(() => {
+    if (nearBottom.current && detail?.approvals.length) {
+      document
+        .querySelector(".messages .agent-request")
+        ?.scrollIntoView({ block: "start" });
+    }
+  }, [detail?.approvals.map((a: any) => a.id).join(",")]);
+  useEffect(() => {
+    if (responseScroll.current && responseScroll.current === detail?.chat.id) {
+      responseScroll.current = null;
+      const request = document.querySelector(".messages .agent-request");
+      (request || bottom.current)?.scrollIntoView({
+        block: request ? "start" : "end",
+      });
+    }
+  }, [detail]);
   useEffect(() => {
     let active = true;
     setResults([]);
@@ -535,7 +616,11 @@ export function App() {
     setError("");
     history.pushState(null, "", id ? "?project=" + id : location.pathname);
   }
-  function newChat(id: string | null = chat?.project_id || projectId) {
+  function newChat(
+    id: string | null = chat?.project_id || projectId,
+    workspaceId: string | null = null,
+  ) {
+    setNewWorkspaceId(workspaceId);
     setNewProjectId(id);
     setModal("chat");
     setMobile(false);
@@ -619,9 +704,11 @@ export function App() {
         await api(`/chats/${chatId}/mode`, { mode: "plan" });
         await loadDetail();
       });
-    if (["permissions", "rename"].includes(name)) setModal("chat-settings");
+    if (name === "permissions") setModal("chat-permissions");
+    if (name === "rename") setModal("chat-settings");
     if (["status", "usage"].includes(name)) setModal("chat-status");
-    if (name === "clear") newChat();
+    if (name === "clear")
+      newChat(chat?.project_id || null, chat?.workspace_id || null);
     if (name === "diff") setPanel("diff");
     if (name === "mention") setText("@");
     if (name === "skills") setText("$");
@@ -711,6 +798,12 @@ export function App() {
           projectId),
     ),
     account = overview.accounts.find((a: any) => a.id === chat?.account_id);
+  const composerModel = chat
+    ? modelLabel(chat) +
+      (chat.resolved_effort || chat.effort
+        ? " · " + effortLabel(chat.resolved_effort || chat.effort)
+        : "")
+    : "";
   if (loading)
     return (
       <div className="splash">
@@ -834,7 +927,8 @@ export function App() {
                   <Files size={18} />
                   <span>Files</span>
                 </button>
-                {chat.project_id && (
+                {overview.projects.find((p: any) => p.id === chat.project_id)
+                  ?.repo && (
                   <button
                     className={
                       "icon labeled-action " +
@@ -924,26 +1018,74 @@ export function App() {
             onProject={selectProject}
             onAddProject={() => setModal("project")}
             onSettings={projectSettings}
+            onUpdated={loadOverview}
+            onFiles={(w: any) => {
+              setViewingWorkspace(w);
+              setModal("workspace-files");
+            }}
           />
         ) : (
-          <div className={"workspace " + (panel ? "with-panel" : "")}>
+          <div
+            className={
+              "workspace " +
+              (panel ? "with-panel" : "") +
+              (panelExpanded ? " panel-expanded" : "")
+            }
+          >
             <section className="conversation">
-              <div className="chat-meta">
-                <span className={"provider " + chat.provider}>
-                  {chat.provider === "codex" ? "◈ Codex" : "✳ Claude Code"}
-                </span>
-                <button onClick={() => setModal("switch")}>
-                  {account?.name || "Account"}
-                  <ArrowRightLeft size={13} />
+              <div className="chat-context">
+                <button
+                  className="text-button chat-folder"
+                  title={workspaceLabel(chat)}
+                  aria-label={"Open files in " + workspaceLabel(chat)}
+                  onClick={() => setPanel("files")}
+                >
+                  <FolderGit2 size={14} />
+                  <span>{workspaceLabel(chat)}</span>
                 </button>
-                <span className="chat-mode">
-                  {chat.mode === "plan"
-                    ? "Plan mode"
-                    : chat.autonomous
-                      ? "Autonomous"
-                      : "With approvals"}
-                </span>
+                <button
+                  className="text-button chat-account"
+                  title="Switch agent account"
+                  aria-label={
+                    "Switch account: " + (account?.name || "Choose account")
+                  }
+                  onClick={() => setModal("switch")}
+                >
+                  <span className={"provider-symbol " + chat.provider}>
+                    {chat.provider === "codex" ? "◈" : "✳"}
+                  </span>
+                  <span>{account?.name || "Choose account"}</span>
+                  <ChevronDown size={12} />
+                </button>
+                {chat.mode === "plan" && (
+                  <span className="chat-context-mode">Plan mode</span>
+                )}
               </div>
+              {detail.jobs[0]?.state === "queued" &&
+                overview.chats.some(
+                  (c: any) =>
+                    c.workspace_id === chat.workspace_id &&
+                    c.id !== chat.id &&
+                    ["running", "waiting_approval"].includes(c.state),
+                ) && (
+                  <p className="chat-folder-wait" role="status">
+                    Waiting for another chat to finish using this folder.
+                  </p>
+                )}
+              {!account && (
+                <div className="run-notice">
+                  <p>
+                    Choose an account to continue this chat. Your messages and
+                    files are preserved.
+                  </p>
+                  <button
+                    className="secondary"
+                    onClick={() => setModal("switch")}
+                  >
+                    Choose account
+                  </button>
+                </div>
+              )}
               {account && account.status === "disconnected" && (
                 <div className="run-notice">
                   <p>Connect {account.name} to run tasks in this chat.</p>
@@ -957,10 +1099,13 @@ export function App() {
               )}
               <div
                 className="messages"
+                role="region"
+                aria-label="Conversation"
                 onScroll={(e) => {
                   const el = e.currentTarget;
                   nearBottom.current =
                     el.scrollHeight - el.scrollTop - el.clientHeight < 100;
+                  setShowLatest(!nearBottom.current);
                 }}
               >
                 {!detail.messages.length && (
@@ -969,16 +1114,14 @@ export function App() {
                       {chat.provider === "codex" ? "◈" : "✳"}
                     </span>
                     <h2>What are we working on?</h2>
-                    <p>
-                      Describe a task or attach files.
-                      <br />
-                      {chat.project_id
-                        ? "A separate branch will be created for this chat."
-                        : "Your files and conversation stay together in this chat."}
-                    </p>
+                    <p>Describe a task, ask a question, or attach a file.</p>
                     <span className="branch-label">
                       <GitBranch size={14} />
-                      {chat.project_id ? chat.branch : "Private workspace"}
+                      {overview.projects.find(
+                        (p: any) => p.id === chat.project_id,
+                      )?.repo
+                        ? chat.branch
+                        : workspaceLabel(chat)}
                     </span>
                   </div>
                 )}
@@ -1027,21 +1170,25 @@ export function App() {
                 )}
                 {detail.messages.map((m: any) => (
                   <article className={"message " + m.role} key={m.id}>
-                    <div className="message-avatar">
-                      {m.role === "user"
-                        ? "Y"
-                        : chat.provider === "codex"
-                          ? "◈"
-                          : "✳"}
-                    </div>
                     <div className="message-content">
                       <div className="message-heading">
+                        <span className="message-avatar" aria-hidden="true">
+                          {m.role === "user"
+                            ? "Y"
+                            : chat.provider === "codex"
+                              ? "◈"
+                              : "✳"}
+                        </span>
+
                         {m.role === "user"
                           ? "You"
                           : chat.provider === "codex"
                             ? "Codex"
                             : "Claude Code"}
-                        <time>
+                        <time
+                          dateTime={m.created_at}
+                          title={new Date(m.created_at).toLocaleString()}
+                        >
                           {new Date(m.created_at).toLocaleTimeString("en-GB", {
                             hour: "2-digit",
                             minute: "2-digit",
@@ -1061,16 +1208,28 @@ export function App() {
                 ))}
                 {job && ["running", "waiting_approval"].includes(job.state) && (
                   <article className="message assistant">
-                    <div className="message-avatar">◈</div>
                     <div className="message-content">
-                      <div className="message-heading">
-                        {labels[job.state]}
-                        <LoaderCircle size={13} className="spin" />
+                      <div className="message-heading" role="status">
+                        <span className="message-avatar" aria-hidden="true">
+                          {chat.provider === "codex" ? "◈" : "✳"}
+                        </span>
+                        {job.state === "waiting_approval"
+                          ? detail.approvals.some(
+                              (a: any) => a.kind === "question",
+                            )
+                            ? "Waiting for your answer"
+                            : "Waiting for permission"
+                          : labels[job.state]}
+                        {job.state === "running" && (
+                          <LoaderCircle size={13} className="spin" />
+                        )}
                       </div>
                       <Markdown
                         text={
                           streams[job.id] ||
-                          "Your agent is preparing the workspace…"
+                          (job.state === "waiting_approval"
+                            ? "Review the request below to continue."
+                            : "Your agent is preparing the workspace…")
                         }
                       />
                     </div>
@@ -1101,44 +1260,14 @@ export function App() {
                     <AgentQuestions
                       key={a.id}
                       request={a}
-                      onAnswered={loadDetail}
+                      onAnswered={refreshAfterResponse}
                     />
                   ) : (
-                    <div className="approval" key={a.id}>
-                      <ShieldCheck size={20} />
-                      <div>
-                        <strong>Your permission is needed</strong>
-                        <pre>{a.description}</pre>
-                        <div className="button-row">
-                          <button
-                            className="primary"
-                            onClick={() =>
-                              run(async () => {
-                                await api("/approvals/" + a.id, {
-                                  allow: true,
-                                });
-                                await loadDetail();
-                              })
-                            }
-                          >
-                            Allow
-                          </button>
-                          <button
-                            className="secondary"
-                            onClick={() =>
-                              run(async () => {
-                                await api("/approvals/" + a.id, {
-                                  allow: false,
-                                });
-                                await loadDetail();
-                              })
-                            }
-                          >
-                            Deny
-                          </button>
-                        </div>
-                      </div>
-                    </div>
+                    <AgentPermission
+                      key={a.id}
+                      request={a}
+                      onAnswered={refreshAfterResponse}
+                    />
                   ),
                 )}
                 {job &&
@@ -1170,6 +1299,19 @@ export function App() {
                 <div ref={bottom} />
               </div>
               <div className="composer-wrap">
+                {showLatest && !detail.approvals.length && (
+                  <button
+                    className="chat-latest secondary"
+                    onClick={() => {
+                      nearBottom.current = true;
+                      setShowLatest(false);
+                      bottom.current?.scrollIntoView({ block: "end" });
+                    }}
+                  >
+                    <ArrowDown size={14} />
+                    Latest messages
+                  </button>
+                )}
                 <div
                   className={"composer " + (drag ? "dragging" : "")}
                   onDragOver={(e) => {
@@ -1298,32 +1440,35 @@ export function App() {
                       <Paperclip size={19} />
                     </button>
                     <button
-                      className="permission-chip"
-                      onClick={() => setModal("chat-settings")}
-                    >
-                      <ShieldCheck size={14} />
-                      {chat.autonomous ? "Autonomous" : "Ask for permission"}
-                      <ChevronDown size={12} />
-                    </button>
-                    <button
                       className="permission-chip model-chip"
                       onClick={() => setModal("chat-model")}
-                      title="Model and reasoning effort"
+                      aria-label={"Model: " + composerModel}
+                      title={composerModel}
                     >
-                      <span>
-                        {modelLabel(chat)}
-                        {" · " +
-                          effortLabel(chat.resolved_effort || chat.effort)}
-                      </span>
+                      <span>{composerModel}</span>
                       <ChevronDown size={12} />
                     </button>
                     <button
-                      className="icon composer-help"
-                      aria-label="Commands and help"
-                      title="Commands and help"
-                      onClick={() => setModal("composer-help")}
+                      className={
+                        "permission-chip " +
+                        (chat.autonomous ? "is-autonomous" : "")
+                      }
+                      aria-label={
+                        "Permissions: " +
+                        (chat.autonomous ? "Autonomous" : "Ask for permission")
+                      }
+                      title={
+                        chat.autonomous
+                          ? "Autonomous actions enabled"
+                          : "Ask for permission before actions"
+                      }
+                      onClick={() => setModal("chat-permissions")}
                     >
-                      <CircleHelp size={18} />
+                      <ShieldCheck size={14} />
+                      <span>
+                        {chat.autonomous ? "Autonomous" : "Approvals"}
+                      </span>
+                      <ChevronDown size={12} />
                     </button>
                     <span className="spacer" />
                     {busy ? (
@@ -1360,45 +1505,103 @@ export function App() {
                   </div>
                 </div>
                 <div className="composer-note">
-                  <span>Your agent keeps working while you are offline.</span>
-                  <span>Enter to send · Shift + Enter for a new line</span>
+                  <span className="composer-hint">
+                    {busy
+                      ? "Agent is working · your draft stays here"
+                      : "Enter to send · Shift + Enter for a new line"}
+                  </span>
+                  <button
+                    className="text-button composer-help"
+                    aria-label="Commands and help"
+                    onClick={() => setModal("composer-help")}
+                  >
+                    <CircleHelp size={13} />
+                    <span>Commands & help</span>
+                  </button>
                 </div>
               </div>
             </section>
             {panel && (
               <aside className="work-panel">
                 <header>
-                  <strong>
-                    {
+                  <div className="work-panel-title">
+                    <strong>
+                      {panel === "terminal" ? (
+                        <TerminalIcon size={16} />
+                      ) : panel === "diff" ? (
+                        <GitBranch size={16} />
+                      ) : (
+                        <Files size={16} />
+                      )}
                       {
-                        files: "Chat files",
-                        diff: "Code changes",
-                        terminal: "Terminal",
-                      }[panel]
-                    }
-                  </strong>
-                  <button
-                    className="icon"
-                    aria-label="Back to chat"
-                    onClick={() => setPanel("")}
-                  >
-                    <span>Back to chat</span>
-                    <X size={18} />
-                  </button>
+                        {
+                          files: "Files",
+                          diff: "Changes",
+                          terminal: "Terminal",
+                        }[panel]
+                      }
+                    </strong>
+                    <span title={workspaceLabel(chat)}>
+                      {workspaceLabel(chat)}
+                    </span>
+                  </div>
+                  <div className="work-panel-controls">
+                    <button
+                      className="icon-button panel-expand"
+                      aria-label={
+                        panelExpanded ? "Restore panel size" : "Expand panel"
+                      }
+                      title={
+                        panelExpanded ? "Restore panel size" : "Expand panel"
+                      }
+                      onClick={() => setPanelExpanded(!panelExpanded)}
+                    >
+                      {panelExpanded ? (
+                        <Minimize2 size={16} />
+                      ) : (
+                        <Maximize2 size={16} />
+                      )}
+                    </button>
+                    <button
+                      className="icon-button panel-back"
+                      aria-label="Back to chat"
+                      title="Back to chat"
+                      onClick={() => {
+                        setPanel("");
+                        setPanelExpanded(false);
+                      }}
+                    >
+                      <X size={18} />
+                    </button>
+                  </div>
                 </header>
-                {panel === "terminal" ? (
+                {panel === "files" ? (
+                  <WorkspaceFiles
+                    key={chat.workspace_id}
+                    workspace={
+                      overview.workspaces.find(
+                        (w: any) => w.id === chat.workspace_id,
+                      ) || {
+                        id: chat.workspace_id,
+                        project_id: chat.project_id,
+                        kind: chat.workspace_kind,
+                        name: chat.workspace_name,
+                        initialized: chat.initialized,
+                      }
+                    }
+                    onUpdated={async () => {
+                      await loadOverview();
+                      await loadDetail();
+                    }}
+                  />
+                ) : panel === "terminal" ? (
                   <Suspense
                     fallback={<p className="muted">Opening terminal…</p>}
                   >
                     <Terminal chatId={chat.id} />
                   </Suspense>
                 ) : (
-                  <FilePanel
-                    key={chat.id + panel}
-                    chatId={chat.id}
-                    mode={panel}
-                    onError={setError}
-                  />
+                  <ChangesPanel key={chat.id} chatId={chat.id} />
                 )}
               </aside>
             )}
@@ -1498,14 +1701,70 @@ export function App() {
               setModal("");
             }}
           />
-          <Folders scope="projects" id={editingProject.id} />
+          <details className="settings-disclosure">
+            <summary>Working folders</summary>
+            <ProjectWorkspaces
+              embedded
+              key={editingProject.id}
+              project={editingProject}
+              workspaces={overview.workspaces}
+              onUpdated={async () => {
+                const next = await loadOverview();
+                if (
+                  currentChat.current &&
+                  next.chats.some((c: any) => c.id === currentChat.current)
+                )
+                  await loadDetail();
+              }}
+              onFiles={(w: any) => {
+                setViewingWorkspace(w);
+                setModal("workspace-files");
+              }}
+              onNew={newChat}
+              onOpenChat={(id: string) => {
+                selectChat(id);
+                setModal("");
+              }}
+            />
+          </details>
+          <details className="settings-disclosure">
+            <summary>Connected folders</summary>
+            <Folders scope="projects" id={editingProject.id} />
+          </details>
+        </Modal>
+      )}
+      {modal === "workspace-files" && viewingWorkspace && (
+        <Modal
+          className="workspace-files-modal"
+          title={workspaceLabel(
+            overview.workspaces.find(
+              (w: any) => w.id === viewingWorkspace.id,
+            ) || viewingWorkspace,
+          )}
+          onClose={() => setModal("")}
+        >
+          <WorkspaceFiles
+            key={viewingWorkspace.id}
+            workspace={
+              overview.workspaces.find(
+                (w: any) => w.id === viewingWorkspace.id,
+              ) || viewingWorkspace
+            }
+            onUpdated={loadOverview}
+          />
         </Modal>
       )}
       {modal === "chat" && (
-        <Modal error={error} title="New chat" onClose={() => setModal("")}>
+        <Modal
+          error={error}
+          title="New chat"
+          className="new-chat-modal"
+          onClose={() => setModal("")}
+        >
           <NewChat
             overview={overview}
             initialProjectId={newProjectId}
+            initialWorkspaceId={newWorkspaceId}
             me={me}
             onError={setError}
             onCreated={async (c: any) => {
@@ -1521,6 +1780,7 @@ export function App() {
         <Modal
           error={error}
           title="Agent accounts"
+          className="accounts-modal"
           onClose={() => {
             setModal("");
             void loadOverview();
@@ -1528,7 +1788,10 @@ export function App() {
         >
           <Accounts
             accounts={overview.accounts}
-            refresh={loadOverview}
+            refresh={async () => {
+              await loadOverview();
+              if (currentChat.current) await loadDetail();
+            }}
             onError={setError}
           />
         </Modal>
@@ -1578,12 +1841,13 @@ export function App() {
           }}
         >
           <p>
-            Delete <strong>{editingChat.title}</strong> and all its messages,
-            attachments and private workspace files? This cannot be undone.
+            Delete <strong>{editingChat.title}</strong> and its conversation
+            history? This cannot be undone.
           </p>
           <p className="muted">
-            Connected shared folders, your project and published GitHub branches
-            are kept. Stop any active task and close its terminal first.
+            Working files and original attachments are kept in the working
+            folder, available from the project or home page. Stop any active
+            task and close this chat’s terminal first.
           </p>
           <div className="chat-dialog-actions">
             <button
@@ -1641,7 +1905,7 @@ export function App() {
       {modal === "chat-model" && chat && (
         <Modal
           title="Model & thinking"
-          className="chat-model-modal"
+          className="chat-picker-modal chat-model-modal"
           error={error}
           onClose={() => setModal("")}
         >
@@ -1659,9 +1923,39 @@ export function App() {
           />
         </Modal>
       )}
+      {modal === "chat-permissions" && chat && (
+        <Modal
+          title="Permissions"
+          className="chat-picker-modal"
+          error={error}
+          onClose={() => setModal("")}
+        >
+          <ChatPermissions
+            key={chat.id}
+            autonomous={chat.autonomous}
+            onClose={() => setModal("")}
+            onError={setError}
+            onSave={async (autonomous) => {
+              await api(
+                `/chats/${chat.id}/permissions`,
+                { autonomous },
+                "PATCH",
+              );
+              await loadDetail();
+              setModal("");
+            }}
+          />
+        </Modal>
+      )}
       {modal === "chat-settings" && chat && (
-        <Modal error={error} title="Chat settings" onClose={() => setModal("")}>
+        <Modal
+          error={error}
+          title="Chat settings"
+          className="chat-settings-modal"
+          onClose={() => setModal("")}
+        >
           <ChatSettings
+            key={chat.id}
             chat={chat}
             accounts={overview.accounts}
             me={me}
@@ -1673,17 +1967,30 @@ export function App() {
             }}
             onError={setError}
           />
-          <Folders scope="chats" id={chat.id} />
-          <hr />
-          <button
-            className="danger-button"
-            onClick={() => {
-              setEditingChat(chat);
-              setModal("delete-chat");
-            }}
-          >
-            Delete chat…
-          </button>
+          <details className="settings-disclosure">
+            <summary>Server access</summary>
+            <SshAccess embedded scope="chats" id={chat.id} />
+          </details>
+          <details className="settings-disclosure">
+            <summary>Connected folders</summary>
+            <Folders
+              scope="chats"
+              id={chat.id}
+              readOnlyOnly={chat.workspace_kind === "copy"}
+            />
+          </details>
+          <div className="chat-settings-danger">
+            <button
+              type="button"
+              className="text-button quiet-danger"
+              onClick={() => {
+                setEditingChat(chat);
+                setModal("delete-chat");
+              }}
+            >
+              <Trash2 size={15} /> Delete chat…
+            </button>
+          </div>
         </Modal>
       )}
       {modal === "settings" && (
@@ -1742,6 +2049,7 @@ function Attachment({ file: f }: { file: any }) {
 function NewChat({
   overview,
   initialProjectId,
+  initialWorkspaceId,
   onCreated,
   onError,
   onSetup,
@@ -1752,14 +2060,54 @@ function NewChat({
   const [provider, setProvider] = useState(preferred?.provider || "codex");
   const [accountId, setAccountId] = useState(preferred?.id || "");
   const [creating, setCreating] = useState(false);
+  const [selectedProject, setSelectedProject] = useState(
+    initialProjectId || "",
+  );
+  const [selectedWorkspace, setSelectedWorkspace] = useState(
+    overview.workspaces.find((w: any) => w.id === initialWorkspaceId)?.kind ===
+      "main"
+      ? ""
+      : initialWorkspaceId || "",
+  );
+  const [folderMode, setFolderMode] = useState<"main" | "copy" | "existing">(
+    initialWorkspaceId &&
+      overview.workspaces.find((w: any) => w.id === initialWorkspaceId)
+        ?.kind !== "main"
+      ? "existing"
+      : "main",
+  );
+  const [copyName, setCopyName] = useState("");
+  const [createdCopy, setCreatedCopy] = useState<any>(null);
+  const [creatingCopy, setCreatingCopy] = useState(false);
+  const folders = [
+    ...overview.workspaces,
+    ...(createdCopy &&
+    !overview.workspaces.some((w: any) => w.id === createdCopy.id)
+      ? [createdCopy]
+      : []),
+  ].filter((w: any) => w.project_id === (selectedProject || null));
+  const mainFolder = folders.find((w: any) => w.kind === "main");
+  const existingFolders = folders.filter(
+    (w: any) => w.kind !== "main" && w.status === "ready",
+  );
+  const needsMain =
+    selectedProject &&
+    folderMode !== "existing" &&
+    !mainFolder &&
+    folders.length > 0;
+  const invalidFolder =
+    !!selectedProject &&
+    (folderMode === "copy"
+      ? !mainFolder || mainFolder.status !== "ready" || !copyName.trim()
+      : folderMode === "existing"
+        ? !existingFolders.some((w: any) => w.id === selectedWorkspace)
+        : !!mainFolder && mainFolder.status !== "ready");
   const accounts = overview.accounts.filter(
     (a: any) => a.provider === provider,
   );
   const selectedAccount = accounts.find((a: any) => a.id === accountId);
   const defaults = overview.modelDefaults?.[provider];
-  const suggestedModel =
-    selectedAccount?.model_catalog?.find((m: any) => m.isDefault) ||
-    selectedAccount?.model_catalog?.[0];
+  const [modelPreview, setModelPreview] = useState({ model: "", effort: "" });
   function selectProvider(next: string) {
     setProvider(next);
     setAccountId(
@@ -1781,14 +2129,32 @@ function NewChat({
     );
   return (
     <form
+      className="new-chat-form"
       onSubmit={async (e) => {
         e.preventDefault();
-        if (creating || !accountId) return;
+        if (creating || !accountId || needsMain || invalidFolder) return;
         setCreating(true);
+        onError("");
         const f = new FormData(e.currentTarget);
+        let freshCopy: any = null;
         try {
+          let workspaceId =
+            selectedProject && folderMode === "main" ? "" : selectedWorkspace;
+          if (selectedProject && folderMode === "copy") {
+            setCreatingCopy(true);
+            freshCopy = await api(`/workspaces/${mainFolder.id}/copies`, {
+              name: copyName.trim(),
+            });
+            workspaceId = freshCopy.id;
+            // Retain the successful copy if chat creation fails. A retry uses it.
+            setCreatedCopy(freshCopy);
+            setSelectedWorkspace(freshCopy.id);
+            setFolderMode("existing");
+            setCreatingCopy(false);
+          }
           const c = await api("/chats", {
-            project_id: f.get("project") || null,
+            project_id: selectedProject || null,
+            ...(workspaceId ? { workspace_id: workspaceId } : {}),
             provider,
             account_id: accountId,
             model: f.get("model") || "",
@@ -1797,8 +2163,13 @@ function NewChat({
           });
           await onCreated(c);
         } catch (e: any) {
-          onError(e.message);
+          onError(
+            freshCopy
+              ? `Working copy “${freshCopy.name}” was created, but the chat could not be opened. Retry Create chat to use this copy. ${e.message}`
+              : e.message,
+          );
         } finally {
+          setCreatingCopy(false);
           setCreating(false);
         }
       }}
@@ -1808,7 +2179,13 @@ function NewChat({
           <Select
             aria-label="Project"
             name="project"
-            defaultValue={initialProjectId || ""}
+            value={selectedProject}
+            onChange={(e) => {
+              setSelectedProject(e.target.value);
+              setSelectedWorkspace("");
+              setFolderMode("main");
+              setCopyName("");
+            }}
           >
             <option value="">Personal chat</option>
             {overview.projects.map((p: any) => (
@@ -1818,118 +2195,289 @@ function NewChat({
             ))}
           </Select>
         </Field>
-        <p className="muted">
-          Project chats use the project’s repository and folders.
-        </p>
-        <div className="segmented" role="group" aria-label="Choose your agent">
-          <button
-            type="button"
-            aria-pressed={provider === "codex"}
-            className={provider === "codex" ? "selected" : ""}
-            onClick={() => selectProvider("codex")}
-          >
-            ◈ Codex
-          </button>
-          <button
-            type="button"
-            aria-pressed={provider === "claude"}
-            className={provider === "claude" ? "selected" : ""}
-            onClick={() => selectProvider("claude")}
-          >
-            ✳ Claude Code
-          </button>
-        </div>
-        {accounts.length ? (
-          <Field label="Account">
-            <Select
-              aria-label="Account"
-              name="account"
-              required
-              value={accountId}
-              onChange={(e) => setAccountId(e.target.value)}
-            >
-              {accounts.map((a: any) => (
-                <option key={a.id} value={a.id}>
-                  {a.name} · {labels[a.status] || a.status}
-                </option>
-              ))}
-            </Select>
-          </Field>
+        {selectedProject ? (
+          <details className="settings-disclosure new-chat-location" open>
+            <summary>Working folder</summary>
+            <div className="chat-settings-section">
+              <fieldset className="chat-folder-choice">
+                <legend className="visually-hidden">
+                  Where should this chat work?
+                </legend>
+                <div className="chat-folder-options">
+                  <label
+                    className={
+                      "chat-folder-option " +
+                      (folderMode === "main" ? "selected" : "")
+                    }
+                  >
+                    <input
+                      type="radio"
+                      name="folder-mode"
+                      value="main"
+                      checked={folderMode === "main"}
+                      onChange={() => setFolderMode("main")}
+                    />
+                    <span>
+                      <strong>
+                        <FolderGit2 size={17} /> Main folder
+                      </strong>
+                      <small>Shared files · one task at a time.</small>
+                    </span>
+                  </label>
+                  <label
+                    className={
+                      "chat-folder-option " +
+                      (folderMode === "copy" ? "selected" : "") +
+                      (!mainFolder || mainFolder.status !== "ready"
+                        ? " unavailable"
+                        : "")
+                    }
+                  >
+                    <input
+                      type="radio"
+                      name="folder-mode"
+                      value="copy"
+                      checked={folderMode === "copy"}
+                      disabled={!mainFolder || mainFolder.status !== "ready"}
+                      onChange={() => setFolderMode("copy")}
+                    />
+                    <span>
+                      <strong>
+                        <GitBranch size={17} /> New working copy
+                      </strong>
+                      <small>
+                        Work separately, then review and transfer changes.
+                      </small>
+                    </span>
+                  </label>
+                  {!!existingFolders.length && (
+                    <label
+                      className={
+                        "chat-folder-option existing " +
+                        (folderMode === "existing" ? "selected" : "")
+                      }
+                    >
+                      <input
+                        type="radio"
+                        name="folder-mode"
+                        value="existing"
+                        checked={folderMode === "existing"}
+                        onChange={() => {
+                          setFolderMode("existing");
+                          if (
+                            !existingFolders.some(
+                              (w: any) => w.id === selectedWorkspace,
+                            )
+                          )
+                            setSelectedWorkspace(existingFolders[0].id);
+                        }}
+                      />
+                      <span>
+                        <strong>
+                          <FolderGit2 size={17} /> Existing folder
+                        </strong>
+                        <small>
+                          Continue in a working copy or saved folder.
+                        </small>
+                      </span>
+                    </label>
+                  )}
+                </div>
+                {folderMode === "copy" && (
+                  <div className="chat-folder-detail">
+                    <Field label="Working copy name">
+                      <input
+                        name="copy-name"
+                        autoComplete="off"
+                        required
+                        maxLength={80}
+                        value={copyName}
+                        onChange={(e) => setCopyName(e.target.value)}
+                        placeholder="For example: Update the homepage"
+                      />
+                    </Field>
+                    <p className="muted">
+                      The copy and chat are created together. Dependencies,
+                      build output and local secret files are excluded.
+                      Connected folders are read-only.
+                    </p>
+                    <p className="muted">
+                      Parallel tasks need separate available agent accounts.
+                      External services and databases remain shared.
+                    </p>
+                  </div>
+                )}
+                {folderMode === "existing" && (
+                  <Field label="Working folder">
+                    <Select
+                      aria-label="Working folder"
+                      value={selectedWorkspace}
+                      onChange={(e) => setSelectedWorkspace(e.target.value)}
+                    >
+                      {existingFolders.map((w: any) => (
+                        <option value={w.id} key={w.id}>
+                          {workspaceLabel(w)}
+                        </option>
+                      ))}
+                    </Select>
+                  </Field>
+                )}
+                {needsMain && (
+                  <p className="inline-error" role="alert">
+                    Choose the main folder in Project settings first, or
+                    continue in an existing saved folder.
+                  </p>
+                )}
+              </fieldset>
+            </div>
+          </details>
         ) : (
-          <div className="setup-empty">
-            <p>
-              Add a {provider === "codex" ? "Codex" : "Claude Code"} account to
-              use this agent.
+          <>
+            <Field label="Working folder">
+              <Select
+                aria-label="Working folder"
+                value={selectedWorkspace}
+                onChange={(e) => setSelectedWorkspace(e.target.value)}
+              >
+                <option value="">New personal folder</option>
+                {existingFolders.map((w: any) => (
+                  <option value={w.id} key={w.id}>
+                    {workspaceLabel(w)}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+            <p className="muted">
+              Chats in the same folder share files and run one task at a time.
             </p>
+          </>
+        )}
+        <section className="new-chat-agent" aria-label="Agent and account">
+          <h3>Agent</h3>
+          <div
+            className="segmented"
+            role="group"
+            aria-label="Choose your agent"
+          >
             <button
               type="button"
-              className="secondary"
-              onClick={() => onSetup("accounts")}
+              aria-pressed={provider === "codex"}
+              className={provider === "codex" ? "selected" : ""}
+              onClick={() => selectProvider("codex")}
             >
-              Open agent accounts
+              ◈ Codex
+            </button>
+            <button
+              type="button"
+              aria-pressed={provider === "claude"}
+              className={provider === "claude" ? "selected" : ""}
+              onClick={() => selectProvider("claude")}
+            >
+              ✳ Claude Code
             </button>
           </div>
-        )}
-        {selectedAccount && selectedAccount.status !== "ready" && (
-          <p className="muted">
-            You can create this chat now. Connect the account in Agent accounts
-            before sending a task.
-          </p>
-        )}
-        <p className="new-chat-model">
-          Starting model from settings:{" "}
-          <strong>
-            {defaults?.model ||
-              suggestedModel?.model ||
-              suggestedModel?.id ||
-              (provider === "claude" ? "Sonnet" : "Choose a model below")}
-          </strong>
-          {defaults?.effort || suggestedModel?.defaultReasoningEffort
-            ? " · " +
-              effortLabel(
-                defaults?.effort || suggestedModel?.defaultReasoningEffort,
-              )
-            : ""}
-          {defaults && (
-            <small>
-              From Settings → Models. You can change it below or later in the
-              chat.
-            </small>
+          {accounts.length ? (
+            <Field label="Account">
+              <Select
+                aria-label="Account"
+                name="account"
+                required
+                value={accountId}
+                onChange={(e) => setAccountId(e.target.value)}
+              >
+                {accounts.map((a: any) => (
+                  <option key={a.id} value={a.id}>
+                    {a.name} · {labels[a.status] || a.status}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+          ) : (
+            <div className="setup-empty">
+              <p>
+                Add a {provider === "codex" ? "Codex" : "Claude Code"} account
+                to use this agent.
+              </p>
+              <button
+                type="button"
+                className="secondary"
+                onClick={() => onSetup("accounts")}
+              >
+                Open agent accounts
+              </button>
+            </div>
           )}
-        </p>
-        <details className="advanced-options">
-          <summary>Change model and permissions</summary>
-          <ModelOptions
-            key={
-              provider +
-              accountId +
-              (defaults?.model || "") +
-              (defaults?.effort || "")
-            }
-            provider={provider}
-            accountId={accountId}
-            initialModel={defaults?.model || ""}
-            initialEffort={defaults?.effort || ""}
-          />
-          <label className="checkbox">
-            <input name="autonomous" type="checkbox" />
-            Run without approval prompts
-          </label>
-          <p className="muted">
-            Allow the agent to run commands and edit files without asking for
-            approval.
-          </p>
+          {selectedAccount && selectedAccount.status !== "ready" && (
+            <p className="muted">
+              You can create this chat now. Connect the account in Agent
+              accounts before sending a task.
+            </p>
+          )}
+        </section>
+        <details className="settings-disclosure">
+          <summary>
+            <span className="settings-summary-caption">
+              Model &amp; thinking
+              {modelPreview.model && (
+                <small>
+                  {modelPreview.model}
+                  {modelPreview.effort
+                    ? " · " + effortLabel(modelPreview.effort)
+                    : ""}
+                </small>
+              )}
+            </span>
+          </summary>
+          <div className="chat-settings-section chat-settings-model">
+            <ModelOptions
+              key={
+                provider +
+                accountId +
+                (defaults?.model || "") +
+                (defaults?.effort || "")
+              }
+              provider={provider}
+              accountId={accountId}
+              initialModel={defaults?.model || ""}
+              initialEffort={defaults?.effort || ""}
+              onSelectionChange={setModelPreview}
+            />
+          </div>
         </details>
-        <p className="muted">
-          Your first message names the chat. You can rename it in Chat settings.
-        </p>
-        <button
-          className="primary form-submit"
-          disabled={!accountId || creating}
-        >
-          <Plus size={17} />
-          {creating ? "Creating chat…" : "Create chat"}
-        </button>
+        <details className="settings-disclosure">
+          <summary>Permissions</summary>
+          <div className="chat-settings-section">
+            <label className="chat-permission-row">
+              <ShieldCheck size={18} aria-hidden="true" />
+              <span>
+                <strong>Run without approval prompts</strong>
+                <small>
+                  Allow commands and file edits without asking. Leave off to
+                  review permission requests.
+                </small>
+              </span>
+              <input name="autonomous" type="checkbox" />
+            </label>
+          </div>
+        </details>
+        <div className="new-chat-footer">
+          <p className="settings-section-note">
+            Your first message becomes the chat title.
+          </p>
+          <button
+            className="primary"
+            disabled={!accountId || creating || !!needsMain || invalidFolder}
+          >
+            <Plus size={17} />
+            {creatingCopy
+              ? "Creating working copy…"
+              : creating
+                ? "Creating chat…"
+                : selectedProject && folderMode === "copy"
+                  ? "Create copy and chat"
+                  : "Create chat"}
+          </button>
+        </div>
       </fieldset>
     </form>
   );
@@ -1943,6 +2491,7 @@ function Accounts({ accounts, refresh, onError }: any) {
     [copyError, setCopyError] = useState(""),
     [connecting, setConnecting] = useState(false),
     [disconnecting, setDisconnecting] = useState(""),
+    [removing, setRemoving] = useState<any>(null),
     [adding, setAdding] = useState(false),
     [added, setAdded] = useState("");
   useEffect(() => {
@@ -1989,159 +2538,223 @@ function Accounts({ accounts, refresh, onError }: any) {
   return (
     <>
       <p className="accounts-intro">
-        Add an account below, then select Connect to sign in with Codex or
-        Claude Code. You can connect multiple accounts.
+        Connect your Codex or Claude Code accounts to start working.
       </p>
-      <form
-        className="account-add-form"
-        onSubmit={async (e) => {
-          e.preventDefault();
-          if (adding) return;
-          const form = e.currentTarget;
-          const name = String(new FormData(form).get("name") || "").trim();
-          if (!name) return;
-          setAdding(true);
-          setAdded("");
-          try {
-            await api("/accounts", { name, provider });
-            form.reset();
-            setAdded(`${name} added. Select Connect below to sign in.`);
-            await refresh();
-          } catch (e: any) {
-            onError(e.message);
-          } finally {
-            setAdding(false);
-          }
-        }}
-      >
-        <h3>
-          {accounts.length ? "Add another account" : "Add your first account"}
-        </h3>
-        <div className="form-row">
-          <Field label="Account label">
-            <input
-              name="name"
-              required
-              maxLength={80}
-              placeholder="e.g. Personal, Work, Account 3"
-            />
-          </Field>
-          <Field label="Service">
-            <Select
-              aria-label="Service"
-              value={provider}
-              onChange={(e) => setProvider(e.target.value)}
-            >
-              <option value="codex">Codex</option>
-              <option value="claude">Claude Code</option>
-            </Select>
-          </Field>
+      {!!accounts.length && (
+        <div className="accounts-summary">
+          <h3>Your accounts</h3>
+          <span>
+            {accounts.filter((a: any) => a.status === "ready").length} connected
+          </span>
         </div>
-        <button className="primary" disabled={adding}>
-          <Plus size={17} />
-          {adding ? "Adding account…" : "Add account"}
-        </button>
-        {added && (
-          <p className="account-added" role="status">
-            {added}
-          </p>
-        )}
-      </form>
-      <div className="accounts-summary">
-        <h3>Your accounts</h3>
-        <span>
-          {accounts.length} added ·{" "}
-          {accounts.filter((a: any) => a.status === "ready").length} connected
-        </span>
-      </div>
+      )}
       <div className="account-list">
         {[
           { id: "codex", name: "Codex" },
           { id: "claude", name: "Claude Code" },
-        ].map((service) => (
-          <section
-            className="account-group"
-            key={service.id}
-            aria-label={service.name + " accounts"}
-          >
-            <header>
-              <strong>{service.name}</strong>
-              <span>
-                {accounts.filter((a: any) => a.provider === service.id).length}{" "}
-                saved
-              </span>
-            </header>
-            {!accounts.some((a: any) => a.provider === service.id) && (
-              <p className="muted">
-                No accounts added yet. Add your first {service.name} account
-                above.
-              </p>
-            )}
-            {accounts
-              .filter((a: any) => a.provider === service.id)
-              .map((a: any) => (
-                <div className="account-row" key={a.id}>
-                  <span className={"provider-icon " + a.provider}>
-                    {a.provider === "codex" ? "◈" : "✳"}
-                  </span>
-                  <div>
-                    <strong>{a.name}</strong>
-                    <small>
-                      <span className={"status-dot " + a.status} />
-                      {labels[a.status]}
-                    </small>
-                    <AccountUsage account={a} refresh={refresh} />
-                  </div>
-                  {["ready", "limited", "disconnect_failed"].includes(
-                    a.status,
-                  ) ? (
-                    <button
-                      className="secondary"
-                      disabled={!!disconnecting || connecting}
-                      onClick={async () => {
-                        setDisconnecting(a.id);
-                        try {
-                          await api("/accounts/" + a.id + "/logout", {});
-                          if (authId === a.id) {
-                            setAuthId("");
-                            setEvents([]);
+        ]
+          .filter((service) =>
+            accounts.some((a: any) => a.provider === service.id),
+          )
+          .map((service) => (
+            <section
+              className="account-group"
+              key={service.id}
+              aria-label={service.name + " accounts"}
+            >
+              <header>
+                <strong>{service.name}</strong>
+                <span>
+                  {
+                    accounts.filter((a: any) => a.provider === service.id)
+                      .length
+                  }{" "}
+                  {accounts.filter((a: any) => a.provider === service.id)
+                    .length === 1
+                    ? "account"
+                    : "accounts"}
+                </span>
+              </header>
+              {accounts
+                .filter((a: any) => a.provider === service.id)
+                .map((a: any) => (
+                  <div className="account-entry" key={a.id}>
+                    <div className="account-row">
+                      <span className={"provider-icon " + a.provider}>
+                        {a.provider === "codex" ? "◈" : "✳"}
+                      </span>
+                      <div>
+                        <strong>{a.name}</strong>
+                        <small>
+                          <span className={"status-dot " + a.status} />
+                          {labels[a.status]}
+                        </small>
+                      </div>
+                      <div className="account-action-buttons">
+                        {["ready", "limited", "disconnect_failed"].includes(
+                          a.status,
+                        ) ? (
+                          <button
+                            className="text-button"
+                            disabled={!!disconnecting || connecting}
+                            onClick={async () => {
+                              setDisconnecting(a.id);
+                              try {
+                                await api("/accounts/" + a.id + "/logout", {});
+                                if (authId === a.id) {
+                                  setAuthId("");
+                                  setEvents([]);
+                                }
+                              } catch (e: any) {
+                                onError(e.message);
+                              } finally {
+                                setDisconnecting("");
+                                await refresh();
+                              }
+                            }}
+                          >
+                            {disconnecting === a.id
+                              ? "Disconnecting…"
+                              : a.status === "disconnect_failed"
+                                ? "Retry disconnect"
+                                : "Disconnect"}
+                          </button>
+                        ) : (
+                          <button
+                            className="secondary"
+                            disabled={
+                              connecting ||
+                              !!disconnecting ||
+                              a.status === "disconnecting" ||
+                              a.status === "deleting" ||
+                              a.status === "delete_failed" ||
+                              a.status === "inspecting"
+                            }
+                            onClick={() => start(a.id)}
+                          >
+                            Connect
+                          </button>
+                        )}
+                        <button
+                          className="icon-button quiet-danger"
+                          aria-label={"Delete account " + a.name}
+                          title={"Delete account " + a.name}
+                          disabled={
+                            !!disconnecting ||
+                            connecting ||
+                            [
+                              "authenticating",
+                              "inspecting",
+                              "disconnecting",
+                              "deleting",
+                            ].includes(a.status)
                           }
-                        } catch (e: any) {
-                          onError(e.message);
-                        } finally {
-                          setDisconnecting("");
-                          await refresh();
-                        }
-                      }}
-                    >
-                      {disconnecting === a.id
-                        ? "Disconnecting…"
-                        : a.status === "disconnect_failed"
-                          ? "Retry disconnect"
-                          : "Disconnect"}
-                    </button>
-                  ) : (
-                    <button
-                      className="secondary"
-                      disabled={
-                        connecting ||
-                        !!disconnecting ||
-                        a.status === "disconnecting" ||
-                        a.status === "inspecting"
-                      }
-                      onClick={() => start(a.id)}
-                    >
-                      Connect
-                    </button>
-                  )}
-                </div>
-              ))}
-          </section>
-        ))}
+                          onClick={() => setRemoving(a)}
+                        >
+                          <Trash2 size={15} />
+                        </button>
+                      </div>
+                    </div>
+                    <div className="account-limits">
+                      <AccountUsage account={a} refresh={refresh} compact />
+                    </div>
+                    {removing?.id === a.id && (
+                      <RemovalConfirmation
+                        requireName={false}
+                        key={removing.id}
+                        name={removing.name}
+                        busy={!!disconnecting}
+                        description="This removes the account and saved sign-in data from this app. Chats, messages and project files are kept. Choose another account to continue those chats. Your Codex or Claude subscription is not affected."
+                        onCancel={() => setRemoving(null)}
+                        onConfirm={async () => {
+                          setDisconnecting(removing.id);
+                          try {
+                            await api(
+                              "/accounts/" + removing.id,
+                              { name: removing.name },
+                              "DELETE",
+                            );
+                            if (authId === removing.id) {
+                              setAuthId("");
+                              setEvents([]);
+                            }
+                            setRemoving(null);
+                          } catch (e: any) {
+                            onError(e.message);
+                          } finally {
+                            setDisconnecting("");
+                            await refresh();
+                          }
+                        }}
+                      />
+                    )}
+                  </div>
+                ))}
+            </section>
+          ))}
       </div>
+      <details className="settings-disclosure" open={!accounts.length}>
+        <summary>
+          {accounts.length ? "Add account" : "Connect your first account"}
+        </summary>
+        <form
+          className="account-add-form"
+          onSubmit={async (e) => {
+            e.preventDefault();
+            if (adding) return;
+            const form = e.currentTarget;
+            const name = String(new FormData(form).get("name") || "").trim();
+            if (!name) return;
+            setAdding(true);
+            setAdded("");
+            try {
+              await api("/accounts", { name, provider });
+              form.reset();
+              setAdded(`${name} added. Select Connect to sign in.`);
+              await refresh();
+            } catch (e: any) {
+              onError(e.message);
+            } finally {
+              setAdding(false);
+            }
+          }}
+        >
+          <div className="form-row">
+            <Field label="Account label">
+              <input
+                name="name"
+                required
+                maxLength={80}
+                placeholder="e.g. Personal or Work"
+              />
+            </Field>
+            <Field label="Service">
+              <Select
+                aria-label="Service"
+                value={provider}
+                onChange={(e) => setProvider(e.target.value)}
+              >
+                <option value="codex">Codex</option>
+                <option value="claude">Claude Code</option>
+              </Select>
+            </Field>
+          </div>
+          <div className="settings-section-footer">
+            <button className="primary" disabled={adding}>
+              <Plus size={17} />
+              {adding ? "Adding account…" : "Add account"}
+            </button>
+          </div>
+        </form>
+      </details>
+      {added && (
+        <p className="account-added" role="status">
+          {added}
+        </p>
+      )}
       <p className="accounts-footnote">
-        You can save any number of accounts. Set parallel task capacity in
-        Settings → Resources. One task runs per account.
+        One task runs per account. Set parallel capacity in Settings →
+        Resources.
       </p>
       {authId && (
         <div className="auth-flow">
@@ -2253,15 +2866,67 @@ function Accounts({ accounts, refresh, onError }: any) {
     </>
   );
 }
-function ChatSettings({ chat, me, onSave, onError }: any) {
+function ChatPermissions({
+  autonomous,
+  onSave,
+  onClose,
+  onError,
+}: {
+  autonomous: boolean;
+  onSave: (autonomous: boolean) => Promise<void>;
+  onClose: () => void;
+  onError: (message: string) => void;
+}) {
   const [saving, setSaving] = useState(false);
   return (
     <form
       onSubmit={async (e) => {
         e.preventDefault();
         if (saving) return;
+        const data = new FormData(e.currentTarget);
         setSaving(true);
+        onError("");
+        try {
+          await onSave(data.get("approvalMode") === "autonomous");
+        } catch (e: any) {
+          onError(e.message);
+        } finally {
+          setSaving(false);
+        }
+      }}
+    >
+      <fieldset disabled={saving} className="form-fields">
+        <Field label="Approval mode">
+          <Select
+            aria-label="Approval mode"
+            name="approvalMode"
+            defaultValue={autonomous ? "autonomous" : "ask"}
+          >
+            <option value="ask">Ask for permission</option>
+            <option value="autonomous">Autonomous</option>
+          </Select>
+        </Field>
+        <div className="chat-dialog-actions">
+          <button type="button" className="secondary" onClick={onClose}>
+            Cancel
+          </button>
+          <button className="primary">{saving ? "Saving…" : "Apply"}</button>
+        </div>
+      </fieldset>
+    </form>
+  );
+}
+function ChatSettings({ chat, me, onSave, onError }: any) {
+  const [saving, setSaving] = useState(false);
+  return (
+    <form
+      className="chat-settings-form"
+      onSubmit={async (e) => {
+        e.preventDefault();
+        if (saving) return;
         const f = new FormData(e.currentTarget);
+        setSaving(true);
+        onError("");
         try {
           await onSave({
             title: f.get("title"),
@@ -2277,221 +2942,74 @@ function ChatSettings({ chat, me, onSave, onError }: any) {
         }
       }}
     >
-      <Field label="Chat name">
-        <input
-          name="title"
-          defaultValue={chat.title}
-          maxLength={160}
-          required
-        />
-      </Field>
-      <ModelOptions
-        provider={chat.provider}
-        accountId={chat.account_id}
-        initialModel={chat.model}
-        initialEffort={chat.effort}
-      />
-      <Field label="Account switching">
-        <Select
-          aria-label="Account switching"
-          name="handoff"
-          defaultValue={chat.handoff}
-        >
-          <option value="manual">Choose manually</option>
-          <option value="auto" disabled={!me.autoHandoff}>
-            Automatically
-            {!me.autoHandoff ? "  — requires verification and activation" : ""}
-          </option>
-        </Select>
-      </Field>
-      <label className="checkbox">
-        <input
-          name="autonomous"
-          type="checkbox"
-          defaultChecked={chat.autonomous}
-        />
-        Run without approval prompts
-      </label>
-      <p className="muted">
-        Allow the agent to run commands and edit files in this workspace without
-        asking. Leave off to review permission requests.
-      </p>
-      <button className="primary" disabled={saving}>
-        {saving ? "Saving…" : "Save changes"}
-      </button>
-    </form>
-  );
-}
-function FilePanel({ chatId, mode, onError }: any) {
-  const [files, setFiles] = useState<any[]>([]),
-    [dir, setDir] = useState(""),
-    [diff, setDiff] = useState(""),
-    [view, setView] = useState<any>(null),
-    [message, setMessage] = useState(""),
-    [result, setResult] = useState(""),
-    [loading, setLoading] = useState(true),
-    [publishing, setPublishing] = useState(false);
-  useEffect(() => {
-    let live = true;
-    setLoading(true);
-    (mode === "files"
-      ? api(`/chats/${chatId}/files?path=${encodeURIComponent(dir)}`).then(
-          (items) => {
-            if (live) setFiles(items);
-          },
-        )
-      : api(`/chats/${chatId}/diff`).then((r) => {
-          if (live) setDiff(r.diff);
-        })
-    )
-      .catch((e: any) => {
-        if (live) onError(e.message);
-      })
-      .finally(() => {
-        if (live) setLoading(false);
-      });
-    return () => {
-      live = false;
-    };
-  }, [chatId, mode, dir]);
-  async function publish(action: string) {
-    if (publishing) return;
-    setPublishing(true);
-    setResult("");
-    try {
-      const r = await api(`/chats/${chatId}/git`, {
-        action,
-        message,
-        client_id: crypto.randomUUID(),
-      });
-      setResult(r.html_url || r.output || r.status || "Done");
-      const updated = await api(`/chats/${chatId}/diff`);
-      setDiff(updated.diff);
-    } catch (e: any) {
-      onError(e.message);
-    } finally {
-      setPublishing(false);
-    }
-  }
-  return (
-    <div className="panel-content">
-      {loading && (
-        <p className="muted" role="status">
-          Loading {mode === "files" ? "files" : "changes"}…
-        </p>
-      )}
-      {mode === "files" ? (
-        <>
-          <button
-            className="text-button"
-            onClick={() => {
-              setDir(dir.split("/").slice(0, -1).join("/"));
-              setView(null);
-            }}
-          >
-            {dir ? "← Parent folder · /" + dir : "Workspace files"}
-          </button>
-          {!loading && !files.length && (
-            <p className="muted">
-              This folder is empty. Files appear as your agent works.
+      <fieldset className="form-fields" disabled={saving}>
+        <Field label="Chat name">
+          <input
+            name="title"
+            defaultValue={chat.title}
+            maxLength={160}
+            required
+          />
+        </Field>
+        <details className="settings-disclosure" open>
+          <summary>Model &amp; thinking</summary>
+          <div className="chat-settings-section chat-settings-model">
+            <p className="settings-section-intro">
+              {chat.provider === "codex" ? "Codex" : "Claude Code"} · Applies to
+              future messages in this chat.
             </p>
-          )}
-          {files.map((f) => (
-            <button
-              className="file-row"
-              key={f.path}
-              onClick={() => {
-                if (f.directory) {
-                  setDir(f.path);
-                  setView(null);
-                } else {
-                  void fetch(
-                    `/api/chats/${chatId}/file?path=${encodeURIComponent(f.path)}`,
-                  )
-                    .then(async (r) => {
-                      if (!r.ok) throw new Error("Unable to open this file");
-                      const blob = await r.blob();
-                      setView({
-                        path: f.path,
-                        text:
-                          blob.size < 200000
-                            ? await blob.text()
-                            : "This file is too large to preview. Download it instead.",
-                      });
-                    })
-                    .catch((e) => onError(e.message));
-                }
-              }}
-            >
-              {f.directory ? <FolderGit2 size={16} /> : <FileText size={16} />}
-              <span>{f.name}</span>
-            </button>
-          ))}
-          {view && (
-            <div className="file-preview">
-              <a
-                href={`/api/chats/${chatId}/file?path=${encodeURIComponent(view.path)}`}
-              >
-                <Download size={14} /> Download
-              </a>
-              <pre>{view.text}</pre>
-            </div>
-          )}
-        </>
-      ) : (
-        <>
-          <pre className="diff">
-            {diff || "No tracked changes. New files appear after a commit."}
-          </pre>
-          <Field label="Commit message / pull request title">
-            <input
-              value={message}
-              onChange={(e) => setMessage(e.target.value)}
-              placeholder="Describe the changes"
+            <ModelOptions
+              provider={chat.provider}
+              accountId={chat.account_id}
+              initialModel={chat.model}
+              initialEffort={chat.effort}
             />
-          </Field>
-          <div className="button-row">
-            <button
-              className="secondary"
-              disabled={!message.trim() || publishing || loading}
-              onClick={() => publish("commit")}
-            >
-              Commit
-            </button>
-            <button
-              className="secondary"
-              disabled={!message.trim() || publishing || loading}
-              onClick={() => publish("push")}
-            >
-              Push
-            </button>
-            <button
-              className="primary"
-              disabled={!message.trim() || publishing || loading}
-              onClick={() => publish("pr")}
-            >
-              Create pull request
-            </button>
           </div>
-          <p className="muted">
-            Push and pull requests run only when you select the corresponding
-            action.
-          </p>
-          {publishing && <p role="status">Publishing changes…</p>}
-          {result && (
-            <p className="operation-result">
-              {result.startsWith("https://github.com/") ? (
-                <a href={result} target="_blank" rel="noreferrer">
-                  Open PR ↗
-                </a>
-              ) : (
-                result
-              )}
-            </p>
-          )}
-        </>
-      )}
-    </div>
+        </details>
+        <details className="settings-disclosure">
+          <summary>Permissions &amp; accounts</summary>
+          <div className="chat-settings-section">
+            <label className="chat-permission-row">
+              <ShieldCheck size={18} aria-hidden="true" />
+              <span>
+                <strong>Run without approval prompts</strong>
+                <small>
+                  Allow commands and file edits without asking. Leave off to
+                  review permission requests.
+                </small>
+              </span>
+              <input
+                name="autonomous"
+                type="checkbox"
+                defaultChecked={chat.autonomous}
+              />
+            </label>
+            <Field label="Account switching">
+              <Select
+                aria-label="Account switching"
+                name="handoff"
+                defaultValue={chat.handoff}
+              >
+                <option value="manual">Choose manually</option>
+                <option value="auto" disabled={!me.autoHandoff}>
+                  Automatically{!me.autoHandoff ? " — unavailable" : ""}
+                </option>
+              </Select>
+            </Field>
+            {!me.autoHandoff && (
+              <p className="settings-section-note">
+                Automatic switching requires verification and activation.
+              </p>
+            )}
+          </div>
+        </details>
+        <div className="chat-settings-save">
+          <button className="primary" disabled={saving}>
+            {saving ? "Saving…" : "Save changes"}
+          </button>
+        </div>
+      </fieldset>
+    </form>
   );
 }
 function SettingsForm({
@@ -2505,8 +3023,25 @@ function SettingsForm({
   onManage,
 }: any) {
   const [saved, setSaved] = useState(false),
+    [enabling, setEnabling] = useState(false),
     [section, setSection] = useState("models");
+  const settingsLayoutRef = useRef<HTMLDivElement>(null);
+  const sections = [
+    { id: "models", label: "Models" },
+    { id: "connections", label: "Connections" },
+    { id: "ssh", label: "Servers & SSH" },
+    { id: "resources", label: "Resources" },
+    { id: "notifications", label: "Notifications" },
+  ];
+  function selectSection(next: string) {
+    setSection(next);
+    onError("");
+    settingsLayoutRef.current?.closest("dialog")?.scrollTo({ top: 0 });
+  }
   async function push() {
+    if (enabling) return;
+    setEnabling(true);
+    onError("");
     try {
       if (!me.vapidKey)
         throw new Error("Web Push is not configured on this server yet");
@@ -2525,32 +3060,67 @@ function SettingsForm({
       setSaved(true);
     } catch (e: any) {
       onError(e.message);
+    } finally {
+      setEnabling(false);
     }
   }
   return (
-    <>
+    <div className="settings-layout" ref={settingsLayoutRef}>
+      <div className="settings-mobile-navigation">
+        <Select
+          aria-label="Settings section"
+          value={section}
+          onChange={(e) => selectSection(e.target.value)}
+        >
+          {sections.map((item) => (
+            <option value={item.id} key={item.id}>
+              {item.label}
+            </option>
+          ))}
+        </Select>
+      </div>
       <div
         className="segmented settings-tabs"
         role="tablist"
         aria-label="Settings sections"
       >
-        {[
-          { id: "models", label: "Models" },
-          { id: "connections", label: "Connections" },
-          { id: "resources", label: "Resources" },
-          { id: "notifications", label: "Notifications" },
-        ].map((item) => (
+        {sections.map((item) => (
           <button
             key={item.id}
             id={"settings-tab-" + item.id}
             type="button"
             role="tab"
+            tabIndex={section === item.id ? 0 : -1}
+            onKeyDown={(event) => {
+              const direction = {
+                ArrowRight: 1,
+                ArrowDown: 1,
+                ArrowLeft: -1,
+                ArrowUp: -1,
+              }[event.key];
+              if (!direction && event.key !== "Home" && event.key !== "End")
+                return;
+              event.preventDefault();
+              const tabs = Array.from(
+                event.currentTarget.parentElement!.querySelectorAll<HTMLButtonElement>(
+                  '[role="tab"]',
+                ),
+              );
+              const index = tabs.indexOf(event.currentTarget);
+              const target =
+                event.key === "Home"
+                  ? 0
+                  : event.key === "End"
+                    ? tabs.length - 1
+                    : (index + (direction || 0) + tabs.length) % tabs.length;
+              tabs[target].focus();
+              tabs[target].click();
+            }}
             aria-selected={section === item.id}
             aria-controls={"settings-panel-" + item.id}
             className={section === item.id ? "selected" : ""}
             onClick={() => {
-              setSection(item.id);
-              setSaved(false);
+              selectSection(item.id);
             }}
           >
             {item.label}
@@ -2570,6 +3140,15 @@ function SettingsForm({
           />
         </div>
       )}
+      {section === "ssh" && (
+        <div
+          role="tabpanel"
+          id="settings-panel-ssh"
+          aria-labelledby="settings-tab-ssh"
+        >
+          <SshSettings />
+        </div>
+      )}
       {section === "resources" && (
         <div
           role="tabpanel"
@@ -2585,34 +3164,55 @@ function SettingsForm({
           id="settings-panel-connections"
           aria-labelledby="settings-tab-connections"
         >
-          <h3>Projects</h3>
-          <p className="muted">
-            Each project has its own GitHub token. Chats can also run without a
-            repository.
-          </p>
-          <div className="project-settings-list">
-            {projects.map((p: any) => (
-              <button
-                key={p.id}
-                className="project-settings-row"
-                onClick={() => onManage(p)}
-              >
-                <FolderGit2 size={18} />
-                <span>
-                  <strong>{p.name}</strong>
-                  <small>
-                    {p.repo} ·{" "}
-                    {p.github_configured ? "Token saved" : "No token"}
-                  </small>
-                </span>
-                <ChevronRight size={16} />
-              </button>
-            ))}
-          </div>
-          <button className="primary" onClick={onAdd}>
-            <Plus size={16} />
-            Connect a project
-          </button>
+          <header className="workspace-settings-heading">
+            <h3>Connections</h3>
+            <p className="muted">
+              Each project has its own GitHub token. Chats can also run without
+              a repository.
+            </p>
+          </header>
+          <section
+            className="workspace-settings-card connections-card"
+            aria-label="Connected projects"
+          >
+            <header className="settings-card-heading">
+              <h4>Projects</h4>
+              <span>{projects.length}</span>
+            </header>
+            <div className="project-settings-list">
+              {projects.map((p: any) => (
+                <button
+                  key={p.id}
+                  className="project-settings-row"
+                  onClick={() => onManage(p)}
+                >
+                  <FolderGit2 size={18} />
+                  <span>
+                    <strong>{p.name}</strong>
+                    <small>
+                      {p.repo
+                        ? `${p.repo} · ${p.github_configured ? "Token saved" : "No token"}`
+                        : "Files-only project"}
+                    </small>
+                  </span>
+                  <ChevronRight size={16} />
+                </button>
+              ))}
+            </div>
+            {!projects.length && (
+              <div className="settings-section-empty">
+                <FolderGit2 size={20} aria-hidden="true" />
+                <div>
+                  <strong>No projects connected</strong>
+                  <span>Add a repository or a files-only project.</span>
+                </div>
+              </div>
+            )}
+            <button className="text-button" onClick={onAdd}>
+              <Plus size={16} />
+              Connect a project
+            </button>
+          </section>
         </div>
       )}
       {section === "notifications" && (
@@ -2621,23 +3221,57 @@ function SettingsForm({
           id="settings-panel-notifications"
           aria-labelledby="settings-tab-notifications"
         >
-          <h3>Notifications</h3>
-          <p className="muted">
-            Get notified when a task finishes or your agent needs permission.
-          </p>
-          <button className="secondary" onClick={push}>
-            <Bell size={16} />
-            Enable on this device
-          </button>
+          <header className="workspace-settings-heading">
+            <h3>Notifications</h3>
+            <p className="muted">
+              Get notified when a task finishes or your agent needs permission.
+            </p>
+          </header>
+          <section
+            className="workspace-settings-card notification-settings"
+            aria-label="Device notifications"
+          >
+            <header className="settings-card-heading">
+              <h4>This device</h4>
+            </header>
+            <div className="notification-settings-row">
+              <Bell size={20} aria-hidden="true" />
+              <div>
+                <strong>Task updates</strong>
+                <small>Finished tasks and requests for your approval.</small>
+              </div>
+            </div>
+            <p className="settings-section-note">
+              Applies to this browser or installed app.
+            </p>
+            {!me.vapidKey && (
+              <p className="settings-section-note">
+                Notifications must be configured on the server first.
+              </p>
+            )}
+            <div className="settings-card-actions">
+              <button
+                className="primary"
+                onClick={push}
+                disabled={enabling || saved || !me.vapidKey}
+              >
+                {enabling
+                  ? "Enabling…"
+                  : saved
+                    ? "Enabled on this device"
+                    : "Enable on this device"}
+              </button>
+            </div>
+            {saved && (
+              <p className="success" role="status">
+                <Check size={16} />
+                Notifications enabled.
+              </p>
+            )}
+          </section>
         </div>
       )}
-      {saved && (
-        <p className="success">
-          <Check size={16} />
-          Saved
-        </p>
-      )}
-    </>
+    </div>
   );
 }
 
@@ -2646,6 +3280,8 @@ function ConnectProject({
 }: {
   onCreated: (project: any) => Promise<void>;
 }) {
+  const [projectType, setProjectType] = useState("git");
+  const [name, setName] = useState("");
   const [repository, setRepository] = useState("");
   const [projectTokenInput, setProjectTokenInput] = useState("");
   const [error, setError] = useState("");
@@ -2653,15 +3289,45 @@ function ConnectProject({
   const normalized = normalizeGithubRepo(repository);
   return (
     <>
-      <p className="muted">
-        Paste a GitHub repository link or enter owner/repository. Access is
-        configured for this project only.
-      </p>
+      <fieldset className="workspace-mode-options" disabled={busy}>
+        <legend>Project type</legend>
+        {[
+          {
+            value: "git",
+            label: "GitHub repository",
+            detail: "Work on code with branches and separate working copies.",
+          },
+          {
+            value: "files",
+            label: "Files only",
+            detail: "Upload documents and files. No repository needed.",
+          },
+        ].map((option) => (
+          <label
+            key={option.value}
+            className={projectType === option.value ? "selected" : ""}
+          >
+            <input
+              type="radio"
+              name="project-type"
+              checked={projectType === option.value}
+              onChange={() => {
+                setProjectType(option.value);
+                setError("");
+              }}
+            />
+            <span>
+              <strong>{option.label}</strong>
+              <small>{option.detail}</small>
+            </span>
+          </label>
+        ))}
+      </fieldset>
       <form
         onSubmit={async (e) => {
           e.preventDefault();
           if (busy) return;
-          if (!normalized) {
+          if (projectType === "git" && !normalized) {
             setError("Enter owner/repository or a GitHub repository URL.");
             return;
           }
@@ -2669,8 +3335,9 @@ function ConnectProject({
           setError("");
           try {
             const created = await api("/projects", {
-              repo: repository,
-              ...(projectTokenInput.trim()
+              repo: projectType === "git" ? repository : "",
+              ...(projectType === "files" ? { name: name.trim() } : {}),
+              ...(projectType === "git" && projectTokenInput.trim()
                 ? { token: projectTokenInput.trim() }
                 : {}),
             });
@@ -2682,37 +3349,51 @@ function ConnectProject({
           }
         }}
       >
-        <Field label="Repository">
-          <input
-            required
-            value={repository}
-            onChange={(e) => {
-              setRepository(e.target.value);
-              setError("");
-            }}
-            placeholder="https://github.com/owner/repository"
-            maxLength={2048}
-            aria-describedby="repository-help"
-            aria-invalid={!!error}
-          />
-        </Field>
-        <p className="muted" id="repository-help">
-          {normalized
-            ? "Repository: " + normalized
-            : "Also accepts owner/repository"}
-        </p>
-        <Field label="Access token (optional)">
-          <input
-            type="password"
-            autoComplete="new-password"
-            value={projectTokenInput}
-            onChange={(e) => setProjectTokenInput(e.target.value)}
-            placeholder="github_pat_…"
-            minLength={10}
-            maxLength={500}
-          />
-        </Field>
-        <GithubTokenHelp />
+        {projectType === "files" ? (
+          <Field label="Project name">
+            <input
+              required
+              maxLength={100}
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder="For example: Marketing materials"
+            />
+          </Field>
+        ) : (
+          <>
+            <Field label="Repository">
+              <input
+                required
+                value={repository}
+                onChange={(e) => {
+                  setRepository(e.target.value);
+                  setError("");
+                }}
+                placeholder="https://github.com/owner/repository"
+                maxLength={2048}
+                aria-describedby="repository-help"
+                aria-invalid={!!error}
+              />
+            </Field>
+            <p className="muted" id="repository-help">
+              {normalized
+                ? "Repository: " + normalized
+                : "Also accepts owner/repository"}
+            </p>
+            <Field label="Access token (optional)">
+              <input
+                type="password"
+                autoComplete="new-password"
+                value={projectTokenInput}
+                onChange={(e) => setProjectTokenInput(e.target.value)}
+                placeholder="github_pat_…"
+                minLength={10}
+                maxLength={500}
+              />
+            </Field>
+            <GithubTokenHelp />
+          </>
+        )}
         {error && (
           <p className="inline-error" role="alert">
             {error}
@@ -2720,7 +3401,11 @@ function ConnectProject({
         )}
         <button className="primary" disabled={busy}>
           <FolderGit2 size={17} />
-          {busy ? "Connecting…" : "Connect"}
+          {busy
+            ? "Creating…"
+            : projectType === "git"
+              ? "Connect repository"
+              : "Create project"}
         </button>
       </form>
     </>

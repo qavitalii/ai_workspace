@@ -38,13 +38,23 @@ createInterface({ input: process.stdin }).on("line", async (line) => {
               header: "Design",
               options: [{ label: "Simple", description: "Small scope" }],
             },
+            {
+              question: "Which areas?",
+              multiSelect: true,
+              options: [{ label: "Tests" }, { label: "Docs" }],
+            },
+            { question: "Any notes?" },
           ],
         },
       }),
     });
     const result = await response.json();
     assert.equal(result.behavior, "allow");
-    assert.deepEqual(result.updatedInput.answers, { "Choose?": "Simple" });
+    assert.deepEqual(result.updatedInput.answers, {
+      "Choose?": "Simple",
+      "Which areas?": "Tests, Docs",
+      "Any notes?": "Keep changes focused",
+    });
     send({ type: "result", is_error: false, result: "Claude plan complete" });
   } catch (e) {
     process.stderr.write(e.stack + "\n");

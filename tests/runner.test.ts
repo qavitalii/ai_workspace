@@ -1,3 +1,4 @@
+import { buildQuestionAnswers } from "../src/question-answers";
 import { it, expect } from "vitest";
 import { spawn, execFileSync } from "node:child_process";
 import { createInterface } from "node:readline";
@@ -21,7 +22,7 @@ async function run(input: RunInput | { type: "usage"; provider: "codex" }) {
       `${path.resolve("tests/fixtures")}:/fixtures:ro`,
       "--entrypoint",
       "/bin/sh",
-      "ai-workspace-runner:0.1.0",
+      process.env.RUNNER_IMAGE || "ai-workspace-runner:0.1.0",
       "-c",
       "mkdir -p /tmp/test-bin && ln -s /fixtures/codex-protocol.mjs /tmp/test-bin/codex && ln -s /fixtures/claude-protocol.mjs /tmp/test-bin/claude && export PATH=/tmp/test-bin:$PATH && exec node /app/dist/node/runner/main.js",
     ],
@@ -52,8 +53,22 @@ async function run(input: RunInput | { type: "usage"; provider: "codex" }) {
             JSON.stringify({
               type: "answer",
               id: e.id,
-              answers: Object.fromEntries(
-                e.questions.map((q: any) => [q.id, { answers: ["Simple"] }]),
+              answers: buildQuestionAnswers(
+                e.questions,
+                Object.fromEntries(
+                  e.questions.map((q: any) => [
+                    q.id,
+                    {
+                      selected: q.multiSelect
+                        ? ["Tests", "Docs"]
+                        : q.options?.length
+                          ? ["Simple"]
+                          : [],
+                      custom: !q.options?.length,
+                      text: q.options?.length ? "" : "Keep changes focused",
+                    },
+                  ]),
+                ),
               ),
             }) + "\n",
           );

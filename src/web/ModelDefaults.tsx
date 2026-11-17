@@ -15,7 +15,7 @@ function ProviderDefaults({ provider, accounts, initial, onSaved }: any) {
     [saved, setSaved] = useState(false);
   return (
     <form
-      className="provider-defaults"
+      className="provider-defaults workspace-settings-card"
       onChange={() => setSaved(false)}
       onSubmit={async (e) => {
         e.preventDefault();
@@ -41,7 +41,10 @@ function ProviderDefaults({ provider, accounts, initial, onSaved }: any) {
         }
       }}
     >
-      <h3>{provider === "codex" ? "Codex" : "Claude Code"}</h3>
+      <header className="settings-card-heading">
+        <h4>{provider === "codex" ? "Codex" : "Claude Code"}</h4>
+        <span>New chats</span>
+      </header>
       <fieldset disabled={saving} className="form-fields">
         {matching.length > 1 && (
           <label className="field">
@@ -70,11 +73,14 @@ function ProviderDefaults({ provider, accounts, initial, onSaved }: any) {
           initialModel={initial?.model || ""}
           initialEffort={initial?.effort || ""}
         />
-        <button className="primary">
-          {saving
-            ? "Saving…"
-            : `Save ${provider === "codex" ? "Codex" : "Claude Code"} defaults`}
-        </button>
+        <div className="settings-card-actions">
+          <button
+            className="primary"
+            aria-label={`Save ${provider === "codex" ? "Codex" : "Claude Code"} defaults`}
+          >
+            {saving ? "Saving…" : "Save defaults"}
+          </button>
+        </div>
       </fieldset>
       {saved && (
         <p role="status" className="success">
@@ -92,21 +98,24 @@ function ProviderDefaults({ provider, accounts, initial, onSaved }: any) {
 export function ModelDefaults({ accounts, defaults, onSaved }: any) {
   return (
     <section aria-label="Default models">
-      <h3>Models for new chats</h3>
-      <p className="muted">
-        Choose a model and reasoning effort for each agent. New chats start with
-        these settings; you can change them in an individual chat. Existing
-        chats keep their current settings.
-      </p>
-      {["codex", "claude"].map((provider) => (
-        <ProviderDefaults
-          key={provider}
-          provider={provider}
-          accounts={accounts}
-          initial={defaults?.[provider]}
-          onSaved={onSaved}
-        />
-      ))}
+      <header className="workspace-settings-heading">
+        <h3>Models</h3>
+        <p className="muted">
+          Set the starting model for each agent. Existing chats keep their
+          settings.
+        </p>
+      </header>
+      <div className="provider-defaults-grid">
+        {["codex", "claude"].map((provider) => (
+          <ProviderDefaults
+            key={provider}
+            provider={provider}
+            accounts={accounts}
+            initial={defaults?.[provider]}
+            onSaved={onSaved}
+          />
+        ))}
+      </div>
     </section>
   );
 }

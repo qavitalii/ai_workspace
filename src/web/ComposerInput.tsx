@@ -32,10 +32,22 @@ export function ComposerInput({
     [loading, setLoading] = useState(false),
     [error, setError] = useState("");
   useEffect(() => {
-    if (!input.current) return;
-    input.current.style.height = "auto";
-    input.current.style.height =
-      Math.min(input.current.scrollHeight, 180) + "px";
+    const element = input.current;
+    if (!element) return;
+    const resize = () => {
+      element.style.height = "auto";
+      element.style.height = Math.min(element.scrollHeight, 180) + "px";
+    };
+    resize();
+    let width = element.clientWidth;
+    const observer = new ResizeObserver(() => {
+      if (element.clientWidth !== width) {
+        width = element.clientWidth;
+        resize();
+      }
+    });
+    observer.observe(element);
+    return () => observer.disconnect();
   }, [value]);
   const match = value.slice(0, cursor).match(/(?:^|\s)([/@$])([^\s]*)$/);
   const symbol = match?.[1],

@@ -67,12 +67,17 @@ The installer creates `.env` with permissions `600`. Do not commit it or include
 | `POSTGRES_PASSWORD` | Random database password; changing `.env` alone does not update an existing database user |
 | `ENCRYPTION_KEY` | 32 random bytes in hexadecimal; do not rotate without migrating encrypted secrets |
 | `MAX_CONCURRENT` | Default maximum concurrent tasks, 3 initially; any positive whole number. A value saved in Settings → Resources overrides this environment default |
+| `OUTPUT_LIMIT_GB` | Initial shared saved-output budget in decimal GB, 1 by default (0.01–10000). After the first migration, change it in Settings → Resources |
+| `WORKSPACE_PROXY_IP`, `WORKSPACE_SERVER_PROXY_IP`, `WORKSPACE_PROXY_SUBNET` | Dedicated proxy network: defaults `172.30.250.2`, `172.30.250.3`, `172.30.250.0/24`; change all three together if the subnet overlaps another network |
+| `TRUSTED_PROXY_IPS` | Outside Compose, comma-separated explicit immediate proxy IPs; empty trusts none. Compose sets this to Caddy’s fixed address |
 | `MAX_FILE_MB` | Maximum attachment size, 25 MB by default |
 | `MAX_ATTACHMENTS` | Maximum attachments per message, 10 by default |
 | `ENABLE_AUTO_HANDOFF` | `false` initially; see the provider verification guide |
 | `VAPID_*` | Web Push keys and contact address, generated during installation |
 
 Apply changes with `./ops/compose.sh up -d server caddy`. To change a domain, update `APP_ORIGIN`, `SITE_ADDRESS`, and DNS together. To migrate local mode to a server, also set `NODE_ENV=production`, change `.install-mode` to `--server`, and use the server Compose configuration without the local override.
+
+The supervisor trusts forwarded client addresses only from the configured immediate proxy. Caddy overwrites `X-Forwarded-For` with its connecting client’s address, so login quotas are per client. An additional CDN/load balancer needs its own explicit trust configuration; do not enable blanket proxy trust.
 
 For frontend/backend development outside Docker, use Node 22, your own PostgreSQL instance, `npm ci`, the variables from `.env.example`, and `npm run dev`. Docker is still required for agent containers. Set `APP_ORIGIN=http://localhost:5173` for Vite. Never use a production database for tests.
 
@@ -81,6 +86,10 @@ For frontend/backend development outside Docker, use Node 22, your own PostgreSQ
 Open **Settings → Resources** to see CPU usage/idle percentage, used/available memory, workspace filesystem space, running tasks, queued tasks, and tasks waiting for an account. Samples refresh every two seconds while this panel is open. Disconnection retains the last sample with an explicit stale-data message.
 
 **Maximum concurrent tasks** accepts any positive whole number, including 50 or more. Saving takes effect for new starts without restarting the server. The value is stored in PostgreSQL and survives restarts and backups. Lowering it does not interrupt running tasks: new starts wait until occupancy drops below the new limit. The initial default comes from `MAX_CONCURRENT=3`; once saved in the UI, the database value takes precedence.
+
+**Saved agent output limit (GB, all chats)** sets one shared budget for responses, persisted activity, approval details and conversation summaries. The default is 1 GB (1,000,000,000 bytes); fractional values from 0.01 to 10000 GB are accepted. Usage includes UTF-8 payload bytes plus a 256-byte allowance per event, assistant message and approval. This is not a total disk quota: PostgreSQL indexes/WAL/physical overhead, project files, attachments, provider-native histories, backups and container logs use additional space.
+
+Writes reserve capacity atomically across simultaneous tasks. If the next output cannot fit, that task stops with an explanation; raise the limit or delete old chats, then retry. Lowering the limit below existing usage keeps all history and blocks further growth. Existing installations are measured during migration, never purged. Completed streaming fragments are consolidated into their saved answer. Separately, the supervisor caps each runner event/frame at 1 MiB and each response at 4 MiB, waits for event processing before reading more, and bounds WebSocket buffering. Runner Docker logs rotate at 10 MB × 3 per container.
 
 Each account still serves only one running task at a time. Increasing capacity does not create accounts, bypass provider quotas, or reserve CPU/RAM in advance. Each runner retains its configured CPU/RAM/PID limits. Size the server for your workloads and use the live metrics to observe actual usage. A 50-slot scheduler test is not a 50-container performance benchmark.
 
@@ -96,7 +105,9 @@ For Codex, use Copy code and enter the device code on OpenAI's page. For Claude,
 
 Complete the [provider verification scenarios](provider-verification.md) before relying on unattended execution. Repeat them after changing CLI versions. Disconnect signs out through the official CLI and preserves account records, chats, files, and attachments. It is blocked during active tasks and permission waits. Failed or interrupted sign-out stays unavailable for scheduling and offers Retry disconnect; it does not claim the credentials were removed. Connect starts a new sign-in.
 
-Create chat does not require a name or Git repository. Choose No repository — private workspace to start without Git. A short title comes from the first message and can be changed in chat settings. Git diff and publishing actions are available only for repository chats.
+Create chat does not require a name or Git repository. Choose **Personal chat** for work outside a project, or create a **Files only** project for shared documents without Git. Project chats offer **Main folder**, **New working copy**, and **Existing folder** when one is available. A short title comes from the first message and can be changed in chat settings. Git diff and publishing actions are available only for repository chats.
+
+**Delete account** removes the saved Workspace account and its local sign-in/session files after confirmation. Chats, messages and project files remain; select another account to continue. It does not delete your OpenAI/Anthropic account, cancel a subscription or revoke remote credentials. Stop active/queued tasks first and wait for sign-in, inspection or sign-out to finish. If cleanup fails, retry Delete account.
 
 ## 5. Routine operations
 
@@ -122,11 +133,23 @@ Generated files can be downloaded from the Files panel; downloads are capped at 
 ./ops/backup.sh
 ```
 
-The backup script temporarily stops the supervisor to capture a consistent database and file checkpoint. **Active jobs are interrupted.** It automatically restarts the server afterward. The encrypted archive in `backups/` contains the database, native CLI profiles, workspaces, attachments, and configuration. Backups older than seven days are removed.
+The backup script temporarily stops the supervisor to capture a consistent database and file checkpoint. **Active jobs are interrupted.** It automatically restarts the server afterward. The encrypted archive in `backups/` contains the database, all of `DATA_ROOT`, and configuration, including native CLI profiles, workspaces and attachments. Backups older than seven days are removed.
 
 A root VPS installation creates `/etc/cron.d/ai-workspace-backup`, scheduled for **03:17 in the server's timezone**. Logs are written to `/var/log/ai-workspace-backup.log`. Local installation does not install a cron job.
 
 **Copy `.backup-key` to a safe location outside the server.** Also copy archives to another disk or remote storage. Offsite upload is not included. A backup on the same VPS disk does not protect against losing that VPS.
+
+### Working-folder data included in backups
+
+| Under `DATA_ROOT` | Preserve together with the database |
+|---|---|
+| `workspaces/` | Main, saved, personal, copy and resolution working files |
+| `workspace-git/` | Shared Git history, branches and linked-worktree metadata |
+| `workspace-operations/` | Copy baselines, frozen reviews, resolution inputs and recovery journals/files |
+| `workspace-checkpoints/` | Previous main folders saved before transfers |
+| `uploads/`, `profiles/`, `shared/` | Original attachments, account state and default connected folders |
+
+Backing up only `workspaces/` is insufficient for linked worktrees and future transfers. Do not delete operation directories as temporary files: current baselines and unresolved reviews depend on them. Main-folder checkpoints and shared Git objects have no automatic retention cleanup. They can remain after a working copy is deleted. Restore the database and the entire data tree from the same backup; worktree links use stable container paths, so manage Git through the application rather than moving individual folders or repairing links on the host.
 
 ### Restore
 
@@ -149,7 +172,7 @@ This explicitly replaces the installation's current data. The script retains the
 
 A clean Git checkout is required. The script creates a backup, runs `git pull --ff-only`, builds both images, and recreates the services. CLI versions are pinned in the Dockerfile and do not update themselves inside running containers.
 
-Read project release notes before updating. Current schema changes are additive. For an incompatible downgrade, restore the matching backup and code version together.
+Read project release notes before updating. Rebuild both server and runner: the new folder helper is bundled into the runner image. Schema migration preserves existing working files and attachments in place; old folders keep their storage format. Existing projects without a main folder require an explicit selection in Project settings. New copies select Git worktrees or ordinary directories automatically. For an incompatible downgrade, restore the matching backup and code version together.
 
 ## 8. Troubleshooting
 
@@ -162,7 +185,11 @@ Read project release notes before updating. Current schema changes are additive.
 | HTTPS does not work | DNS A/AAAA records, ports 80/443, `./ops/compose.sh logs caddy` |
 | Runner image is missing | Run `./ops/compose.sh build runner-image` |
 | GitHub returns 403/404 | PAT repository access, organization approval, correct owner/repository |
-| A chat remains queued | Selected account is connected and idle, capacity is available, and the terminal is closed |
+| A chat remains queued | Selected account is connected and idle, capacity is available, and no task, terminal or folder operation is using its working folder; also check writable connected folders |
+| Transfer says the review is out of date | Refresh the review; source/main files or the copy baseline changed |
+| Resolution cannot transfer yet | Finish the resolution chat; all conflict paths must be acknowledged and markers removed. Review still does not guarantee semantic correctness |
+| Cannot delete a source copy | Finish or delete its dependent resolution folder first; stop queued/active tasks and close terminals |
+| Git writes fail inside a worktree terminal/agent | Shared Git metadata is intentionally read-only there; use the app’s Git actions for commit/push/PR |
 | Claude sign-in is waiting | Open the URL from the native CLI and provide the code if requested |
 | Job interrupted after reboot | Expected behavior: inspect files and resume explicitly |
 | Low disk space | Settings shows free space; inspect `docker system df`; do not remove the database volume |
@@ -172,7 +199,7 @@ Check configuration with `./ops/compose.sh config --quiet`. Plain `docker compos
 
 ## 9. Files and connected folders
 
-For files that belong to a message, use the paperclip, drag/drop, or image paste. Originals stay with the chat; agents receive workspace copies.
+For files that belong to a message, use the paperclip, drag/drop, or image paste. Submitted originals are mounted read-only at `/attachments`; agents save edited copies in their working folder. Deleting a chat detaches and preserves its originals in the folder’s attachment library. They are not automatically shared as working files: use the library’s save action to copy them into the folder. Upload directly through a working folder’s **Files** panel when other chats in that folder should see the file immediately.
 
 For reusable data, open **Chat settings → Folders** or **Project settings → Folders**:
 
@@ -180,7 +207,7 @@ For reusable data, open **Chat settings → Folders** or **Project settings → 
 2. Choose **Upload files** or **Upload folder**. Directory uploads retain relative paths. Each file uses `MAX_FILE_MB`; archives are not extracted. Browsers without directory selection can upload individual files. Uploads report progress, never overwrite different existing files, and safely skip identical files when retried.
 3. Choose **Read only** (default) or **Read & write**, then **Connect folder**. To change access later, select the same folder, choose the new mode, and connect again.
 
-The agent and terminal see `/workspace/.workspace-folders/<name>`. Project folders are inherited by all its chats. Chat folders apply only to that chat. **Browse** lists and downloads files. **Disconnect folder** removes access without deleting data. Stop tasks and close terminals before changing connections or uploading into a folder in use. Chats sharing a writable folder run one at a time; read-only readers can run together. A waiting chat remains queued until the folder is available.
+The agent and terminal see `/workspace/.workspace-folders/<name>`. Project folders are inherited by all its chats. Chat folders apply only to that chat. **Browse** lists and downloads files. **Disconnect folder** removes access without deleting data. Stop tasks and close terminals before changing connections or uploading into a folder in use. Chats sharing a writable folder run one at a time; read-only readers can run together. A waiting chat remains queued until the folder is available. In working-copy and resolution chats, connected folders are always mounted read-only, even if their connection allows writes in the main folder.
 
 By default, folders live under `DATA_ROOT/shared` and are included in encrypted backups. To make an existing folder available, place it directly under that directory (for example `shared/assets`). Use ordinary directories, not symbolic links. On Linux, UID 1000 must have read access, plus write access for uploads or writable connections. Workspace never recursively changes ownership of existing folders.
 
@@ -215,3 +242,53 @@ The composer offers keyboard and touch suggestions: `/` for commands specific to
 Plan mode persists across turns. The composer shows **Plan mode** and **Switch to execution**; switching is blocked while a task is active. Planning questions are saved as pending requests and can be answered after reconnecting, including from a phone. Stopping or restarting expires pending requests. Claude may request explicit permission to exit planning during a run. Replies to secret questions are sent to the agent without being copied to the event log.
 
 The web interface does not provide every interactive terminal command. MCP/plugin management, native session forks, terminal themes and account-wide app mentions are not implemented here. Claude commands are discovered per chat and forwarded only when advertised; availability may change with CLI versions. Codex plan mode uses the experimental collaboration API of the pinned CLI version. See [Codex App Server](https://developers.openai.com/codex/app-server) and [Claude SDK skills and commands](https://code.claude.com/docs/en/agent-sdk/slash-commands).
+
+
+## 11. Working folders and conflict resolution
+
+A chat stores the conversation; its selected working folder stores the files. **New chat** beside a folder starts another conversation using that folder. It does not create another copy. The new-chat form defaults to main, or to the existing folder when launched from that folder’s card.
+
+| Choice | Practical use | File behavior |
+|---|---|---|
+| **Main folder** | Continue shared work or make a small sequential change | Chats see the same files; one active task at a time |
+| **New working copy** | Let one agent update the homepage while another works on navigation | Starts from current main files; edits stay separate until reviewed and transferred |
+| **Existing folder** | Continue an earlier task or inspect a preserved legacy folder | Reuses that folder and its current files |
+
+For Git checkouts, new copies are linked worktrees with separate branches in a managed shared repository. The main checkout's Git metadata is preserved. Without Git, the app copies ordinary directories. Neither mode automatically synchronizes later main/copy changes. Dependencies, build output, local credentials, `.env` files (except example/sample/template files) and app-internal paths are excluded; inspect the exclusion list on the folder card. Git history may still contain previously committed files. External services/databases remain shared. Parallel tasks need separate available accounts and sufficient capacity.
+
+To transfer completed work:
+
+1. Open **Review changes** on the copy. Inspect the main version and proposed result. Compatible edits combine automatically.
+2. For conflicts, choose a version manually or select an account and **Resolve with agent**. This prepares a separate resolution folder and queues a chat; the main and original copy are preserved. The agent is asked to combine both intentions, run checks and explain its decisions. It may need clarification for ambiguous decisions.
+3. When the agent finishes, open the project and **Review changes** on the **Resolve · …** folder. Finish any incomplete resolution in its chat. If main changed in the meantime, the review compares against current main again. A resolution folder does not spawn another resolution folder automatically.
+4. Select **Transfer to main folder**. This updates working files and saves the previous main folder for recovery; it does not commit, push or publish. Use separate Git actions when desired. If the original copy has already been transferred since resolution began, start a fresh resolution from its latest review.
+
+A source copy remains available after transfer. Later edits in it remain new changes. If creation of the copy succeeds but creation of the chat fails, the form retains that copy: retry **Create chat** to reuse it.
+
+**Delete folder** is available for non-main folders. It permanently removes that folder, its linked chats and original attachments after confirmation by name. Transfer anything needed first. Main, connected folders and previous main-folder recovery copies are preserved. To keep the folder and files, delete only its chat. A copy with an unfinished dependent resolution cannot be deleted until the resolution is completed or removed. Whole-project deletion with a “keep files” option is not implemented.
+
+## SSH servers and keys
+
+Open **Settings → Servers & SSH keys**. Create an Ed25519 key or import an OpenSSH Ed25519, RSA or ECDSA private key. For an encrypted key, enter its passphrase once. Workspace normalizes and encrypts the key with the installation's `ENCRYPTION_KEY`; it does not save the passphrase or offer private-key export. Hardware keys, SSH certificates, jump hosts and password login are not supported in this version.
+
+Copy the public key and add it as a new line to the intended remote user's `~/.ssh/authorized_keys`, preserving existing entries. On that server, the directory should have mode `700` and the file mode `600`, owned by that user. Create a server entry with its address, port, username, SSH alias and key. The address must be reachable from the Workspace Docker network; `localhost` means the temporary container itself, not your laptop or the Workspace host.
+
+Use **Review fingerprint**, compare the displayed fingerprints with a trusted server console or administrator, then select **I verified these fingerprints**. A network scan alone does not authenticate the server. You can obtain fingerprints on the server with `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` (and the corresponding RSA/ECDSA public files if present). Use **Test connection** after confirmation. It authenticates and runs only `true`; it does not install keys or edit remote files. Results include the time and distinguish authentication rejection, identity changes, DNS failures, refusal and timeout. A changed address or port clears stored trust; changed server keys require a new review.
+
+Select servers in **Project settings → SSH server access** or in a personal chat's settings, then click **Save SSH access**. Project chats inherit these connections, including saved folders and working copies. Within a connected chat, the agent and terminal can use `ssh production 'command'`, `scp file production:/path/` and `sftp production`, replacing `production` with your alias. Project chats display inherited access; edit it at the project level. Remote changes are shared across working copies. SSH permissions come from the remote user: planning mode and a read-only local folder do not make the remote server read-only.
+
+Stop queued/active tasks and close affected terminals before editing/removing connections or changing their assignments. Wait for connection checks to finish. Deleting a server removes Workspace assignments but keeps its saved key. A key cannot be deleted while a server references it. **Neither action removes public keys from remote `authorized_keys` files or revokes other copies of a key**; remove those remote entries yourself when retiring access. Already-started remote processes may continue after a chat stops.
+
+The agent receives an isolated authentication socket for its current run, never a private-key file. The helper holds assigned identities in memory with destination constraints tied to confirmed host keys and usernames. Configuration and public keys reside in a disposable Docker volume; private working files use memory-backed storage. Shared provider profiles, Git helpers and sign-in/model-inspection sessions do not receive these credentials. SSH helpers disable Docker output logging, and cleanup removes helpers and socket volumes after stop or supervisor recovery. No private keys or passphrases are placed in command arguments.
+
+Back up the database and `.env` using the existing encrypted backup procedure: the SSH key ciphertext is in the database and requires the original `ENCRYPTION_KEY`. Restoring that backup restores saved SSH access, so review assignments after recovery. Rebuild **both server and runner images** when upgrading to this feature; the older runner lacks the SSH helper. Existing installations start with no SSH keys or assignments. No provider-account login or remote access is required for migration.
+
+To run isolated SSH tests (in addition to the disposable PostgreSQL and runner tests described in the README):
+
+```bash
+docker build --target runner -t ai-workspace-runner:ssh-tests .
+docker build -f tests/fixtures/sshd.Dockerfile -t ai-workspace-sshd:tests .
+SSH_DOCKER_TESTS=1 RUNNER_IMAGE=ai-workspace-runner:ssh-tests npm test
+```
+
+The SSH tests create temporary keys, SSH targets and authentication helpers, verify SSH/SCP/SFTP and rejection of unassigned destinations, and clean them up. Add `INTEGRATION_TESTS=1` and the disposable `DATABASE_URL` to include actual runtime/terminal access and database/API tests. On Docker Desktop, set `DOCKER_HOST` as described in the README if necessary. These checks use synthetic credentials; they do not sign into Codex/Claude or touch real SSH servers.

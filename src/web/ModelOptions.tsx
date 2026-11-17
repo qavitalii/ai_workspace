@@ -9,12 +9,14 @@ export function ModelOptions({
   initialModel = "",
   initialEffort = "",
   compact = false,
+  onSelectionChange,
 }: {
   provider: string;
   accountId: string;
   initialModel?: string;
   initialEffort?: string;
   compact?: boolean;
+  onSelectionChange?: (selection: { model: string; effort: string }) => void;
 }) {
   const [model, setModel] = useState(initialModel),
     [effort, setEffort] = useState(initialEffort),
@@ -69,6 +71,9 @@ export function ModelOptions({
       generation.current++;
     };
   }, [provider, accountId, refresh]);
+  useEffect(() => {
+    onSelectionChange?.({ model, effort });
+  }, [model, effort, onSelectionChange]);
   const selected = models.find((m) => (m.model || m.id) === model);
   const advertised = selected?.supportedReasoningEfforts?.map((e: any) =>
     typeof e === "string" ? e : e.reasoningEffort,
@@ -129,34 +134,6 @@ export function ModelOptions({
           </Select>
         )}
       </label>
-      {!compact && (
-        <button
-          type="button"
-          className="text-button"
-          onClick={() => setCustom(!custom)}
-        >
-          {custom
-            ? "Choose from available models"
-            : "Enter an exact model name"}
-        </button>
-      )}
-      {provider === "codex" && (!compact || !!error) && (
-        <button
-          type="button"
-          className="text-button"
-          disabled={!accountId || busy}
-          onClick={() => {
-            forceRefresh.current = accountId;
-            setRefresh((n) => n + 1);
-          }}
-        >
-          {busy
-            ? "Loading models…"
-            : error
-              ? "Retry loading models"
-              : "Refresh models"}
-        </button>
-      )}
       <label className="field">
         <span>Reasoning effort</span>
         <Select
@@ -180,11 +157,39 @@ export function ModelOptions({
           ))}
         </Select>
       </label>
+      <div className="model-option-tools">
+        {!compact && (
+          <button
+            type="button"
+            className="text-button"
+            onClick={() => setCustom(!custom)}
+          >
+            {custom ? "Choose from list" : "Custom model"}
+          </button>
+        )}
+        {provider === "codex" && (!compact || !!error) && (
+          <button
+            type="button"
+            className="text-button"
+            disabled={!accountId || busy}
+            onClick={() => {
+              forceRefresh.current = accountId;
+              setRefresh((n) => n + 1);
+            }}
+          >
+            {busy
+              ? "Loading models…"
+              : error
+                ? "Retry loading models"
+                : "Refresh models"}
+          </button>
+        )}
+      </div>
       {!compact && (
         <p className="muted">
           {advertised?.length
             ? "Options reported by the selected model."
-            : "Deeper thinking can help with complex tasks, but may take longer and use more of your limit."}
+            : "More thinking uses more time and account capacity."}
         </p>
       )}
       {error && (

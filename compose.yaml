@@ -24,11 +24,13 @@ services:
     environment:
       NODE_ENV: ${NODE_ENV:-production}
       APP_ORIGIN: ${APP_ORIGIN:?Run ops/install.sh first}
+      TRUSTED_PROXY_IPS: ${WORKSPACE_PROXY_IP:-172.30.250.2}
       DATABASE_URL: postgres://workspace:${POSTGRES_PASSWORD}@db:5432/workspace
       ENCRYPTION_KEY: ${ENCRYPTION_KEY:?Run ops/install.sh first}
       DATA_ROOT: ${DATA_ROOT:?Run ops/install.sh first}
       RUNNER_IMAGE: ai-workspace-runner:0.1.0
       MAX_CONCURRENT: ${MAX_CONCURRENT:-3}
+      OUTPUT_LIMIT_GB: ${OUTPUT_LIMIT_GB:-1}
       MAX_FILE_MB: ${MAX_FILE_MB:-25}
       MAX_ATTACHMENTS: ${MAX_ATTACHMENTS:-10}
       ENABLE_AUTO_HANDOFF: ${ENABLE_AUTO_HANDOFF:-false}
@@ -38,7 +40,10 @@ services:
     volumes:
       - ${DATA_ROOT}:${DATA_ROOT}
       - /var/run/docker.sock:/var/run/docker.sock
-    networks: [control, web]
+    networks:
+      control:
+      proxy:
+        ipv4_address: ${WORKSPACE_SERVER_PROXY_IP:-172.30.250.3}
     depends_on:
       db: { condition: service_healthy }
     healthcheck:
@@ -64,7 +69,9 @@ services:
       - ./ops/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
       - caddy_config:/config
-    networks: [web]
+    networks:
+      proxy:
+        ipv4_address: ${WORKSPACE_PROXY_IP:-172.30.250.2}
     depends_on:
       server: { condition: service_healthy }
   runner-image:
@@ -78,4 +85,7 @@ volumes:
   caddy_config:
 networks:
   control: { internal: true }
-  web:
+  proxy:
+    ipam:
+      config:
+        - subnet: ${WORKSPACE_PROXY_SUBNET:-172.30.250.0/24}

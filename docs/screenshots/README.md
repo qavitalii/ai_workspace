@@ -1,8 +1,10 @@
 # Documentation screenshots
 
-These are browser captures of the actual React interface using fictional data from `ops/preview-docs.mjs`. Desktop captures include a decorative presentation frame from `ops/docs-frame.html`; the application inside it is rendered without style overrides. No real account, conversation, token, repository, or usage report is included. Example model names and assistant messages are illustrative, not provider verification results.
+These are browser captures of the actual React interface with fictional data. `workspace.jpg`, `conversation.jpg`, `mobile.jpg` and `mobile-showcase.jpg` are earlier overview captures from `ops/preview-docs.mjs`; they predate the working-folder controls and should not be used as a current control reference. `new-chat.jpg` and `resolve-conflicts.jpg` show the updated folder selection and agent-resolution controls, captured on 2026-11-16 in an isolated local test installation with synthetic files and a demo account. No inference task was run. Desktop captures include a decorative presentation frame from `ops/docs-frame.html`; the application inside it is rendered without style overrides. No real account, conversation, token, repository, or usage report is included. Example model names and assistant messages are illustrative, not provider verification results.
 
-To refresh:
+The read-only preview fixture now includes main, worktree and personal folder records with chat-to-folder associations. It can display current project cards and the new-chat form, but it cannot create copies, perform reviews or queue resolution tasks. To refresh the interactive workflow screenshots, use a disposable test database and an isolated data directory as described in [development and verification](../../README.md#development-and-verification). Keep real profiles and project files out of that environment.
+
+To refresh overview captures:
 
 1. Run `npm ci`, then `node ops/preview-docs.mjs`.
 2. Open `http://127.0.0.1:4178/__docs/frame` at 1600 × 1080. Expand **Studio website** in the sidebar and capture the full page as `workspace.jpg`. The decorative frame leaves a 48 px margin around the complete application viewport.

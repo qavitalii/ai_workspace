@@ -1,3 +1,4 @@
+import * as sshRuntime from "../src/server/ssh-runtime";
 import { accountUsage, saveUsage } from "../src/server/usage";
 import { accountModels } from "../src/server/models";
 import {
@@ -17,6 +18,8 @@ import {
   vi,
 } from "vitest";
 import { randomUUID } from "node:crypto";
+import { once } from "node:events";
+import WebSocket from "ws";
 import {
   mkdtemp,
   mkdir,
@@ -30,16 +33,25 @@ import path from "node:path";
 import argon2 from "argon2";
 import * as OTPAuth from "otpauth";
 import { disconnectAccount } from "../src/server/accounts";
-import { claim, active } from "../src/server/worker";
+import * as runtimeModule from "../src/server/runtime";
+import * as gitModule from "../src/server/git";
+import { outputStorage, GB } from "../src/server/output-storage";
+import { claim, active, runJob } from "../src/server/worker";
 import { concurrentTasks } from "../src/server/settings";
+import {
+  createWorkspace,
+  chatWorkspace,
+  workspacePath,
+} from "../src/server/workspaces";
+import { acquireFolder, releaseFolder } from "../src/server/leases";
 import { acquireWorkspace, releaseWorkspace } from "../src/server/leases";
 import { event } from "../src/server/events";
 import { config } from "../src/server/config";
 import { db, migrate } from "../src/server/db";
 import { createApp } from "../src/server/app";
-import { docker } from "../src/server/runtime";
+import { docker, launch, type Running } from "../src/server/runtime";
 import { initializeWorkspace, projectToken } from "../src/server/git";
-import { hash, seal } from "../src/server/security";
+import { hash, seal, unseal } from "../src/server/security";
 const enabled = process.env.INTEGRATION_TESTS === "1";
 describe.skipIf(!enabled)("PostgreSQL API integration", () => {
   let app: Awaited<ReturnType<typeof createApp>>,
@@ -49,6 +61,17 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
   const token = "test-session-token",
     origin = "http://localhost:5173";
   const headers = { origin, cookie: "session=" + token };
+  async function openTerminal() {
+    // Exercise the real close handshake: injectWS uses paired in-memory streams
+    // whose server-side close may wait for the WebSocket timeout.
+    if (!app.server.listening)
+      await app.listen({ host: "127.0.0.1", port: 0 });
+    const address = app.server.address();
+    if (!address || typeof address === "string") throw new Error("No test port");
+    const socket = new WebSocket(`ws://127.0.0.1:${address.port}/api/chats/${chat}/terminal`, { headers });
+    await once(socket, "open");
+    return socket;
+  }
   beforeAll(async () => {
     if (!config.database.includes("54329"))
       throw new Error(
@@ -64,8 +87,9 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
   beforeEach(async () => {
     config.maxConcurrent = 3;
     await db.query(
-      "TRUNCATE workspace_leases,publications,push_subscriptions,approvals,events,jobs,attachments,messages,chats,accounts,projects,sessions,owner,settings CASCADE",
+      "TRUNCATE ssh_links,ssh_servers,ssh_keys,workspaces,workspace_leases,publications,push_subscriptions,approvals,events,jobs,attachments,messages,chats,accounts,projects,sessions,owner,settings CASCADE",
     );
+    await db.query("UPDATE output_storage SET limit_bytes=$1 WHERE id=1", [GB]);
     await db.query("INSERT INTO sessions VALUES($1,now()+interval '1 hour')", [
       hash(token),
     ]);
@@ -81,10 +105,767 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
       "INSERT INTO accounts(id,name,provider,status) VALUES($1,'A','codex','ready')",
       [account],
     );
+    await createWorkspace(project, "main", "Main folder", db, chat);
     await db.query(
-      "INSERT INTO chats(id,project_id,title,provider,account_id,branch) VALUES($1,$2,'Test','codex',$3,'workspace/test')",
+      "UPDATE workspaces SET branch='workspace/test' WHERE id=$1",
+      [chat],
+    );
+    await db.query(
+      "INSERT INTO chats(id,project_id,workspace_id,title,provider,account_id,branch) VALUES($1,$2,$1,'Test','codex',$3,'workspace/test')",
       [chat, project, account],
     );
+  });
+
+  it("stores SSH secrets encrypted, controls inheritance and blocks access changes while busy", async () => {
+    const pub =
+      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB";
+    const mock = vi
+      .spyOn(sshRuntime, "sshOperation")
+      .mockImplementation(async (input: any) => {
+        if (input.operation === "scan") return [pub];
+        if (input.operation === "test")
+          return { ok: true, message: "Connected successfully." };
+        return {
+          private_key: "PRIVATE_TEST_SECRET",
+          public_key: pub,
+          fingerprint: "SHA256:test",
+        };
+      });
+    try {
+      const call = (method: any, url: string, payload?: any) =>
+        app.inject({
+          method,
+          url: "/api" + url,
+          headers,
+          ...(payload !== undefined ? { payload } : {}),
+        });
+      const project = (
+        await db.query("SELECT project_id FROM chats WHERE id=$1", [chat])
+      ).rows[0].project_id;
+      const keyResponse = await call("POST", "/ssh-keys", {
+        name: "Deploy",
+        operation: "import",
+        private_key: "PRIVATE_TEST_SECRET",
+        passphrase: "secret",
+      });
+      expect(keyResponse.statusCode).toBe(200);
+      const key = keyResponse.json();
+      expect(keyResponse.body).not.toContain("PRIVATE_TEST_SECRET");
+      const stored = (
+        await db.query("SELECT private_key FROM ssh_keys WHERE id=$1", [key.id])
+      ).rows[0].private_key;
+      expect(stored).not.toContain("PRIVATE_TEST_SECRET");
+      expect(unseal(stored)).toBe("PRIVATE_TEST_SECRET");
+      const fields = {
+        name: "VPS",
+        alias: "production",
+        host: "example.test",
+        port: 2222,
+        username: "deploy",
+        key_id: key.id,
+      };
+      const response = await call("POST", "/servers", fields);
+      expect(response.statusCode).toBe(200);
+      const server = response.json();
+      expect(
+        (await call("POST", `/servers/${server.id}/test`, {})).statusCode,
+      ).toBe(409);
+      const scan = (
+        await call("POST", `/servers/${server.id}/scan`, {})
+      ).json();
+      expect(
+        (
+          await call("POST", `/servers/${server.id}/trust`, {
+            token: randomUUID(),
+          })
+        ).statusCode,
+      ).toBe(409);
+      expect(
+        (
+          await call("POST", `/servers/${server.id}/trust`, {
+            token: scan.token,
+          })
+        ).statusCode,
+      ).toBe(200);
+      expect(
+        (await call("POST", `/servers/${server.id}/test`, {})).json().ok,
+      ).toBe(true);
+      expect(
+        (
+          await call("PUT", `/projects/${project}/servers`, {
+            server_ids: [server.id],
+          })
+        ).statusCode,
+      ).toBe(200);
+      expect((await call("GET", `/chats/${chat}/servers`)).json()).toEqual({
+        inherited: true,
+        server_ids: [server.id],
+      });
+      expect(
+        (await call("PUT", `/chats/${chat}/servers`, { server_ids: [] }))
+          .statusCode,
+      ).toBe(409);
+      expect((await sshRuntime.chatServers(chat)).map((s) => s.id)).toEqual([
+        server.id,
+      ]);
+      expect((await call("DELETE", `/ssh-keys/${key.id}`)).statusCode).toBe(
+        409,
+      );
+      await acquireWorkspace(chat, "terminal");
+      expect((await call("DELETE", `/servers/${server.id}`)).statusCode).toBe(
+        409,
+      );
+      expect(
+        (await call("PATCH", `/servers/${server.id}`, fields)).statusCode,
+      ).toBe(409);
+      expect(
+        (await call("PUT", `/projects/${project}/servers`, { server_ids: [] }))
+          .statusCode,
+      ).toBe(409);
+      await releaseWorkspace(chat);
+      const personal = randomUUID();
+      await createWorkspace(null, "personal", "Personal", db, personal);
+      await db.query(
+        "INSERT INTO chats(id,workspace_id,title,provider,branch) VALUES($1,$1,'Personal','codex','main')",
+        [personal],
+      );
+      await acquireWorkspace(chat, "terminal");
+      // Assignments in an unrelated idle scope may change even when this server
+      // is being used elsewhere; the shared server definition stays protected.
+      expect(
+        (
+          await call("PUT", `/chats/${personal}/servers`, {
+            server_ids: [server.id],
+          })
+        ).statusCode,
+      ).toBe(200);
+      expect((await call("GET", `/chats/${personal}/servers`)).json()).toEqual({
+        inherited: false,
+        server_ids: [server.id],
+      });
+      await releaseWorkspace(chat);
+      const messageId = randomUUID(),
+        jobId = randomUUID();
+      await db.query(
+        "INSERT INTO messages(id,chat_id,role,content) VALUES($1,$2,'user','test')",
+        [messageId, chat],
+      );
+      await db.query(
+        "INSERT INTO jobs(id,chat_id,message_id,state) VALUES($1,$2,$3,'queued')",
+        [jobId, chat, messageId],
+      );
+      for (const state of [
+        "queued",
+        "running",
+        "waiting_approval",
+        "waiting_account",
+      ]) {
+        await db.query("UPDATE jobs SET state=$2 WHERE id=$1", [jobId, state]);
+        expect(
+          (
+            await call("PUT", `/projects/${project}/servers`, {
+              server_ids: [],
+            })
+          ).statusCode,
+        ).toBe(409);
+        expect((await call("DELETE", `/servers/${server.id}`)).statusCode).toBe(
+          409,
+        );
+      }
+      await db.query("DELETE FROM jobs WHERE id=$1", [jobId]);
+      let finishScan!: (keys: string[]) => void;
+      mock.mockImplementationOnce(
+        async () =>
+          new Promise<string[]>((r) => {
+            finishScan = r;
+          }),
+      );
+      const scanning = call("POST", `/servers/${server.id}/scan`, {});
+      // inject begins processing when awaited/then'ed.
+      const inFlight = scanning.then((r) => r);
+      await vi.waitFor(() => expect(finishScan).toBeTypeOf("function"));
+      try {
+        expect((await call("DELETE", `/servers/${server.id}`)).statusCode).toBe(
+          409,
+        );
+      } finally {
+        finishScan([pub]);
+        await inFlight;
+      }
+      expect(
+        (
+          await call("PATCH", `/servers/${server.id}`, {
+            ...fields,
+            host: "new.example.test",
+          })
+        ).statusCode,
+      ).toBe(200);
+      expect((await call("GET", "/servers")).json()[0].host_keys).toEqual([]);
+      expect((await call("DELETE", `/servers/${server.id}`)).statusCode).toBe(
+        200,
+      );
+      expect(
+        (await call("GET", `/chats/${chat}/servers`)).json().server_ids,
+      ).toEqual([]);
+      expect((await call("DELETE", `/ssh-keys/${key.id}`)).statusCode).toBe(
+        200,
+      );
+      expect((await call("GET", "/ssh-keys")).json()).toEqual([]);
+    } finally {
+      mock.mockRestore();
+    }
+  });
+
+  it.skipIf(process.env.SSH_DOCKER_TESTS !== "1")(
+    "provides SSH only to assigned runtime and terminal sessions, and removes brokers on stop",
+    async () => {
+      const key = await sshRuntime.sshOperation({ operation: "generate" });
+      const keyId = randomUUID(),
+        serverId = randomUUID();
+      const project = (
+        await db.query("SELECT project_id FROM chats WHERE id=$1", [chat])
+      ).rows[0].project_id;
+      await db.query(
+        "INSERT INTO ssh_keys(id,name,private_key,public_key,fingerprint) VALUES($1,'Test',$2,$3,$4)",
+        [keyId, seal(key.private_key), key.public_key, key.fingerprint],
+      );
+      await db.query(
+        "INSERT INTO ssh_servers(id,name,alias,host,port,username,key_id,host_keys) VALUES($1,'Test','assigned','127.0.0.1',2222,'tester',$2,$3)",
+        [serverId, keyId, JSON.stringify([key.public_key])],
+      );
+      await db.query(
+        "INSERT INTO ssh_links(id,project_id,server_id) VALUES($1,$2,$3)",
+        [randomUUID(), project, serverId],
+      );
+      const runCheck = async (r: Running, expected: boolean) => {
+        const c = docker.getContainer(r.id);
+        const check = await c.exec({
+          Cmd: [
+            "sh",
+            "-c",
+            expected
+              ? "test -S /run/workspace-ssh/agent.sock && test ! -e /private/key && test ! -e /profile/.ssh/id_ed25519"
+              : "test ! -e /run/workspace-ssh/agent.sock",
+          ],
+          AttachStdout: true,
+          AttachStderr: true,
+        });
+        const stream = await check.start({ hijack: true, stdin: false });
+        for await (const _ of stream) {
+          /* discard test command output */
+        }
+        expect((await check.inspect()).ExitCode).toBe(0);
+      };
+      let run: Running | undefined;
+      try {
+        const create = vi
+          .spyOn(docker, "createContainer")
+          .mockRejectedValueOnce(
+            new Error("simulated runner creation failure"),
+          );
+        try {
+          await expect(launch(chat, account, () => {})).rejects.toThrow(
+            "simulated runner creation failure",
+          );
+        } finally {
+          create.mockRestore();
+        }
+        expect(
+          (
+            await docker.listVolumes({
+              filters: JSON.stringify({
+                label: [
+                  "ai.workspace.ssh=true",
+                  "ai.workspace.instance=" + config.data,
+                ],
+              }),
+            })
+          ).Volumes,
+        ).toHaveLength(0);
+        run = await launch(chat, account, () => {});
+        await runCheck(run, true);
+        await run.stop();
+        run = undefined;
+        run = await launch(chat, null, () => {});
+        await runCheck(run, true);
+        await run.stop();
+        run = undefined;
+        const personal = randomUUID();
+        await createWorkspace(null, "personal", "Personal", db, personal);
+        await db.query(
+          "INSERT INTO chats(id,workspace_id,title,provider,account_id,branch) VALUES($1,$1,'Personal','codex',$2,'main')",
+          [personal, account],
+        );
+        run = await launch(personal, account, () => {});
+        await runCheck(run, false);
+        await run.stop();
+        run = undefined;
+        run = await launch(null, account, () => {});
+        await runCheck(run, false);
+        await run.stop();
+        run = undefined;
+        expect(
+          (
+            await docker.listVolumes({
+              filters: JSON.stringify({
+                label: [
+                  "ai.workspace.ssh=true",
+                  "ai.workspace.instance=" + config.data,
+                ],
+              }),
+            })
+          ).Volumes,
+        ).toHaveLength(0);
+      } finally {
+        await run?.stop();
+      }
+    },
+    60000,
+  );
+  it.each(["failed", "exit", "interrupted"])(
+    "closes the terminal and releases its folder after a %s event",
+    async (type) => {
+      vi.spyOn(gitModule, "initializeWorkspace").mockResolvedValue();
+      let emit!: (event: any) => void | Promise<void>;
+      const stopped = vi.fn(async () => {});
+      const launched = vi
+        .spyOn(runtimeModule, "launch")
+        .mockImplementation(async (_chat, _account, onEvent) => {
+          emit = onEvent;
+          return { id: "terminal-fixture", send() {}, stop: stopped };
+        });
+      const socket = await openTerminal();
+      const received: any[] = [];
+      socket.on("message", (raw) => received.push(JSON.parse(raw.toString())));
+      try {
+        await vi.waitFor(() => expect(launched).toHaveBeenCalled());
+        await emit({ type, error: "SSH access stopped unexpectedly." });
+        await vi.waitFor(async () => {
+          expect(socket.readyState).toBe(3);
+          expect(
+            (
+              await db.query(
+                "SELECT 1 FROM workspace_leases WHERE chat_id=$1",
+                [chat],
+              )
+            ).rowCount,
+          ).toBe(0);
+        });
+        expect(stopped).toHaveBeenCalledTimes(1);
+        if (type === "failed")
+          expect(received).toContainEqual({
+            type: "terminal",
+            data: "\r\nSSH access stopped unexpectedly.\r\n",
+          });
+        // Opening the same terminal again also verifies removal from the registry.
+        const reopened = await openTerminal();
+        try {
+          await vi.waitFor(() => expect(launched).toHaveBeenCalledTimes(2));
+        } finally {
+          reopened.close();
+          await vi.waitFor(() => expect(stopped).toHaveBeenCalledTimes(2));
+          await vi.waitFor(async () =>
+            expect(
+              (
+                await db.query(
+                  "SELECT 1 FROM workspace_leases WHERE chat_id=$1",
+                  [chat],
+                )
+              ).rowCount,
+            ).toBe(0),
+          );
+        }
+      } finally {
+        socket.close();
+        vi.restoreAllMocks();
+      }
+    },
+  );
+
+  it("keeps the terminal lease until a launch pending at disconnect has been stopped", async () => {
+    vi.spyOn(gitModule, "initializeWorkspace").mockResolvedValue();
+    let complete!: (runtime: Running) => void;
+    const stopped = vi.fn(async () => {});
+    vi.spyOn(runtimeModule, "launch").mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          complete = resolve;
+        }),
+    );
+    const socket = await openTerminal();
+    try {
+      await vi.waitFor(() => expect(complete).toBeTypeOf("function"));
+      socket.close();
+      await vi.waitFor(() => expect(socket.readyState).toBe(3));
+      expect(
+        (
+          await db.query("SELECT 1 FROM workspace_leases WHERE chat_id=$1", [
+            chat,
+          ])
+        ).rowCount,
+      ).toBe(1);
+      complete({ id: "delayed-terminal", send() {}, stop: stopped });
+      await vi.waitFor(async () =>
+        expect(
+          (
+            await db.query("SELECT 1 FROM workspace_leases WHERE chat_id=$1", [
+              chat,
+            ])
+          ).rowCount,
+        ).toBe(0),
+      );
+      expect(stopped).toHaveBeenCalledTimes(1);
+    } finally {
+      complete?.({ id: "delayed-terminal", send() {}, stop: stopped });
+      socket.close();
+      vi.restoreAllMocks();
+    }
+  });
+
+  it.skipIf(process.env.SSH_DOCKER_TESTS !== "1")(
+    "closes a terminal after its SSH broker crashes and removes the socket volume",
+    async () => {
+      const key = await sshRuntime.sshOperation({ operation: "generate" });
+      const keyId = randomUUID(),
+        serverId = randomUUID();
+      await db.query(
+        "INSERT INTO ssh_keys(id,name,private_key,public_key,fingerprint) VALUES($1,'Test',$2,$3,$4)",
+        [keyId, seal(key.private_key), key.public_key, key.fingerprint],
+      );
+      await db.query(
+        "INSERT INTO ssh_servers(id,name,alias,host,port,username,key_id,host_keys) VALUES($1,'Test','assigned','127.0.0.1',2222,'tester',$2,$3)",
+        [serverId, keyId, JSON.stringify([key.public_key])],
+      );
+      await db.query(
+        "INSERT INTO ssh_links(id,chat_id,server_id) VALUES($1,$2,$3)",
+        [randomUUID(), chat, serverId],
+      );
+      // No repository checkout or external SSH destination is needed.
+      vi.spyOn(gitModule, "initializeWorkspace").mockResolvedValue();
+      const filters = JSON.stringify({
+        label: [
+          "ai.workspace.ssh=true",
+          "ai.workspace.instance=" + config.data,
+        ],
+      });
+      const socket = await openTerminal();
+      const received: any[] = [];
+      socket.on("message", (raw) => received.push(JSON.parse(raw.toString())));
+      try {
+        await vi.waitFor(
+          () => expect(received.some((e) => e.type === "terminal")).toBe(true),
+          { timeout: 15000 },
+        );
+        const brokers = await docker.listContainers({ filters });
+        expect(brokers).toHaveLength(1);
+        await docker.getContainer(brokers[0].Id).remove({ force: true });
+        await vi.waitFor(
+          async () => {
+            expect(socket.readyState).toBe(3);
+            expect(
+              (
+                await db.query(
+                  "SELECT 1 FROM workspace_leases WHERE chat_id=$1",
+                  [chat],
+                )
+              ).rowCount,
+            ).toBe(0);
+            expect(
+              (await docker.listVolumes({ filters })).Volumes,
+            ).toHaveLength(0);
+          },
+          { timeout: 15000 },
+        );
+        expect(
+          received.some(
+            (e) =>
+              e.type === "terminal" &&
+              e.data.includes("SSH access stopped unexpectedly"),
+          ),
+        ).toBe(true);
+        await acquireWorkspace(chat, "terminal");
+        await releaseWorkspace(chat);
+      } finally {
+        socket.close();
+        vi.restoreAllMocks();
+      }
+    },
+    30000,
+  );
+
+  it("persists a shared GB budget and preserves history when the limit is lowered", async () => {
+    const save = (limitGb: number) =>
+      app.inject({
+        method: "POST",
+        url: "/api/settings/output",
+        headers,
+        payload: { limitGb },
+      });
+    for (const value of [0, -1, 0.001, 10001])
+      expect((await save(value)).statusCode).toBe(400);
+    expect((await save(0.02)).json().limitBytes).toBe(20_000_000);
+    await db.query(
+      "INSERT INTO messages(id,chat_id,role,content) VALUES($1,$2,'assistant',$3)",
+      [randomUUID(), chat, "a".repeat(11_000_000)],
+    );
+    expect((await save(0.01)).statusCode).toBe(200);
+    const before = await outputStorage();
+    expect(before.usedBytes).toBeGreaterThan(before.limitBytes);
+    await expect(
+      event(chat, null, "log", { text: "blocked" }),
+    ).rejects.toMatchObject({ code: "P5401" });
+    await migrate();
+    expect(await outputStorage()).toEqual(before);
+    await db.query("DELETE FROM messages WHERE chat_id=$1", [chat]);
+    expect((await outputStorage()).usedBytes).toBe(0);
+    await expect(
+      event(chat, null, "log", { text: "room again" }),
+    ).resolves.toBeTruthy();
+  });
+  it("enforces atomic shared reservations and releases bytes after rollback and deletion", async () => {
+    await db.query("UPDATE output_storage SET limit_bytes=1000 WHERE id=1");
+    const writes = await Promise.allSettled(
+      Array.from({ length: 12 }, () =>
+        db.query("INSERT INTO events(chat_id,type,data) VALUES($1,'log',$2)", [
+          chat,
+          JSON.stringify({ text: "Привіт".repeat(20) }),
+        ]),
+      ),
+    );
+    expect(writes.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+    expect(writes.filter((r) => r.status === "rejected")).toHaveLength(11);
+    const usage = await outputStorage();
+    expect(usage.usedBytes).toBeLessThanOrEqual(1000);
+    expect(
+      Number((await db.query("SELECT output_total_bytes() n")).rows[0].n),
+    ).toBe(usage.usedBytes);
+    // User messages do not consume the agent-output budget.
+    await db.query(
+      "INSERT INTO messages(id,chat_id,role,content) VALUES($1,$2,'user',$3)",
+      [randomUUID(), chat, "user text".repeat(1000)],
+    );
+    expect((await outputStorage()).usedBytes).toBe(usage.usedBytes);
+    await db.query("DELETE FROM events WHERE chat_id=$1", [chat]);
+    expect((await outputStorage()).usedBytes).toBe(0);
+    const message = randomUUID();
+    await db.query(
+      "INSERT INTO messages(id,chat_id,role,content) VALUES($1,$2,'assistant','saved')",
+      [message, chat],
+    );
+    const saved = await outputStorage();
+    await db.query(
+      "INSERT INTO messages(id,chat_id,role,content) VALUES($1,$2,'assistant','duplicate') ON CONFLICT(id) DO NOTHING",
+      [message, chat],
+    );
+    expect(await outputStorage()).toEqual(saved);
+  });
+  async function fakeJob() {
+    const message = randomUUID(),
+      id = randomUUID();
+    await db.query(
+      "INSERT INTO messages(id,chat_id,role,content) VALUES($1,$2,'user','work')",
+      [message, chat],
+    );
+    const job = (
+      await db.query(
+        "INSERT INTO jobs(id,chat_id,message_id,account_id,state) VALUES($1,$2,$3,$4,'running') RETURNING *",
+        [id, chat, message, account],
+      )
+    ).rows[0];
+    let emit!: (e: any) => void | Promise<void>;
+    const runtime = {
+      id: "fake-runner",
+      send: vi.fn(),
+      stop: vi.fn(async () => {}),
+    };
+    vi.spyOn(gitModule, "initializeWorkspace").mockResolvedValue(undefined);
+    vi.spyOn(runtimeModule, "launch").mockImplementation(
+      async (_chat, _account, handler) => {
+        emit = handler;
+        return runtime;
+      },
+    );
+    await runJob(job);
+    return { job, runtime, emit };
+  }
+  it("stores complete correlated approval details for reload and rejects blind approval", async () => {
+    const { job, runtime, emit } = await fakeJob();
+    try {
+      const details = {
+        tool: "Bash",
+        input: { command: "printf safe", cwd: "/workspace" },
+      };
+      await emit({
+        type: "approval",
+        id: "native-a",
+        description: "Run command",
+        details,
+      });
+      await emit({
+        type: "approval",
+        id: "native-b",
+        description: "Run command",
+        details: { ...details, input: { command: "rm important.txt" } },
+      });
+      const pending = (
+        await app.inject({ url: `/api/chats/${chat}`, headers })
+      ).json().approvals;
+      expect(pending).toHaveLength(2);
+      const first = pending.find((a: any) => a.request_id === "native-a");
+      expect(first.details).toEqual(details);
+      expect(
+        (
+          await app.inject({
+            method: "POST",
+            url: `/api/approvals/${first.id}`,
+            headers,
+            payload: { allow: true },
+          })
+        ).statusCode,
+      ).toBe(200);
+      expect(runtime.send).toHaveBeenLastCalledWith({
+        type: "approve",
+        id: "native-a",
+        allow: true,
+      });
+      await emit({
+        type: "approval",
+        id: "legacy",
+        description: "Missing arguments",
+      });
+      const legacy = (
+        await db.query("SELECT id FROM approvals WHERE request_id='legacy'")
+      ).rows[0];
+      expect(
+        (
+          await app.inject({
+            method: "POST",
+            url: `/api/approvals/${legacy.id}`,
+            headers,
+            payload: { allow: true },
+          })
+        ).statusCode,
+      ).toBe(409);
+      expect(
+        (
+          await app.inject({
+            method: "POST",
+            url: `/api/approvals/${legacy.id}`,
+            headers,
+            payload: { allow: false },
+          })
+        ).statusCode,
+      ).toBe(200);
+      await emit({ type: "completed" });
+      expect(
+        (
+          await db.query(
+            "SELECT decision FROM approvals WHERE job_id=$1 AND request_id='native-b'",
+            [job.id],
+          )
+        ).rows[0].decision,
+      ).toBe(false);
+    } finally {
+      active.delete(job.id);
+      vi.restoreAllMocks();
+    }
+  });
+  it.each([false, true])(
+    "stops output at capacity and preserves text/denies requests (lowered limit: %s)",
+    async (lowered) => {
+      const { job, runtime, emit } = await fakeJob();
+      try {
+        await emit({ type: "delta", text: "Already saved answer" });
+        await emit({
+          type: "approval",
+          id: "request",
+          description: "Run",
+          details: { command: "ls" },
+        });
+        const before = await outputStorage();
+        await db.query("UPDATE output_storage SET limit_bytes=$1 WHERE id=1", [
+          lowered ? 1 : before.usedBytes + 10,
+        ]);
+        await emit({ type: "log", text: "x".repeat(1000) });
+        const state = (
+          await db.query(
+            "SELECT state,error,container_id FROM jobs WHERE id=$1",
+            [job.id],
+          )
+        ).rows[0];
+        expect(state.state).toBe("failed");
+        expect(state.error).toContain("output limit reached");
+        expect(state.container_id).toBeNull();
+        expect(runtime.stop).toHaveBeenCalledTimes(1);
+        expect(active.has(job.id)).toBe(false);
+        expect(
+          (
+            await db.query(
+              "SELECT content FROM messages WHERE chat_id=$1 AND role='assistant'",
+              [chat],
+            )
+          ).rows[0].content,
+        ).toBe("Already saved answer");
+        expect(
+          (
+            await db.query("SELECT decision FROM approvals WHERE job_id=$1", [
+              job.id,
+            ])
+          ).rows[0].decision,
+        ).toBe(false);
+        expect((await outputStorage()).usedBytes).toBeLessThanOrEqual(
+          before.usedBytes + 10,
+        );
+        expect((await outputStorage()).limitBytes).toBe(
+          lowered ? 1 : before.usedBytes + 10,
+        );
+        await emit({ type: "delta", text: "ignored after stop" });
+        expect(
+          (
+            await db.query(
+              "SELECT count(*) n FROM events WHERE data->>'text'='ignored after stop'",
+            )
+          ).rows[0].n,
+        ).toBe("0");
+      } finally {
+        active.delete(job.id);
+        vi.restoreAllMocks();
+      }
+    },
+  );
+  it("caps the accumulated response by UTF-8 bytes and keeps the accepted portion", async () => {
+    const { job, runtime, emit } = await fakeJob();
+    try {
+      const fragment = "😀".repeat(65536);
+      for (let n = 0; n < 16; n++)
+        await emit({ type: "delta", text: fragment });
+      await emit({ type: "delta", text: "one byte too many" });
+      const state = (
+        await db.query("SELECT state,error FROM jobs WHERE id=$1", [job.id])
+      ).rows[0];
+      expect(state.state).toBe("failed");
+      expect(state.error).toContain("4 MiB");
+      expect(runtime.stop).toHaveBeenCalledTimes(1);
+      const saved = (
+        await db.query(
+          "SELECT content FROM messages WHERE chat_id=$1 AND role='assistant'",
+          [chat],
+        )
+      ).rows[0].content;
+      expect(Buffer.byteLength(saved)).toBe(4 * 1024 * 1024);
+      expect(saved).toBe(fragment.repeat(16));
+      expect(
+        (
+          await db.query(
+            "SELECT count(*) n FROM events WHERE job_id=$1 AND type='delta'",
+            [job.id],
+          )
+        ).rows[0].n,
+      ).toBe("0");
+    } finally {
+      active.delete(job.id);
+      vi.restoreAllMocks();
+    }
   });
   it("changes chat model and effort without changing title, permissions or global defaults", async () => {
     await db.query(
@@ -141,6 +922,36 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
     expect(
       (await update({ model: "new-model", effort: "low" })).statusCode,
     ).toBe(409);
+  });
+  it("switches approval modes independently of other chat settings", async () => {
+    const before = (await db.query("SELECT * FROM chats WHERE id=$1", [chat]))
+      .rows[0];
+    const update = (autonomous: unknown, id = chat) =>
+      app.inject({
+        method: "PATCH",
+        url: `/api/chats/${id}/permissions`,
+        headers,
+        payload: { autonomous },
+      });
+    for (const autonomous of [true, false]) {
+      expect((await update(autonomous)).statusCode).toBe(200);
+      expect(
+        (await db.query("SELECT * FROM chats WHERE id=$1", [chat])).rows[0],
+      ).toEqual({ ...before, autonomous });
+    }
+    expect((await update("true")).statusCode).toBe(400);
+    expect((await update(true, randomUUID())).statusCode).toBe(404);
+    await app.inject({
+      method: "POST",
+      url: `/api/chats/${chat}/messages`,
+      headers,
+      payload: { content: "Task", client_id: randomUUID() },
+    });
+    expect((await update(true)).statusCode).toBe(409);
+    expect(
+      (await db.query("SELECT autonomous FROM chats WHERE id=$1", [chat]))
+        .rows[0].autonomous,
+    ).toBe(false);
   });
   it("applies global model defaults only to new chats and respects per-chat overrides", async () => {
     expect(
@@ -274,7 +1085,7 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
       ).statusCode,
     ).toBe(404);
   });
-  it("deletes chat history and private files while preserving shared folders and account", async () => {
+  it("deletes chat history while preserving working folders, original attachments and account", async () => {
     const mid = randomUUID(),
       jid = randomUUID();
     const project = (
@@ -299,7 +1110,7 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
     );
     const storage = randomUUID() + "-upload.txt";
     await db.query(
-      "INSERT INTO attachments(id,chat_id,message_id,name,mime,size,storage_name,client_id) VALUES($1,$2,$3,'upload.txt','text/plain',4,$4,$5)",
+      "INSERT INTO attachments(id,chat_id,workspace_id,message_id,name,mime,size,storage_name,client_id) VALUES($1,$2,$2,$3,'upload.txt','text/plain',4,$4,$5)",
       [randomUUID(), chat, mid, storage, randomUUID()],
     );
     await db.query(
@@ -332,7 +1143,6 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
       "chats",
       "jobs",
       "messages",
-      "attachments",
       "approvals",
       "events",
       "publications",
@@ -343,8 +1153,30 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
     expect((await db.query("SELECT name FROM folder_links")).rows).toEqual([
       { name: "keep-project" },
     ]);
-    await expect(access(path.join(data, "workspaces", chat))).rejects.toThrow();
-    await expect(access(path.join(data, "uploads", storage))).rejects.toThrow();
+    expect(
+      (
+        await db.query(
+          "SELECT chat_id,message_id,workspace_id FROM attachments",
+        )
+      ).rows,
+    ).toEqual([{ chat_id: null, message_id: null, workspace_id: chat }]);
+    expect((await db.query("SELECT id FROM workspaces")).rows).toEqual([
+      { id: chat },
+    ]);
+    expect(
+      await readFile(
+        path.join(data, "workspaces", chat, "private.txt"),
+        "utf8",
+      ),
+    ).toBe("private");
+    expect(await readFile(path.join(data, "uploads", storage), "utf8")).toBe(
+      "file",
+    );
+    const library = (
+      await app.inject({ url: `/api/workspaces/${chat}/attachments`, headers })
+    ).json();
+    expect(library).toHaveLength(1);
+    expect(library[0].chat_title).toBeNull();
     await access(path.join(data, "shared", "keep-shared"));
     expect(
       (
@@ -830,6 +1662,12 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
       "INSERT INTO accounts(id,name,provider,status) VALUES($1,'B','codex','ready')",
       [account2],
     );
+    const separateFolder = await createWorkspace(
+      project,
+      "saved",
+      "Other folder",
+      db,
+    );
     const second = (
       await app.inject({
         method: "POST",
@@ -837,6 +1675,7 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
         headers,
         payload: {
           project_id: project,
+          workspace_id: separateFolder.id,
           provider: "codex",
           account_id: account2,
         },
@@ -961,6 +1800,455 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
       ).rejects.toThrow();
     },
   );
+  it("migrates legacy folders in place and requires an explicit main-folder choice", async () => {
+    const project = (
+      await db.query("SELECT project_id FROM chats WHERE id=$1", [chat])
+    ).rows[0].project_id;
+    const folder = workspacePath(chat);
+    await mkdir(path.join(folder, ".workspace-attachments"), {
+      recursive: true,
+    });
+    await mkdir(folder + ".initializing", { recursive: true });
+    const files = ["uncommitted.txt", ".workspace-attachments/original.txt"];
+    for (const f of files) await writeFile(path.join(folder, f), "keep " + f);
+    await writeFile(
+      path.join(folder + ".initializing", "partial.txt"),
+      "keep partial clone",
+    );
+    const originalId = randomUUID(),
+      storage = originalId + "-original.txt";
+    await mkdir(path.join(data, "uploads"), { recursive: true });
+    await writeFile(path.join(data, "uploads", storage), "original upload");
+    await db.query(
+      "INSERT INTO attachments(id,chat_id,workspace_id,name,mime,size,storage_name,client_id) VALUES($1,$2,$2,'original.txt','text/plain',15,$3,$4)",
+      [originalId, chat, storage, randomUUID()],
+    );
+    await db.query("UPDATE chats SET initialized=true WHERE id=$1", [chat]);
+    await acquireWorkspace(chat, "terminal");
+    // Simulate the old schema, including an existing terminal lease.
+    await db.query(
+      "ALTER TABLE chats DROP COLUMN workspace_id; ALTER TABLE attachments DROP COLUMN workspace_id; ALTER TABLE workspace_leases DROP COLUMN workspace_id; DELETE FROM workspaces",
+    );
+    await migrate();
+    await migrate();
+    expect(await chatWorkspace(chat)).toMatchObject({
+      id: chat,
+      kind: "saved",
+      name: "Test",
+      initialized: true,
+      branch: "workspace/test",
+    });
+    expect(
+      (await db.query("SELECT workspace_id FROM workspace_leases")).rows,
+    ).toEqual([{ workspace_id: chat }]);
+    for (const f of files)
+      expect(await readFile(path.join(folder, f), "utf8")).toBe("keep " + f);
+    expect(
+      await readFile(
+        path.join(folder + ".initializing", "partial.txt"),
+        "utf8",
+      ),
+    ).toBe("keep partial clone");
+    expect(
+      (
+        await db.query("SELECT workspace_id FROM attachments WHERE id=$1", [
+          originalId,
+        ])
+      ).rows[0].workspace_id,
+    ).toBe(chat);
+    expect(await readFile(path.join(data, "uploads", storage), "utf8")).toBe(
+      "original upload",
+    );
+    const create = () =>
+      app.inject({
+        method: "POST",
+        url: "/api/chats",
+        headers,
+        payload: {
+          project_id: project,
+          provider: "codex",
+          account_id: account,
+        },
+      });
+    expect((await create()).statusCode).toBe(409);
+    const choose = () =>
+      app.inject({
+        method: "POST",
+        url: `/api/projects/${project}/main-workspace`,
+        headers,
+        payload: { workspace_id: chat },
+      });
+    expect((await choose()).statusCode).toBe(409);
+    await releaseWorkspace(chat);
+    expect((await choose()).statusCode).toBe(200);
+    const created = await create();
+    expect(created.statusCode).toBe(200);
+    expect(created.json()).toMatchObject({
+      workspace_id: chat,
+      workspace_kind: "main",
+      initialized: true,
+    });
+    expect((await choose()).statusCode).toBe(409);
+    expect((await db.query("SELECT * FROM workspaces")).rowCount).toBe(1);
+    await migrate();
+    expect((await chatWorkspace(chat)).kind).toBe("main");
+    for (const f of files)
+      expect(await readFile(path.join(folder, f), "utf8")).toBe("keep " + f);
+  });
+  it("refuses to initialize over existing project files", async () => {
+    const folder = workspacePath(chat);
+    await mkdir(folder, { recursive: true });
+    await writeFile(path.join(folder, "unsaved.txt"), "keep my work");
+    await expect(initializeWorkspace({ id: chat })).rejects.toThrow(
+      "already contains files",
+    );
+    expect(await readFile(path.join(folder, "unsaved.txt"), "utf8")).toBe(
+      "keep my work",
+    );
+    expect((await chatWorkspace(chat)).initialized).toBe(false);
+  });
+  it("can start a fresh main folder without changing preserved folders or their chats", async () => {
+    const previous = await chatWorkspace(chat);
+    await db.query("UPDATE workspaces SET kind='saved' WHERE id=$1", [
+      previous.id,
+    ]);
+    await mkdir(workspacePath(previous.id), { recursive: true });
+    await writeFile(
+      path.join(workspacePath(previous.id), "keep.txt"),
+      "unmerged work",
+    );
+    const r = await app.inject({
+      method: "POST",
+      url: `/api/projects/${previous.project_id}/main-workspace`,
+      headers,
+      payload: { workspace_id: null },
+    });
+    expect(r.statusCode).toBe(200);
+    expect(r.json().id).not.toBe(previous.id);
+    expect((await chatWorkspace(chat)).id).toBe(previous.id);
+    expect(
+      await readFile(path.join(workspacePath(previous.id), "keep.txt"), "utf8"),
+    ).toBe("unmerged work");
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/chats",
+      headers,
+      payload: {
+        project_id: previous.project_id,
+        provider: "codex",
+        account_id: account,
+      },
+    });
+    expect(created.json().workspace_id).toBe(r.json().id);
+    const foreign = await createWorkspace(null, "personal", "Unrelated", db);
+    const rejected = await app.inject({
+      method: "POST",
+      url: "/api/chats",
+      headers,
+      payload: {
+        project_id: previous.project_id,
+        workspace_id: foreign.id,
+        provider: "codex",
+        account_id: account,
+      },
+    });
+    expect(rejected.statusCode).toBe(400);
+  });
+  it("serializes tasks and terminals across chats sharing a folder but permits other folders", async () => {
+    const w = await chatWorkspace(chat);
+    const account2 = randomUUID();
+    await db.query(
+      "INSERT INTO accounts(id,name,provider,status) VALUES($1,'Second','codex','ready')",
+      [account2],
+    );
+    const create = async (project_id: string | null) => {
+      const r = await app.inject({
+        method: "POST",
+        url: "/api/chats",
+        headers,
+        payload: { project_id, provider: "codex", account_id: account2 },
+      });
+      expect(r.statusCode).toBe(200);
+      return r.json();
+    };
+    const second = await create(w.project_id);
+    expect(second.workspace_id).toBe(w.id);
+    const separate = await create(null);
+    await acquireWorkspace(chat, "terminal");
+    await expect(acquireWorkspace(second.id, "terminal")).rejects.toThrow(
+      "folder is in use",
+    );
+    await expect(acquireFolder(w.id, "upload")).rejects.toThrow(
+      "folder is in use",
+    );
+    await acquireWorkspace(separate.id, "terminal");
+    await releaseWorkspace(separate.id);
+    await releaseWorkspace(chat);
+    await acquireFolder(w.id, "upload");
+    const queue = async (id: string) => {
+      const r = await app.inject({
+        method: "POST",
+        url: `/api/chats/${id}/messages`,
+        headers,
+        payload: { content: "work", client_id: randomUUID() },
+      });
+      expect(r.statusCode).toBe(200);
+    };
+    await queue(chat);
+    await queue(second.id);
+    expect(await claim()).toBeNull();
+    await releaseFolder(w.id);
+    const claims = (await Promise.all([claim(), claim()])).filter(Boolean);
+    expect(claims).toHaveLength(1);
+    expect(claims[0].chat_id).toBe(chat);
+    await db.query("UPDATE jobs SET state='waiting_approval' WHERE id=$1", [
+      claims[0].id,
+    ]);
+    expect(await claim()).toBeNull();
+    await queue(separate.id);
+    const other = await claim();
+    expect(other.chat_id).toBe(separate.id);
+    await db.query(
+      "UPDATE jobs SET state='completed' WHERE id=ANY($1::uuid[])",
+      [[claims[0].id, other.id]],
+    );
+    expect((await claim()).chat_id).toBe(second.id);
+    expect(
+      (
+        await db.query(
+          "SELECT count(*)::int n FROM messages WHERE chat_id=$1",
+          [second.id],
+        )
+      ).rows[0].n,
+    ).toBe(1);
+  });
+  it("keeps the shared folder accessible after deleting its original and last chat", async () => {
+    const w = await chatWorkspace(chat);
+    await mkdir(workspacePath(w.id), { recursive: true });
+    await writeFile(
+      path.join(workspacePath(w.id), "shared.txt"),
+      "keep forever",
+    );
+    const create = () =>
+      app.inject({
+        method: "POST",
+        url: "/api/chats",
+        headers,
+        payload: {
+          project_id: w.project_id,
+          provider: "codex",
+          account_id: account,
+        },
+      });
+    const second = (await create()).json();
+    for (const id of [chat, second.id]) {
+      expect(
+        (
+          await app.inject({
+            method: "DELETE",
+            url: `/api/chats/${id}`,
+            headers,
+          })
+        ).statusCode,
+      ).toBe(200);
+      expect(
+        await readFile(path.join(workspacePath(w.id), "shared.txt"), "utf8"),
+      ).toBe("keep forever");
+    }
+    const overview = (
+      await app.inject({ url: "/api/overview", headers })
+    ).json();
+    expect(overview.chats).toEqual([]);
+    expect(overview.workspaces).toContainEqual(
+      expect.objectContaining({ id: w.id, kind: "main" }),
+    );
+    expect((await create()).json().workspace_id).toBe(w.id);
+  });
+  it.skipIf(process.env.DOCKER_TESTS !== "1")(
+    "shares uploaded files through both chats and preserves originals on deletion",
+    async () => {
+      const w = await chatWorkspace(chat);
+      // A local prepared folder avoids GitHub or provider calls in this test.
+      await mkdir(workspacePath(w.id), { recursive: true });
+      await db.query("UPDATE workspaces SET initialized=true WHERE id=$1", [
+        w.id,
+      ]);
+      const second = (
+        await app.inject({
+          method: "POST",
+          url: "/api/chats",
+          headers,
+          payload: {
+            project_id: w.project_id,
+            provider: "codex",
+            account_id: account,
+          },
+        })
+      ).json();
+      const uploadFile = (content: string, relative = "phone.txt") =>
+        app.inject({
+          method: "POST",
+          url: `/api/workspaces/${w.id}/files?path=${encodeURIComponent(relative)}`,
+          headers: {
+            ...headers,
+            "content-type": "multipart/form-data; boundary=test-boundary",
+          },
+          payload: `--test-boundary\r\nContent-Disposition: form-data; name="file"; filename="phone.txt"\r\nContent-Type: text/plain\r\n\r\n${content}\r\n--test-boundary--\r\n`,
+        });
+      expect((await uploadFile("from phone")).statusCode).toBe(200);
+      for (const id of [chat, second.id]) {
+        const r = await app.inject({
+          url: `/api/chats/${id}/file?path=phone.txt`,
+          headers,
+        });
+        expect(r.statusCode).toBe(200);
+        expect(r.body).toBe("from phone");
+      }
+      expect((await uploadFile("overwrite")).statusCode).toBe(409);
+      expect(
+        (await uploadFile("original", ".workspace-attachments/new.txt"))
+          .statusCode,
+      ).toBe(400);
+      await acquireWorkspace(second.id, "terminal");
+      expect((await uploadFile("blocked", "another.txt")).statusCode).toBe(409);
+      await releaseWorkspace(second.id);
+      expect((await uploadFile("from phone")).statusCode).toBe(200);
+      expect(
+        (
+          await app.inject({
+            method: "DELETE",
+            url: `/api/chats/${chat}`,
+            headers,
+          })
+        ).statusCode,
+      ).toBe(200);
+      const r = await app.inject({
+        url: `/api/workspaces/${w.id}/file?path=phone.txt`,
+        headers,
+      });
+      expect(r.body).toBe("from phone");
+    },
+    30000,
+  );
+
+  it.skipIf(process.env.DOCKER_TESTS !== "1")(
+    "mounts the shared folder and read-only chat originals without changing legacy files",
+    async () => {
+      const w = await chatWorkspace(chat);
+      await mkdir(path.join(workspacePath(w.id), ".workspace-attachments"), {
+        recursive: true,
+      });
+      await writeFile(
+        path.join(workspacePath(w.id), "shared.txt"),
+        "SHARED_FOLDER_CONTENT",
+      );
+      await writeFile(
+        path.join(workspacePath(w.id), ".workspace-attachments", "keep.txt"),
+        "legacy attachment edits",
+      );
+      const second = (
+        await app.inject({
+          method: "POST",
+          url: "/api/chats",
+          headers,
+          payload: {
+            project_id: w.project_id,
+            provider: "codex",
+            account_id: account,
+          },
+        })
+      ).json();
+      expect(second.id).not.toBe(w.id);
+      const mid = randomUUID(),
+        fid = randomUUID(),
+        storage = fid + "-original.txt";
+      await mkdir(path.join(data, "uploads"), { recursive: true });
+      await writeFile(
+        path.join(data, "uploads", storage),
+        "ORIGINAL_ATTACHMENT",
+      );
+      await db.query(
+        "INSERT INTO messages(id,chat_id,role,content) VALUES($1,$2,'user','Attachment')",
+        [mid, second.id],
+      );
+      await db.query(
+        "INSERT INTO attachments(id,chat_id,workspace_id,message_id,name,mime,size,storage_name,client_id) VALUES($1,$2,$3,$4,'original.txt','text/plain',19,$5,$6)",
+        [fid, second.id, w.id, mid, storage, randomUUID()],
+      );
+      let output = "",
+        done!: () => void;
+      const ready = new Promise<void>((resolve) => {
+        done = resolve;
+      });
+      let runtime: Running | undefined;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      await acquireWorkspace(second.id, "terminal");
+      try {
+        runtime = await launch(second.id, null, (e) => {
+          if (e.type === "terminal") {
+            output += e.data;
+            if (output.includes("MOUNT_CHECK_DONE")) done();
+          }
+        });
+        runtime.send({
+          type: "terminal",
+          data:
+            "cat /workspace/shared.txt; cat /attachments/" +
+            storage +
+            "; node -e \"try{require('fs').writeFileSync('/attachments/" +
+            storage +
+            "','bad');console.log('WRITABLE_ORIGINAL')}catch(e){console.log(e.code)}\"; printf '\\nMOUNT_CHECK_%s\\n' DONE\r",
+        });
+        await Promise.race([
+          ready,
+          new Promise((_, reject) => {
+            timer = setTimeout(
+              () => reject(new Error("Terminal check timed out: " + output)),
+              10000,
+            );
+          }),
+        ]);
+        expect(output).toContain("SHARED_FOLDER_CONTENT");
+        expect(output).toContain("ORIGINAL_ATTACHMENT");
+        expect(output).toMatch(/EROFS|EACCES/);
+        expect(
+          await readFile(path.join(data, "uploads", storage), "utf8"),
+        ).toBe("ORIGINAL_ATTACHMENT");
+        expect(
+          await readFile(
+            path.join(
+              workspacePath(w.id),
+              ".workspace-attachments",
+              "keep.txt",
+            ),
+            "utf8",
+          ),
+        ).toBe("legacy attachment edits");
+      } finally {
+        if (timer) clearTimeout(timer);
+        await runtime?.stop();
+        await releaseWorkspace(second.id);
+      }
+      await db.query("UPDATE workspaces SET initialized=true WHERE id=$1", [
+        w.id,
+      ]);
+      const saved = await app.inject({
+        method: "POST",
+        url: `/api/workspaces/${w.id}/attachments/${fid}/save`,
+        headers,
+        payload: { path: "copied-original.txt" },
+      });
+      expect(saved.statusCode).toBe(200);
+      expect(
+        await readFile(
+          path.join(workspacePath(w.id), "copied-original.txt"),
+          "utf8",
+        ),
+      ).toBe("ORIGINAL_ATTACHMENT");
+    },
+    30000,
+  );
+
   afterAll(async () => {
     await app.close();
     await db.end();
@@ -1369,11 +2657,13 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
           [aid],
         );
       const cid = i === 0 ? chat : randomUUID();
-      if (i !== 0)
+      if (i !== 0) {
+        await createWorkspace(project, "saved", "Parallel", db, cid);
         await db.query(
-          "INSERT INTO chats(id,project_id,title,provider,account_id,branch) VALUES($1,$2,'Parallel','codex',$3,$4)",
+          "INSERT INTO chats(id,project_id,workspace_id,title,provider,account_id,branch) VALUES($1,$2,$1,'Parallel','codex',$3,$4)",
           [cid, project, aid, "workspace/" + cid],
         );
+      }
       await app.inject({
         method: "POST",
         url: `/api/chats/${cid}/messages`,
@@ -1412,8 +2702,9 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
           "INSERT INTO accounts(id,provider,name,status) VALUES($1,'codex','Capacity test','ready')",
           [aid],
         );
+      await createWorkspace(project, "saved", "Capacity test", db, cid);
       await db.query(
-        "INSERT INTO chats(id,project_id,title,provider,account_id,branch) VALUES($1,$2,'Capacity test','codex',$3,$4)",
+        "INSERT INTO chats(id,project_id,workspace_id,title,provider,account_id,branch) VALUES($1,$2,$1,'Capacity test','codex',$3,$4)",
         [cid, project, aid, "workspace/" + cid],
       );
       await db.query(
@@ -1573,5 +2864,693 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
     });
     expect(received.id).toBe(second.id);
     socket.close();
+  });
+  it("removes an account and local credentials while keeping chats, files and history", async () => {
+    await mkdir(path.join(data, "profiles", account), { recursive: true });
+    await writeFile(
+      path.join(data, "profiles", account, "auth"),
+      "test credentials",
+    );
+    await mkdir(workspacePath(chat), { recursive: true });
+    await writeFile(path.join(workspacePath(chat), "kept.txt"), "keep");
+    await db.query(
+      "UPDATE chats SET session_id='old',session_account=$1 WHERE id=$2",
+      [account, chat],
+    );
+    const wrong = await app.inject({
+      method: "DELETE",
+      url: `/api/accounts/${account}`,
+      headers,
+      payload: { name: "wrong" },
+    });
+    expect(wrong.statusCode).toBe(400);
+    const removed = await app.inject({
+      method: "DELETE",
+      url: `/api/accounts/${account}`,
+      headers,
+      payload: { name: "A" },
+    });
+    expect(removed.statusCode).toBe(200);
+    expect(
+      (await db.query("SELECT * FROM accounts WHERE id=$1", [account]))
+        .rowCount,
+    ).toBe(0);
+    const c = (await db.query("SELECT * FROM chats WHERE id=$1", [chat]))
+      .rows[0];
+    expect(c.account_id).toBeNull();
+    expect(c.session_id).toBeNull();
+    expect(
+      await readFile(path.join(workspacePath(chat), "kept.txt"), "utf8"),
+    ).toBe("keep");
+    await expect(
+      access(path.join(data, "profiles", account)),
+    ).rejects.toThrow();
+  });
+  it("blocks account removal during sign-in, inspections and queued work", async () => {
+    for (const status of ["authenticating", "inspecting", "disconnecting"]) {
+      await db.query("UPDATE accounts SET status=$2 WHERE id=$1", [
+        account,
+        status,
+      ]);
+      expect(
+        (
+          await app.inject({
+            method: "DELETE",
+            url: `/api/accounts/${account}`,
+            headers,
+            payload: { name: "A" },
+          })
+        ).statusCode,
+      ).toBe(409);
+    }
+    await db.query("UPDATE accounts SET status='ready' WHERE id=$1", [account]);
+    await app.inject({
+      method: "POST",
+      url: `/api/chats/${chat}/messages`,
+      headers,
+      payload: {
+        content: "queued",
+        client_id: randomUUID(),
+        attachment_ids: [],
+      },
+    });
+    expect(
+      (
+        await app.inject({
+          method: "DELETE",
+          url: `/api/accounts/${account}`,
+          headers,
+          payload: { name: "A" },
+        })
+      ).statusCode,
+    ).toBe(409);
+  });
+  it("protects main and deletes a saved folder with linked chats and originals only after confirmation", async () => {
+    expect(
+      (
+        await app.inject({
+          method: "DELETE",
+          url: `/api/workspaces/${chat}`,
+          headers,
+          payload: { name: "Main folder" },
+        })
+      ).statusCode,
+    ).toBe(409);
+    await db.query(
+      "UPDATE workspaces SET kind='saved',name='Old folder' WHERE id=$1",
+      [chat],
+    );
+    await mkdir(workspacePath(chat), { recursive: true });
+    await writeFile(path.join(workspacePath(chat), "file"), "old");
+    const staging = workspacePath(chat) + ".initializing",
+      original = path.join(data, "uploads", randomUUID() + "-original.txt"),
+      shared = path.join(data, "shared", randomUUID());
+    await mkdir(staging, { recursive: true });
+    await writeFile(path.join(staging, "partial"), "partial");
+    await mkdir(path.dirname(original), { recursive: true });
+    await writeFile(original, "original");
+    await mkdir(shared, { recursive: true });
+    await writeFile(path.join(shared, "external.txt"), "preserve");
+    await (
+      await import("node:fs/promises")
+    ).symlink(shared, path.join(workspacePath(chat), "external-link"));
+    await db.query(
+      "INSERT INTO attachments(id,chat_id,workspace_id,name,mime,size,storage_name,client_id) VALUES($1,$2,$2,'original.txt','text/plain',8,$3,$4)",
+      [randomUUID(), chat, path.basename(original), randomUUID()],
+    );
+    const info = await app.inject({
+      url: `/api/workspaces/${chat}/deletion`,
+      headers,
+    });
+    expect(info.json().chats).toHaveLength(1);
+    expect(info.json().attachments).toBe(1);
+    expect(
+      (
+        await app.inject({
+          method: "DELETE",
+          url: `/api/workspaces/${chat}`,
+          headers,
+          payload: { name: "wrong" },
+        })
+      ).statusCode,
+    ).toBe(409);
+    const deleted = await app.inject({
+      method: "DELETE",
+      url: `/api/workspaces/${chat}`,
+      headers,
+      payload: { name: "Old folder" },
+    });
+    expect(deleted.json()).toEqual({ ok: true, cleanupPending: false });
+    expect(
+      (await db.query("SELECT id FROM chats WHERE id=$1", [chat])).rowCount,
+    ).toBe(0);
+    await expect(access(workspacePath(chat))).rejects.toThrow();
+    await expect(access(staging)).rejects.toThrow();
+    await expect(access(original)).rejects.toThrow();
+    expect(await readFile(path.join(shared, "external.txt"), "utf8")).toBe(
+      "preserve",
+    );
+    expect((await db.query("SELECT id FROM attachments")).rowCount).toBe(0);
+    expect((await db.query("SELECT id FROM projects")).rowCount).toBe(1);
+  });
+  it.skipIf(process.env.DOCKER_TESTS !== "1")(
+    "creates linked worktrees, reviews conflicts, rejects stale transfers and preserves main checkpoints",
+    async () => {
+      const { createCopy, reviewCopy, applyCopy } =
+        await import("../src/server/folder-operations");
+      const { git } = await import("../src/server/git");
+      await mkdir(workspacePath(chat), { recursive: true });
+      const root = workspacePath(chat),
+        original = "one\ntwo\nthree\nfour\nfive\nsix\n";
+      await writeFile(path.join(root, "text.txt"), original);
+      await git(root, ["init", "-b", "workspace/test"]);
+      await git(root, ["add", "."]);
+      await git(root, ["commit", "-m", "initial"]);
+      const head = (await git(root, ["rev-parse", "HEAD"])).trim();
+      await writeFile(path.join(root, "uploaded.pdf"), Buffer.from([0, 1, 2]));
+      await writeFile(path.join(root, ".env"), "do not copy");
+      await writeFile(
+        path.join(root, "text.txt"),
+        original.replace("two", "TWO"),
+      );
+      await db.query("UPDATE workspaces SET initialized=true WHERE id=$1", [
+        chat,
+      ]);
+      const copy = await createCopy(chat, "Parallel work"),
+        cp = workspacePath(copy.id);
+      expect(copy.storage_mode).toBe("worktree");
+      expect(copy.git_source_id).toBe(chat);
+      expect(await readFile(path.join(cp, ".git"), "utf8")).toContain(
+        `/workspace-git/${chat}/worktrees/${copy.id}`,
+      );
+      const sibling = await createCopy(chat, "Other task");
+      expect((await git(cp, ["rev-parse", "--git-common-dir"])).trim()).toBe(
+        (
+          await git(workspacePath(sibling.id), [
+            "rev-parse",
+            "--git-common-dir",
+          ])
+        ).trim(),
+      );
+      expect((await git(cp, ["branch", "--show-current"])).trim()).toBe(
+        copy.branch,
+      );
+      expect(await readFile(path.join(cp, "text.txt"), "utf8")).toContain(
+        "TWO",
+      );
+      expect(await readFile(path.join(cp, "uploaded.pdf"))).toEqual(
+        Buffer.from([0, 1, 2]),
+      );
+      await expect(access(path.join(cp, ".env"))).rejects.toThrow();
+      expect((await git(cp, ["rev-parse", "HEAD^"])).trim()).toBe(head);
+      expect((await git(root, ["rev-parse", "HEAD"])).trim()).toBe(head);
+      await writeFile(
+        path.join(cp, "text.txt"),
+        original.replace("two", "TWO").replace("one", "ONE"),
+      );
+      await writeFile(
+        path.join(root, "text.txt"),
+        original.replace("two", "TWO").replace("six", "SIX"),
+      );
+      let review = await reviewCopy(copy.id);
+      expect(review.changes[0].conflict).toBe(false);
+      await writeFile(path.join(root, "later.txt"), "later");
+      await expect(applyCopy(copy.id, review.id, {})).rejects.toThrow(
+        /Files changed/,
+      );
+      review = await reviewCopy(copy.id);
+      await applyCopy(copy.id, review.id, {});
+      expect(await readFile(path.join(root, "text.txt"), "utf8")).toBe(
+        original
+          .replace("two", "TWO")
+          .replace("one", "ONE")
+          .replace("six", "SIX"),
+      );
+      expect(await readFile(path.join(root, ".env"), "utf8")).toBe(
+        "do not copy",
+      );
+      expect((await git(root, ["rev-parse", "HEAD"])).trim()).toBe(head);
+      expect(
+        await readFile(
+          path.join(data, "workspace-checkpoints", review.id, "text.txt"),
+          "utf8",
+        ),
+      ).not.toContain("ONE");
+      expect((await reviewCopy(copy.id)).changes).toHaveLength(0);
+      await applyCopy(copy.id, review.id, {}); // repeated request is harmless
+      await writeFile(path.join(cp, "uploaded.pdf"), Buffer.from([0, 2]));
+      await writeFile(path.join(root, "uploaded.pdf"), Buffer.from([0, 3]));
+      const conflict = await reviewCopy(copy.id);
+      expect(conflict.changes[0].conflict).toBe(true);
+      await expect(applyCopy(copy.id, conflict.id, {})).rejects.toThrow(
+        /every conflict/,
+      );
+      await applyCopy(copy.id, conflict.id, { "uploaded.pdf": "main" });
+      expect(await readFile(path.join(root, "uploaded.pdf"))).toEqual(
+        Buffer.from([0, 3]),
+      );
+      const removed = await app.inject({
+        method: "DELETE",
+        url: `/api/workspaces/${copy.id}`,
+        headers,
+        payload: { name: copy.name },
+      });
+      expect(removed.statusCode).toBe(200);
+      expect(removed.json().cleanupPending).toBe(false);
+      expect(
+        (
+          await git(workspacePath(sibling.id), ["status", "--porcelain"])
+        ).trim(),
+      ).toBe("");
+      await expect(
+        access(path.join(data, "workspace-git", chat, "worktrees", copy.id)),
+      ).rejects.toThrow();
+      await writeFile(
+        path.join(workspacePath(sibling.id), ".git"),
+        `gitdir: /workspace-git/${chat}/worktrees/${copy.id}\n`,
+      );
+      await expect(git(workspacePath(sibling.id), ["status"])).rejects.toThrow(
+        /Git link/,
+      );
+      await access(path.join(data, "workspace-checkpoints", review.id));
+    },
+    120000,
+  );
+  it.skipIf(process.env.DOCKER_TESTS !== "1")(
+    "creates a files-only project and plain folder copies without Git metadata",
+    async () => {
+      const { createCopy, reviewCopy, applyCopy, deleteWorkingFolder } =
+        await import("../src/server/folder-operations");
+      const { initializeFolder } = await import("../src/server/git");
+      const { workspaceBy } = await import("../src/server/workspaces");
+      const project = await app.inject({
+        method: "POST",
+        url: "/api/projects",
+        headers,
+        payload: { name: "Documents", repo: "" },
+      });
+      expect(project.statusCode).toBe(200);
+      const main = (
+        await db.query("SELECT * FROM workspaces WHERE project_id=$1", [
+          project.json().id,
+        ])
+      ).rows[0];
+      await initializeFolder(main);
+      await writeFile(
+        path.join(workspacePath(main.id), "brief.txt"),
+        "Original brief",
+      );
+      const cp = await createCopy(main.id, "Draft");
+      expect(cp.storage_mode).toBe("folder");
+      expect(cp.git_source_id).toBeNull();
+      await expect(
+        access(path.join(workspacePath(cp.id), ".git")),
+      ).rejects.toThrow();
+      await writeFile(
+        path.join(workspacePath(cp.id), "brief.txt"),
+        "Updated brief",
+      );
+      const review = await reviewCopy(cp.id);
+      await applyCopy(cp.id, review.id, {});
+      expect(
+        await readFile(path.join(workspacePath(main.id), "brief.txt"), "utf8"),
+      ).toBe("Updated brief");
+      expect((await deleteWorkingFolder(cp.id, cp.name)).cleanupPending).toBe(
+        false,
+      );
+      expect((await workspaceBy(main.id)).status).toBe("ready");
+    },
+    60000,
+  );
+  it.skipIf(process.env.DOCKER_TESTS !== "1").each(["git", "folder"])(
+    "queues agent conflict resolution in an isolated %s copy and gates transfer on completed resolution",
+    async (mode) => {
+      const {
+        createCopy,
+        reviewCopy,
+        applyCopy,
+        deleteWorkingFolder,
+        operationPath,
+      } = await import("../src/server/folder-operations");
+      const { workspaceBy } = await import("../src/server/workspaces");
+      const { git } = await import("../src/server/git");
+      const root = workspacePath(chat);
+      await mkdir(root, { recursive: true });
+      await writeFile(path.join(root, "text.txt"), "Original\n");
+      await writeFile(path.join(root, "image.bin"), Buffer.from([0, 1]));
+      if (mode === "git") {
+        await git(root, ["init", "-b", "workspace/test"]);
+        await git(root, ["add", "."]);
+        await git(root, ["commit", "-m", "Initial"]);
+      }
+      await db.query("UPDATE workspaces SET initialized=true WHERE id=$1", [
+        chat,
+      ]);
+      const copy = await createCopy(chat, "Feature");
+      const cp = workspacePath(copy.id);
+      await writeFile(path.join(root, "text.txt"), "Main intent\n");
+      await writeFile(path.join(cp, "text.txt"), "Copy intent\n");
+      await writeFile(path.join(root, "image.bin"), Buffer.from([0, 2]));
+      await writeFile(path.join(cp, "image.bin"), Buffer.from([0, 3]));
+      let review = await reviewCopy(copy.id);
+      const resolve = (review_id: string) =>
+        app.inject({
+          method: "POST",
+          url: `/api/workspaces/${copy.id}/resolve`,
+          headers,
+          payload: { review_id, account_id: account },
+        });
+      await writeFile(path.join(root, "later.txt"), "Added after review");
+      expect((await resolve(review.id)).statusCode).toBe(409);
+      // Remove the preserved failed preparation so it doesn't pin the old source.
+      const failed = (
+        await db.query(
+          "SELECT * FROM workspaces WHERE resolution_source_id=$1",
+          [copy.id],
+        )
+      ).rows[0];
+      await deleteWorkingFolder(failed.id, failed.name);
+      review = await reviewCopy(copy.id);
+      const response = await resolve(review.id);
+      expect(response.statusCode, response.body).toBe(200);
+      const resolution = await workspaceBy(response.json().workspace_id),
+        rp = workspacePath(resolution.id);
+      expect(resolution.storage_mode).toBe(
+        mode === "git" ? "worktree" : "folder",
+      );
+      const runtime = await launch(response.json().chat_id, null, () => {});
+      try {
+        const container = docker.getContainer(runtime.id);
+        const info = await container.inspect();
+        expect(
+          info.Mounts.find((m) => m.Destination === "/merge-input")?.RW,
+        ).toBe(false);
+        if (mode === "git") {
+          expect(
+            info.Mounts.find((m) => m.Destination === `/workspace-git/${chat}`)
+              ?.RW,
+          ).toBe(false);
+          const command = await container.exec({
+            Cmd: [
+              "sh",
+              "-c",
+              "git -c safe.directory=/workspace status --porcelain >/dev/null && ! git -c safe.directory=/workspace add . 2>/dev/null",
+            ],
+            AttachStdout: true,
+            AttachStderr: true,
+          });
+          const stream = await command.start({});
+          for await (const _ of stream) {
+          }
+          expect((await command.inspect()).ExitCode).toBe(0);
+        }
+      } finally {
+        await runtime.stop();
+      }
+      expect(await readFile(path.join(rp, "text.txt"), "utf8")).toContain(
+        "<<<<<<< WORKSPACE MAIN",
+      );
+      expect(await readFile(path.join(root, "text.txt"), "utf8")).toBe(
+        "Main intent\n",
+      );
+      expect(await readFile(path.join(cp, "text.txt"), "utf8")).toBe(
+        "Copy intent\n",
+      );
+      expect(
+        await readFile(
+          path.join(
+            operationPath(resolution.resolution_operation_id!),
+            "inputs",
+            "base",
+            "text.txt",
+          ),
+          "utf8",
+        ),
+      ).toBe("Original\n");
+      expect(
+        (
+          await db.query("SELECT state FROM jobs WHERE chat_id=$1", [
+            response.json().chat_id,
+          ])
+        ).rows[0].state,
+      ).toBe("queued");
+      expect(
+        (
+          await db.query("SELECT autonomous FROM chats WHERE id=$1", [
+            response.json().chat_id,
+          ])
+        ).rows[0].autonomous,
+      ).toBe(false);
+      expect((await resolve(review.id)).statusCode).toBe(409);
+      await expect(deleteWorkingFolder(copy.id, copy.name)).rejects.toThrow(
+        /conflict-resolution/,
+      );
+      await expect(reviewCopy(resolution.id)).rejects.toThrow(); // pending agent owns folder
+      await db.query("UPDATE jobs SET state='completed' WHERE chat_id=$1", [
+        response.json().chat_id,
+      ]);
+      let ready = await reviewCopy(resolution.id);
+      expect(ready.resolutionMessage).toContain("not confirmed");
+      await expect(applyCopy(resolution.id, ready.id, {})).rejects.toThrow(
+        /not confirmed/,
+      );
+      await writeFile(
+        path.join(rp, ".workspace-resolution.json"),
+        JSON.stringify({
+          resolved_paths: ["text.txt", "image.bin"],
+          checks: "simulated test agent",
+        }),
+      );
+      ready = await reviewCopy(resolution.id);
+      expect(ready.resolutionMessage).toContain("markers remain");
+      await writeFile(
+        path.join(rp, "text.txt"),
+        "Main intent and copy intent\n",
+      );
+      await writeFile(path.join(rp, "image.bin"), Buffer.from([0, 4]));
+      await writeFile(
+        path.join(root, "new-main.txt"),
+        "Preserve concurrent work",
+      );
+      await writeFile(
+        path.join(cp, "after-resolution.txt"),
+        "Later original-copy work",
+      );
+      ready = await reviewCopy(resolution.id);
+      expect(ready.resolutionMessage).toBe("");
+      await applyCopy(resolution.id, ready.id, {});
+      expect(await readFile(path.join(root, "text.txt"), "utf8")).toBe(
+        "Main intent and copy intent\n",
+      );
+      expect(await readFile(path.join(root, "image.bin"))).toEqual(
+        Buffer.from([0, 4]),
+      );
+      expect(await readFile(path.join(root, "new-main.txt"), "utf8")).toBe(
+        "Preserve concurrent work",
+      );
+      await expect(
+        access(path.join(root, ".workspace-resolution.json")),
+      ).rejects.toThrow();
+      const remaining = await reviewCopy(copy.id);
+      expect(remaining.changes.map((c: any) => c.path)).toEqual([
+        "after-resolution.txt",
+      ]);
+      expect(
+        (await workspaceBy(resolution.id)).resolution_source_id,
+      ).toBeNull();
+      await deleteWorkingFolder(copy.id, copy.name);
+      if (mode === "git")
+        expect(await git(rp, ["status", "--porcelain"])).toContain("text.txt");
+    },
+    120000,
+  );
+  it.skipIf(process.env.DOCKER_TESTS !== "1")(
+    "creates a worktree from an unborn Git repository without committing main",
+    async () => {
+      const { createCopy } = await import("../src/server/folder-operations");
+      const { git } = await import("../src/server/git");
+      const root = workspacePath(chat);
+      await mkdir(root, { recursive: true });
+      await git(root, ["init", "-b", "workspace/test"]);
+      await writeFile(path.join(root, "uploaded.txt"), "Keep this");
+      await db.query("UPDATE workspaces SET initialized=true WHERE id=$1", [
+        chat,
+      ]);
+      const copy = await createCopy(chat, "First task");
+      expect(copy.storage_mode).toBe("worktree");
+      expect(
+        await readFile(
+          path.join(workspacePath(copy.id), "uploaded.txt"),
+          "utf8",
+        ),
+      ).toBe("Keep this");
+      await expect(
+        git(root, ["rev-parse", "--verify", "HEAD"]),
+      ).rejects.toThrow();
+    },
+    30000,
+  );
+  it("restores the original main folder after an interrupted transfer", async () => {
+    const { recoverFolderOperations } =
+      await import("../src/server/folder-operations");
+    const op = randomUUID(),
+      copy = randomUUID();
+    const project = (
+      await db.query("SELECT project_id FROM chats WHERE id=$1", [chat])
+    ).rows[0].project_id;
+    await createWorkspace(project, "copy", "Copy", db, copy);
+    await db.query(
+      "UPDATE workspaces SET status='applying' WHERE id=ANY($1::uuid[])",
+      [[chat, copy]],
+    );
+    await db.query(
+      "INSERT INTO workspace_operations(id,kind,workspace_id,main_workspace_id,status) VALUES($1,'review',$2,$3,'applying')",
+      [op, copy, chat],
+    );
+    await mkdir(path.join(data, "workspace-checkpoints", op), {
+      recursive: true,
+    });
+    await writeFile(
+      path.join(data, "workspace-checkpoints", op, "original"),
+      "safe",
+    );
+    await mkdir(path.join(data, "workspace-operations", op), {
+      recursive: true,
+    });
+    await mkdir(workspacePath(chat), { recursive: true });
+    await writeFile(path.join(workspacePath(chat), "partial"), "incomplete");
+    await recoverFolderOperations();
+    expect(
+      await readFile(path.join(workspacePath(chat), "original"), "utf8"),
+    ).toBe("safe");
+    await access(
+      path.join(
+        data,
+        "workspace-operations",
+        op,
+        "unconfirmed-result",
+        "partial",
+      ),
+    );
+    expect((await chatWorkspace(chat)).status).toBe("ready");
+  });
+  it("runs two copies concurrently with shared connections forced read-only", async () => {
+    const { chatFolders } = await import("../src/server/folders");
+    const project = (
+      await db.query("SELECT project_id FROM chats WHERE id=$1", [chat])
+    ).rows[0].project_id;
+    await db.query(
+      "INSERT INTO folder_links(id,project_id,name,read_only) VALUES($1,$2,'shared-data',false)",
+      [randomUUID(), project],
+    );
+    const ids: string[] = [];
+    for (let i = 0; i < 2; i++) {
+      const id = randomUUID(),
+        a = randomUUID(),
+        m = randomUUID();
+      ids.push(id);
+      await createWorkspace(project, "copy", "Copy " + i, db, id);
+      await db.query(
+        "INSERT INTO accounts(id,name,provider,status) VALUES($1,'Parallel','codex','ready')",
+        [a],
+      );
+      await db.query(
+        "INSERT INTO chats(id,project_id,workspace_id,title,provider,account_id,branch) VALUES($1,$2,$1,'Copy chat','codex',$3,'copy')",
+        [id, project, a],
+      );
+      await db.query(
+        "INSERT INTO messages(id,chat_id,role,content) VALUES($1,$2,'user','work')",
+        [m, id],
+      );
+      await db.query(
+        "INSERT INTO jobs(id,chat_id,message_id) VALUES($1,$2,$3)",
+        [randomUUID(), id, m],
+      );
+      expect((await chatFolders(id))[0].read_only).toBe(true);
+    }
+    expect((await chatFolders(chat))[0].read_only).toBe(false);
+    expect((await claim())?.chat_id).toBe(ids[0]);
+    expect((await claim())?.chat_id).toBe(ids[1]);
+  });
+  it("acquires both folders atomically and blocks deletion while tasks are queued", async () => {
+    const { acquireFolders } = await import("../src/server/leases");
+    const project = (
+      await db.query("SELECT project_id FROM chats WHERE id=$1", [chat])
+    ).rows[0].project_id;
+    const copy = await createWorkspace(project, "copy", "Copy", db);
+    await acquireFolder(chat, "terminal");
+    await expect(acquireFolders([copy.id, chat], "review")).rejects.toThrow();
+    expect(
+      (
+        await db.query("SELECT 1 FROM workspace_leases WHERE workspace_id=$1", [
+          copy.id,
+        ])
+      ).rowCount,
+    ).toBe(0);
+    await releaseFolder(chat);
+    await db.query("UPDATE workspaces SET kind='saved' WHERE id=$1", [chat]);
+    await app.inject({
+      method: "POST",
+      url: `/api/chats/${chat}/messages`,
+      headers,
+      payload: { content: "queued", client_id: randomUUID() },
+    });
+    expect(
+      (
+        await app.inject({
+          method: "DELETE",
+          url: `/api/workspaces/${chat}`,
+          headers,
+          payload: { name: "Main folder" },
+        })
+      ).statusCode,
+    ).toBe(409);
+  });
+  it("recovers an interrupted folder deletion without removing chats or files", async () => {
+    const { recoverFolderOperations } =
+      await import("../src/server/folder-operations");
+    const op = randomUUID();
+    await db.query(
+      "UPDATE workspaces SET kind='saved',status='deleting' WHERE id=$1",
+      [chat],
+    );
+    await db.query(
+      "INSERT INTO workspace_operations(id,kind,workspace_id,status,result) VALUES($1,'delete',$2,'deleting',$3)",
+      [op, chat, JSON.stringify({ previousStatus: "ready" })],
+    );
+    await mkdir(path.join(data, "workspace-operations", op, "deleted-folder"), {
+      recursive: true,
+    });
+    await writeFile(
+      path.join(data, "workspace-operations", op, "deleted-folder", "keep.txt"),
+      "safe",
+    );
+    await recoverFolderOperations();
+    expect(
+      await readFile(path.join(workspacePath(chat), "keep.txt"), "utf8"),
+    ).toBe("safe");
+    expect((await chatWorkspace(chat)).status).toBe("ready");
+  });
+  it("completes interrupted account removal while preserving conversation records", async () => {
+    const { recoverAccountDeletions } = await import("../src/server/accounts");
+    await db.query("UPDATE accounts SET status='deleting' WHERE id=$1", [
+      account,
+    ]);
+    await mkdir(path.join(data, "profiles", account), { recursive: true });
+    await writeFile(
+      path.join(data, "profiles", account, "remaining"),
+      "credential",
+    );
+    await recoverAccountDeletions();
+    expect(
+      (await db.query("SELECT id FROM accounts WHERE id=$1", [account]))
+        .rowCount,
+    ).toBe(0);
+    expect(
+      (await db.query("SELECT id FROM chats WHERE id=$1", [chat])).rowCount,
+    ).toBe(1);
+    await expect(
+      access(path.join(data, "profiles", account)),
+    ).rejects.toThrow();
   });
 });

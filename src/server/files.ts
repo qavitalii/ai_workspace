@@ -1,6 +1,6 @@
 import { PassThrough } from "node:stream";
 import { finished } from "node:stream/promises";
-import { chown } from "node:fs/promises";
+import { chatWorkspace } from "./workspaces.js";
 import { docker, workspace } from "./runtime.js";
 import { config } from "./config.js";
 /** Read through a container so symlink races in agent-controlled folders cannot reach supervisor files. */
@@ -9,7 +9,11 @@ export async function inspectWorkspace(
   relative: string,
   mode: "list" | "file" | "index",
 ) {
-  return inspectDirectory(workspace(chatId), relative, mode);
+  return inspectDirectory(
+    workspace((await chatWorkspace(chatId)).id),
+    relative,
+    mode,
+  );
 }
 export async function inspectDirectory(
   source: string,
@@ -82,59 +86,6 @@ export async function inspectDirectory(
   } finally {
     clearTimeout(timer);
     (stream as import("node:stream").Duplex).destroy();
-    await c.remove({ force: true }).catch(() => {});
-  }
-}
-
-/** Copy only this chat's uploads through a helper; agent-controlled symlinks never reach the host. */
-export async function syncAttachments(chatId: string, storageNames: string[]) {
-  if (!storageNames.length) return;
-  for (const name of storageNames) {
-    if (
-      name.includes("/") ||
-      name.includes("\\") ||
-      name === "." ||
-      name === ".."
-    )
-      throw new Error("Invalid attachment name");
-    if (process.getuid?.() === 0)
-      await chown(config.data + "/uploads/" + name, 1000, 1000);
-  }
-  const script = `const fs=require('fs'),path=require('path');const names=JSON.parse(process.argv[1]);const dest='/workspace/.workspace-attachments';fs.rmSync(dest,{recursive:true,force:true});fs.mkdirSync(dest);for(const [i,n] of names.entries()){if(n!==path.basename(n))throw Error('Invalid attachment name');fs.copyFileSync('/input/'+i,path.join(dest,n));}`;
-  const c = await docker.createContainer({
-    Image: config.image,
-    User: "1000:1000",
-    WorkingDir: "/workspace",
-    Cmd: ["node", "-e", script, JSON.stringify(storageNames)],
-    Labels: {
-      "ai.workspace.managed": "true",
-      "ai.workspace.instance": config.data,
-    },
-    HostConfig: {
-      Mounts: [
-        { Type: "bind", Source: workspace(chatId), Target: "/workspace" },
-        ...storageNames.map((name, i) => ({
-          Type: "bind" as const,
-          Source: config.data + "/uploads/" + name,
-          Target: "/input/" + i,
-          ReadOnly: true,
-        })),
-      ],
-      NetworkMode: "none",
-      ReadonlyRootfs: true,
-      CapDrop: ["ALL"],
-      SecurityOpt: ["no-new-privileges:true"],
-      Memory: 256 * 1024 ** 2,
-      PidsLimit: 32,
-    },
-  });
-  const timer = setTimeout(() => void c.kill().catch(() => {}), 60000);
-  try {
-    await c.start();
-    if ((await c.wait()).StatusCode !== 0)
-      throw new Error("Unable to prepare attachments in the workspace");
-  } finally {
-    clearTimeout(timer);
     await c.remove({ force: true }).catch(() => {});
   }
 }

@@ -10,7 +10,13 @@ export async function disconnectAccount(id: string, start = launch) {
     if (!account)
       throw Object.assign(new Error("Account not found"), { statusCode: 404 });
     if (
-      ["authenticating", "inspecting", "disconnecting"].includes(account.status)
+      [
+        "authenticating",
+        "inspecting",
+        "disconnecting",
+        "deleting",
+        "delete_failed",
+      ].includes(account.status)
     )
       throw Object.assign(
         new Error("Wait for the current account operation to finish"),
@@ -73,4 +79,92 @@ export async function disconnectAccount(id: string, start = launch) {
     );
   }
   return { ok: true };
+}
+
+/** Local removal only: never deletes the upstream Codex/Claude account. */
+export async function deleteAccount(id: string, name: string) {
+  await transaction(async (c) => {
+    await c.query("SELECT pg_advisory_xact_lock(417028)");
+    const a = (
+      await c.query("SELECT * FROM accounts WHERE id=$1 FOR UPDATE", [id])
+    ).rows[0];
+    if (!a)
+      throw Object.assign(new Error("Account not found"), { statusCode: 404 });
+    if (a.name !== name)
+      throw Object.assign(
+        new Error("Type the account label to confirm deletion."),
+        { statusCode: 400 },
+      );
+    if (
+      ["authenticating", "inspecting", "disconnecting", "deleting"].includes(
+        a.status,
+      )
+    )
+      throw Object.assign(
+        new Error("Wait for the current account operation to finish."),
+        { statusCode: 409 },
+      );
+    if (
+      (
+        await c.query(
+          "SELECT 1 FROM jobs j JOIN chats c ON c.id=j.chat_id WHERE (j.account_id=$1 AND j.state IN ('running','waiting_approval')) OR (c.account_id=$1 AND j.state IN ('queued','waiting_account'))",
+          [id],
+        )
+      ).rowCount
+    )
+      throw Object.assign(
+        new Error(
+          "Stop active and queued tasks using this account before deleting it.",
+        ),
+        { statusCode: 409 },
+      );
+    await c.query("UPDATE accounts SET status='deleting' WHERE id=$1", [id]);
+  });
+  await finishAccountDeletion(id);
+  return { ok: true };
+}
+async function finishAccountDeletion(id: string) {
+  try {
+    const { rm } = await import("node:fs/promises");
+    const { default: path } = await import("node:path");
+    const { config } = await import("./config.js");
+    for (const dir of ["profiles", "auth-workspaces"])
+      await rm(path.join(config.data, dir, id), {
+        recursive: true,
+        force: true,
+      });
+    await transaction(async (c) => {
+      await c.query("SELECT pg_advisory_xact_lock(417028)");
+      await c.query(
+        "UPDATE chats SET session_id=NULL,session_account=NULL WHERE session_account=$1",
+        [id],
+      );
+      await c.query("UPDATE chats SET account_id=NULL WHERE account_id=$1", [
+        id,
+      ]);
+      await c.query("UPDATE jobs SET account_id=NULL WHERE account_id=$1", [
+        id,
+      ]);
+      await c.query("DELETE FROM accounts WHERE id=$1 AND status='deleting'", [
+        id,
+      ]);
+    });
+  } catch (e) {
+    await db.query(
+      "UPDATE accounts SET status='delete_failed' WHERE id=$1 AND status='deleting'",
+      [id],
+    );
+    throw Object.assign(
+      new Error(
+        "Could not finish removing local account data. Retry Delete account.",
+      ),
+      { statusCode: 500 },
+    );
+  }
+}
+export async function recoverAccountDeletions() {
+  for (const a of (
+    await db.query("SELECT id FROM accounts WHERE status='deleting'")
+  ).rows)
+    await finishAccountDeletion(a.id);
 }

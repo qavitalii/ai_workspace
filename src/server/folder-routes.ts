@@ -1,3 +1,4 @@
+import { chatWorkspace } from "./workspaces.js";
 import type { FastifyInstance } from "fastify";
 import { randomUUID } from "node:crypto";
 import { createWriteStream } from "node:fs";
@@ -36,7 +37,7 @@ export async function copyFolderUpload(
 ) {
   uploadPath(relative);
   if (process.getuid?.() === 0) await chown(staged, 1000, 1000);
-  const script = `const fs=require('fs'),p=require('path'),crypto=require('crypto');const target=p.resolve('/folder',process.argv[1]);if(!target.startsWith('/folder/'))throw Error('Invalid path');fs.mkdirSync(p.dirname(target),{recursive:true});if(!fs.realpathSync(p.dirname(target)).startsWith('/folder/')&&fs.realpathSync(p.dirname(target))!='/folder')throw Error('Invalid directory');try{fs.copyFileSync('/input',target,fs.constants.COPYFILE_EXCL)}catch(e){if(e.code!=='EEXIST'||fs.lstatSync(target).isSymbolicLink()||!fs.statSync(target).isFile())throw e;const hash=f=>crypto.createHash('sha256').update(fs.readFileSync(f)).digest('hex');if(fs.statSync(target).size!==fs.statSync('/input').size||hash(target)!==hash('/input'))throw Error('File already exists');}`;
+  const script = `const fs=require('fs'),p=require('path'),crypto=require('crypto');const target=p.resolve('/folder',process.argv[1]);if(!target.startsWith('/folder/'))throw Error('Invalid path');let parent='/folder';for(const part of process.argv[1].split('/').slice(0,-1)){parent=p.join(parent,part);try{fs.mkdirSync(parent)}catch(e){if(e.code!=='EEXIST')throw e}if(fs.lstatSync(parent).isSymbolicLink()||!fs.statSync(parent).isDirectory())throw Error('Invalid directory');}if(!fs.realpathSync(p.dirname(target)).startsWith('/folder/')&&fs.realpathSync(p.dirname(target))!='/folder')throw Error('Invalid directory');try{fs.copyFileSync('/input',target,fs.constants.COPYFILE_EXCL)}catch(e){if(e.code!=='EEXIST'||fs.lstatSync(target).isSymbolicLink()||!fs.statSync(target).isFile())throw e;const hash=f=>crypto.createHash('sha256').update(fs.readFileSync(f)).digest('hex');if(fs.statSync(target).size!==fs.statSync('/input').size||hash(target)!==hash('/input'))throw Error('File already exists');}`;
   const c = await docker.createContainer({
     Image: config.image,
     User: "1000:1000",
@@ -87,7 +88,7 @@ export function folderRoutes(app: FastifyInstance) {
       return (
         await db.query(
           scope === "chats"
-            ? "SELECT f.*,f.project_id IS NOT NULL AS inherited FROM folder_links f JOIN chats c ON c.id=$1 WHERE f.chat_id=c.id OR f.project_id=c.project_id ORDER BY name"
+            ? "SELECT f.*,(f.read_only OR w.kind='copy') AS read_only,f.project_id IS NOT NULL AS inherited FROM folder_links f JOIN chats c ON c.id=$1 JOIN workspaces w ON w.id=c.workspace_id WHERE f.chat_id=c.id OR f.project_id=c.project_id ORDER BY name"
             : "SELECT *,false AS inherited FROM folder_links WHERE project_id=$1 ORDER BY name",
           [id],
         )
@@ -103,6 +104,17 @@ export function folderRoutes(app: FastifyInstance) {
         await c.query("SELECT pg_advisory_xact_lock(417028)");
         await requireFolderIdle(p.name, c);
         await idleScope(c, scope, id);
+        if (
+          scope === "chats" &&
+          !p.read_only &&
+          (await chatWorkspace(id, c)).kind === "copy"
+        )
+          throw Object.assign(
+            new Error(
+              "Connected folders are read-only in working copies. Save editable files in the copy itself.",
+            ),
+            { statusCode: 400 },
+          );
         const inherited =
           scope === "chats"
             ? await c.query(

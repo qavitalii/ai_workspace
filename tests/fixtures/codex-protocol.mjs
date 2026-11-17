@@ -54,6 +54,13 @@ createInterface({ input: process.stdin }).on("line", (line) => {
                 question: "Choose?",
                 options: [{ label: "Simple", description: "Small scope" }],
               },
+              {
+                id: "areas",
+                question: "Which areas?",
+                multiSelect: true,
+                options: [{ label: "Tests" }, { label: "Docs" }],
+              },
+              { id: "notes", question: "Any notes?" },
             ],
           },
         });
@@ -67,7 +74,11 @@ createInterface({ input: process.stdin }).on("line", (line) => {
       }
     } else if (m.id === 701) {
       assert.deepEqual(m.result, {
-        answers: { design: { answers: ["Simple"] } },
+        answers: {
+          design: { answers: ["Simple"] },
+          areas: { answers: ["Tests", "Docs"] },
+          notes: { answers: ["Keep changes focused"] },
+        },
       });
       send({ method: "serverRequest/resolved", params: { requestId: 701 } });
       send({

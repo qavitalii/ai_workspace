@@ -32,6 +32,10 @@ function Metric({
 export function ServerSettings() {
   const [system, setSystem] = useState<any>(null);
   const [maximum, setMaximum] = useState("");
+  const [outputLimit, setOutputLimit] = useState("");
+  const [outputSaving, setOutputSaving] = useState(false);
+  const [outputResult, setOutputResult] = useState("");
+  const [outputError, setOutputError] = useState("");
   const initialized = useRef(false);
   const [offline, setOffline] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -50,6 +54,7 @@ export function ServerSettings() {
           if (!initialized.current) {
             initialized.current = true;
             setMaximum(String(data.maxConcurrent));
+            setOutputLimit(String(data.output.limitGb));
           }
           setOffline(false);
         }
@@ -69,10 +74,15 @@ export function ServerSettings() {
   const r = system?.resources;
   return (
     <section aria-label="Server resources">
-      <div className="resources-heading">
-        <h3>Resources</h3>
-        <span>{offline ? "Connection lost" : "Updates every 2 seconds"}</span>
-      </div>
+      <header className="workspace-settings-heading">
+        <div className="resources-heading">
+          <h3>Resources</h3>
+          <span>{offline ? "Connection lost" : "Updates every 2 seconds"}</span>
+        </div>
+        <p className="muted">
+          Monitor usage and set limits for your workspace.
+        </p>
+      </header>
       {offline && (
         <p className="inline-error" role="status">
           {system
@@ -149,77 +159,172 @@ export function ServerSettings() {
           </p>
         </>
       )}
-      <form
-        className="execution-settings"
-        onSubmit={async (e) => {
-          e.preventDefault();
-          if (saving) return;
-          const value = Number(maximum);
-          if (!Number.isSafeInteger(value) || value < 1) {
-            setError("Enter a positive whole number.");
-            return;
-          }
-          setSaving(true);
-          setError("");
-          setResult("");
-          try {
-            const saved = await api("/settings/execution", {
-              maxConcurrent: value,
-            });
-            setSystem((old: any) =>
-              old ? { ...old, maxConcurrent: saved.maxConcurrent } : old,
-            );
-            setResult(
-              "Saved. New starts use this limit; running tasks continue.",
-            );
-          } catch (e: any) {
-            setError(e.message);
-          } finally {
-            setSaving(false);
-          }
-        }}
-      >
-        <label className="field">
-          <span>Maximum concurrent tasks</span>
-          <input
-            type="number"
-            min={1}
-            step={1}
-            required
-            value={maximum}
-            onChange={(e) => {
-              setMaximum(e.target.value);
-              setResult("");
+      <div className="resource-settings">
+        {system?.output && (
+          <form
+            className="execution-settings workspace-settings-card"
+            onSubmit={async (e) => {
+              e.preventDefault();
+              if (outputSaving) return;
+              setOutputSaving(true);
+              setOutputError("");
+              setOutputResult("");
+              try {
+                const output = await api("/settings/output", {
+                  limitGb: Number(outputLimit),
+                });
+                setSystem((old: any) => ({ ...old, output }));
+                setOutputResult(
+                  "Saved. Existing history is kept; tasks stop if new output would exceed this limit.",
+                );
+              } catch (e: any) {
+                setOutputError(e.message);
+              } finally {
+                setOutputSaving(false);
+              }
             }}
-            aria-describedby="concurrency-help"
-          />
-        </label>
-        <p id="concurrency-help" className="muted">
-          Choose any positive whole number, including 50 or more. Each task
-          needs an available account and server resources. One task runs per
-          account.
-        </p>
-        {system && (
-          <p className="muted">
-            Current limit: {system.maxConcurrent} ·{" "}
-            {Math.max(0, system.maxConcurrent - system.running)} execution slots
-            free
-          </p>
+          >
+            <header className="settings-card-heading">
+              <h4>Output storage</h4>
+            </header>
+            <label className="field">
+              <span>Limit (GB, all chats)</span>
+              <input
+                type="number"
+                min="0.01"
+                max="10000"
+                step="0.01"
+                required
+                value={outputLimit}
+                onChange={(e) => {
+                  setOutputLimit(e.target.value);
+                  setOutputResult("");
+                }}
+                aria-describedby="output-limit-help"
+              />
+            </label>
+            <Metric
+              label="Saved agent output"
+              value={`${(system.output.usedBytes / 1e9).toFixed(3)} GB used`}
+              detail={`Shared limit: ${system.output.limitGb} GB`}
+              percent={Math.min(
+                100,
+                (system.output.usedBytes / system.output.limitBytes) * 100,
+              )}
+            />
+            <p className="muted">
+              Tasks stop at this limit. Existing history is kept.
+            </p>
+            <details className="help-details">
+              <summary>What counts toward the limit?</summary>
+              <p id="output-limit-help" className="muted">
+                Includes saved responses, activity, approval details and
+                conversation summaries. 1 GB = 1,000,000,000 bytes. Project
+                files, attachments, provider histories and database overhead use
+                additional disk space. At the limit, increase it or delete old
+                chats to make room. Existing history is never deleted
+                automatically.
+              </p>
+            </details>
+            {system.output.usedBytes >= system.output.limitBytes && (
+              <p role="alert" className="inline-error">
+                Output storage is full. Increase the limit or delete old chats
+                before continuing.
+              </p>
+            )}
+            <div className="settings-card-actions">
+              <button className="primary" disabled={outputSaving}>
+                {outputSaving ? "Saving…" : "Save output limit"}
+              </button>
+            </div>
+            {outputError && (
+              <p role="alert" className="inline-error">
+                {outputError}
+              </p>
+            )}
+            {outputResult && (
+              <p role="status" className="success">
+                {outputResult}
+              </p>
+            )}
+          </form>
         )}
-        <button className="primary" disabled={saving || !system}>
-          {saving ? "Saving…" : "Save capacity"}
-        </button>
-        {error && (
-          <p className="inline-error" role="alert">
-            {error}
+        <form
+          className="execution-settings workspace-settings-card"
+          onSubmit={async (e) => {
+            e.preventDefault();
+            if (saving) return;
+            const value = Number(maximum);
+            if (!Number.isSafeInteger(value) || value < 1) {
+              setError("Enter a positive whole number.");
+              return;
+            }
+            setSaving(true);
+            setError("");
+            setResult("");
+            try {
+              const saved = await api("/settings/execution", {
+                maxConcurrent: value,
+              });
+              setSystem((old: any) =>
+                old ? { ...old, maxConcurrent: saved.maxConcurrent } : old,
+              );
+              setResult(
+                "Saved. New starts use this limit; running tasks continue.",
+              );
+            } catch (e: any) {
+              setError(e.message);
+            } finally {
+              setSaving(false);
+            }
+          }}
+        >
+          <header className="settings-card-heading">
+            <h4>Task capacity</h4>
+          </header>
+          <label className="field">
+            <span>Maximum concurrent tasks</span>
+            <input
+              type="number"
+              min={1}
+              step={1}
+              required
+              value={maximum}
+              onChange={(e) => {
+                setMaximum(e.target.value);
+                setResult("");
+              }}
+              aria-describedby="concurrency-help"
+            />
+          </label>
+          <p id="concurrency-help" className="muted">
+            Each task needs an available account and enough server capacity. One
+            task runs per account.
           </p>
-        )}
-        {result && (
-          <p className="success" role="status">
-            {result}
-          </p>
-        )}
-      </form>
+          {system && (
+            <p className="muted">
+              Current limit: {system.maxConcurrent} ·{" "}
+              {Math.max(0, system.maxConcurrent - system.running)} execution
+              slots free
+            </p>
+          )}
+          <div className="settings-card-actions">
+            <button className="primary" disabled={saving || !system}>
+              {saving ? "Saving…" : "Save capacity"}
+            </button>
+          </div>
+          {error && (
+            <p className="inline-error" role="alert">
+              {error}
+            </p>
+          )}
+          {result && (
+            <p className="success" role="status">
+              {result}
+            </p>
+          )}
+        </form>
+      </div>
     </section>
   );
 }

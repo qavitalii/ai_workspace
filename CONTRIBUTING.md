@@ -17,7 +17,7 @@ npm test
 for script in ops/*.sh; do bash -n "$script"; done
 ```
 
-The default test run skips database and runner integration tests. Follow the disposable database instructions in [README](README.md#development-and-verification) to run the database suite. Real runner checks additionally need Docker and built runner images; see the existing test gates in `tests/runner.test.ts`. Never point integration tests at an installation you want to keep.
+The default test run skips database and runner integration tests. Follow the disposable database instructions in [README](README.md#development-and-verification) to run the database suite. The same README documents the full `DOCKER_TESTS=1` run with an isolated runner image. It covers worktrees, ordinary copies, merge/recovery behavior and runner isolation as well as protocol fixtures. CI currently enables database tests but not Docker-gated tests. Never point integration tests at an installation you want to keep.
 
 For UI documentation, run `node ops/preview-docs.mjs` and open `http://127.0.0.1:4178`. This read-only fixture uses fictional data and never connects to your accounts or database. See [screenshot instructions](docs/screenshots/README.md).
 
