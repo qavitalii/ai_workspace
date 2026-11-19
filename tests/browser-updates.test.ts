@@ -90,6 +90,34 @@ describe("browser update API", () => {
       expect((await post({ ...release, version: "v1.2.4" })).statusCode).toBe(
         409,
       );
+      const check = (requestHeaders = headers) =>
+        app.inject({
+          method: "POST",
+          url: "/api/updates/check",
+          headers: requestHeaders,
+          payload: {},
+        });
+      expect((await check({ ...headers, cookie: "" })).statusCode).toBe(401);
+      expect(
+        (await check({ ...headers, origin: "https://other.example" }))
+          .statusCode,
+      ).toBe(403);
+      expect(
+        (await Promise.all([check(), check()])).map((r) => r.statusCode),
+      ).toEqual([202, 202]);
+      expect(readFileSync(path.join(requests, "check"), "utf8")).toBe("");
+      expect((await get()).json().checking).toBe(true);
+      rmSync(path.join(requests, "check"));
+      expect((await get()).json().checking).toBe(false);
+      save("waiting");
+      expect((await check()).statusCode).toBe(409);
+      save();
+      writeFileSync(
+        statusFile,
+        JSON.stringify({ ...state, heartbeat: Date.now() - 120_000 }),
+      );
+      expect((await check()).statusCode).toBe(503);
+      save();
       const results = await Promise.all([post(release), post(release)]);
       expect(results.map((response) => response.statusCode).sort()).toEqual([
         202, 409,
@@ -217,6 +245,12 @@ esac
     head: () => git(checkout, "rev-parse", "HEAD"),
     moveTag: () => git(origin, "tag", "-f", "v0.2.0", "HEAD"),
     writeRequest: () => writeFileSync(request, JSON.stringify(release)),
+    check: path.join(state, "requests", "check"),
+    publish: () => {
+      setVersion("0.4.0");
+      git(origin, "commit", "-am", "Release 0.4.0");
+      git(origin, "tag", "-am", "Release 0.4.0", "v0.4.0");
+    },
     status: () =>
       JSON.parse(
         readFileSync(path.join(state, "status", "status.json"), "utf8"),
@@ -292,6 +326,29 @@ describe("Linux update worker with a real Git origin", () => {
       );
     },
   );
+
+  it("checks for releases at once when the app requests it, without reading the request", () => {
+    const host = hostFixture();
+    host.tick();
+    const first = host.status().checkedAt;
+    expect(host.status().available?.version).toBe("v0.2.0");
+    host.publish();
+    host.tick();
+    // The periodic check has not come due yet.
+    expect(host.status().available?.version).toBe("v0.2.0");
+    const secret = path.join(fixture(), "secret");
+    writeFileSync(secret, "keep");
+    symlinkSync(secret, host.check);
+    host.tick();
+    expect(existsSync(host.check)).toBe(false);
+    expect(readFileSync(secret, "utf8")).toBe("keep");
+    expect(host.status().available?.version).toBe("v0.4.0");
+    expect(host.status().checkedAt).toBeGreaterThanOrEqual(first);
+    // A directory in place of the request is ignored, not fatal.
+    mkdirSync(host.check);
+    host.tick();
+    expect(host.status().checkFailed).toBe(false);
+  }, 15_000);
 
   it("rejects symlinks and refuses to install a tag moved after approval", () => {
     const host = hostFixture();

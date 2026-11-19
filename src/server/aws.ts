@@ -80,6 +80,8 @@ class AwsUnavailable extends Error {
   statusCode = 409;
 }
 
+class AwsDeviceCodeUnavailable extends Error {}
+
 function httpError(message: string, statusCode: number) {
   return Object.assign(new Error(message), { statusCode });
 }
@@ -163,9 +165,16 @@ function runAws(home: string, args: string[], env = awsEnv(home)) {
 }
 
 function deviceChallenge(output: string) {
-  const url = output.match(/^(https:\/\/[^\s?#]+)\r?$/m)?.[1];
-  const code = output.match(/^([A-Z0-9]{4}-[A-Z0-9]{4})\r?$/m)?.[1];
-  return url && code ? { url, code } : undefined;
+  // Use the manual verification URL, including any AWS request parameters.
+  // The CLI prints the autofill URL separately, after the code.
+  const match = output.match(
+    /^(https:\/\/\S+)\r?\n(?:\r?\n)*Then enter the code:\r?\n(?:\r?\n)*([A-Z0-9]{4}-[A-Z0-9]{4})\r?\n/m,
+  );
+  if (!match) return;
+  const [, url, code] = match;
+  const parsed = URL.parse(url);
+  if (parsed?.protocol === "https:" && !parsed.username && !parsed.password)
+    return { url, code };
 }
 
 function deviceLogin(home: string, login: Login) {
@@ -200,6 +209,7 @@ function deviceLogin(home: string, login: Login) {
       clearTimeout(deadline);
       login.abort.signal.removeEventListener("abort", stop);
       if (code === 0 && !login.abort.signal.aborted) resolve();
+      else if (!login.challenge) reject(new AwsDeviceCodeUnavailable());
       else reject(new Error("AWS sign-in did not finish"));
     });
   });
@@ -378,7 +388,9 @@ async function signIn(id: string, current: Connection, login: Login) {
         id,
         (error as NodeJS.ErrnoException).code === "ENOENT"
           ? "AWS CLI v2 is required on the Workspace server."
-          : "AWS sign-in could not be verified. Check the SSO URL, region and assigned role, then try again.",
+          : error instanceof AwsDeviceCodeUnavailable
+            ? "Workspace could not get a sign-in code from AWS. Check the SSO start URL and Identity Center region, then try again."
+            : "AWS sign-in could not be verified. Check the SSO URL, region and assigned role, then try again.",
       );
   } finally {
     logins.delete(id);

@@ -51,10 +51,10 @@ export async function updatePhase() {
   return "idle";
 }
 
-async function requestExists() {
+async function requestExists(name = "update.json") {
   if (!requestDir) return false;
   try {
-    await lstat(path.join(requestDir, "update.json"));
+    await lstat(path.join(requestDir, name));
     return true;
   } catch (error: any) {
     if (error.code !== "ENOENT") throw error;
@@ -74,6 +74,7 @@ export function updateRoutes(
       !stateFile ||
       !url.startsWith("/api/") ||
       url === route ||
+      url === route + "/check" ||
       [method].flat().every((value) => safeMethods.has(value))
     )
       return;
@@ -116,6 +117,7 @@ export function updateRoutes(
       target: current?.target ?? null,
       checkedAt: current?.checkedAt ?? null,
       checkFailed: current?.checkFailed ?? false,
+      checking: await requestExists("check"),
       message:
         pending && current?.phase !== "updating"
           ? null
@@ -159,6 +161,35 @@ export function updateRoutes(
           .code(409)
           .send({ error: "An update is already in progress." });
       throw error;
+    } finally {
+      await unlink(temporary);
+    }
+    return reply.code(202).send({ ok: true });
+  });
+
+  // Asks the host updater to look for a release on its next run (seconds)
+  // instead of waiting for the periodic check.
+  app.post(route + "/check", async (_req, reply) => {
+    const current = await status();
+    if (!requestDir || !current || !online(current))
+      return reply
+        .code(503)
+        .send({ error: "The host updater is unavailable." });
+    if (
+      current.phase === "waiting" ||
+      current.phase === "updating" ||
+      (await requestExists())
+    )
+      return reply
+        .code(409)
+        .send({ error: "An update is already in progress." });
+    const temporary = path.join(requestDir, randomUUID() + ".tmp");
+    await writeFile(temporary, "", { flag: "wx", mode: 0o600 });
+    try {
+      await link(temporary, path.join(requestDir, "check"));
+    } catch (error: any) {
+      // A check is already pending; that one will answer this request too.
+      if (error.code !== "EEXIST") throw error;
     } finally {
       await unlink(temporary);
     }

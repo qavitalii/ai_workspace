@@ -200,7 +200,7 @@ sudo ./ops/update.sh && sudo ./ops/enable-browser-updates.sh
 
 If you already use the connected-folders override, perform your manual update with the same [Compose files](#9-files-and-connected-folders) before running the enable command. The host updater preserves this override. Docker Desktop and custom Compose setups use the manual update command.
 
-The host checks the checkout's Git `origin` about every ten minutes. Browser updates use stable tags in the form `vX.Y.Z` that match the release's `package.json` version and can fast-forward the installed checkout. Publish these tags only for tested releases you intend to offer through the button. Workspace installs the release selected by the owner.
+The host checks the checkout's Git `origin` about every ten minutes. Select **Check now** in **Settings → Updates** to check within a few seconds instead; the app only creates an empty request file, which the host updater removes on its next run. Browser updates use stable tags in the form `vX.Y.Z` that match the release's `package.json` version and can fast-forward the installed checkout. Publish these tags only for tested releases you intend to offer through the button. Workspace installs the release selected by the owner.
 
 For updater details, use `sudo journalctl -u ai-workspace-updates.service`. If activation fails, the updater attempts to restart the previous code and images. If the new release changed the database incompatibly, recover using the matching code version and the pre-update [backup](#6-backups).
 
