@@ -224,6 +224,7 @@ Read project release notes before updating. Rebuild both server and runner: the 
 | TOTP is rejected | Correct clock on server/phone; the same code cannot be reused |
 | HTTPS does not work | Correct domain/IP, DNS A/AAAA for domains, ports 80/443, `./ops/compose.sh logs caddy`; for IP access check `CADDY_CONFIG=Caddyfile.ip` and `TLS_SERVER_NAME` |
 | Runner image is missing | Run `./ops/compose.sh build runner-image` |
+| Task warns that the runner image lacks the system package installer | Run `./ops/compose.sh build runner-image` for the bundled image, or rebuild your custom image from the current Workspace runner. Older images can still use their bundled tools. |
 | GitHub returns 403/404 | PAT repository access, organization approval, correct owner/repository |
 | A chat remains queued | Selected account is connected and idle, capacity is available, and no task, terminal or folder operation is using its working folder; also check writable connected folders |
 | Transfer says the review is out of date | Refresh the review; source/main files or the copy baseline changed |
@@ -279,7 +280,7 @@ The composer offers keyboard and touch suggestions: `/` for commands specific to
 | `/context` and workspace/custom commands | Not exposed | Added from the CLI’s `system/init.slash_commands` after the first message |
 | `/skills`, `/resume`, `/files`, `/terminal`, `/settings`, `/stop`, `/help` | Workspace actions | Workspace actions |
 
-Plan mode persists across turns. The composer shows **Plan mode** and **Switch to execution**; switching is blocked while a task is active. Planning questions are saved as pending requests and can be answered after reconnecting, including from a phone. Stopping or restarting expires pending requests. Claude may request explicit permission to exit planning during a run. Replies to secret questions are sent to the agent without being copied to the event log.
+Plan mode persists across turns. The composer shows **Plan mode** and **Switch to execution**. While planning, Claude can ask you to approve a plan. Approving it queues the same task for execution in a fresh runner, where the package installer is available. Claude asks separately for actions that require permission. Planning questions are saved as pending requests and can be answered after reconnecting, including from a phone. Stopping or restarting expires pending requests. Replies to secret questions are sent to the agent without being copied to the event log.
 
 The web interface does not provide every interactive terminal command. Native session forks, terminal themes and account-wide app mentions are not implemented here. Claude commands are discovered per chat and forwarded only when advertised; availability may change with CLI versions. Codex plan mode uses the experimental collaboration API of the pinned CLI version. See [Codex App Server](https://developers.openai.com/codex/app-server) and [Claude SDK skills and commands](https://code.claude.com/docs/en/agent-sdk/slash-commands).
 

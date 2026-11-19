@@ -18,6 +18,7 @@ import { MAX_RESPONSE_BYTES } from "./runner-output.js";
 import { redact } from "./security.js";
 import { event, notify, bus } from "./events.js";
 import type { AgentEvent } from "../shared.js";
+import { packageNames } from "../runner/package-request.js";
 export const active = new Map<string, Running>();
 let ticking = false,
   shutting = false;
@@ -149,23 +150,56 @@ export async function runJob(job: any) {
         : "Could not save the final response. Persisted output events remain available.";
     }
     try {
-      await db.query(
-        "UPDATE jobs SET state=$2,error=$3,container_id=NULL,updated_at=now() WHERE id=$1",
-        [job.id, state, error || null],
-      );
-      await db.query(
-        "UPDATE approvals SET decision=false WHERE job_id=$1 AND decision IS NULL",
-        [job.id],
-      );
+      const stoppedPlanner =
+        state === "interrupted" &&
+        chat.provider === "claude" &&
+        chat.mode === "plan";
+      const saved = stoppedPlanner
+        ? ((await runtime?.profileSaved?.()) ?? true)
+        : true;
+      await transaction(async (c) => {
+        await c.query(
+          "UPDATE approvals SET decision=false WHERE job_id=$1 AND decision IS NULL",
+          [job.id],
+        );
+        if (stoppedPlanner) {
+          const approved = (
+            await c.query(
+              "SELECT 1 FROM approvals WHERE job_id=$1 AND kind='plan_exit' AND decision=true",
+              [job.id],
+            )
+          ).rowCount;
+          if (approved) {
+            const resumed = (
+              await c.query(
+                "UPDATE jobs SET state=CASE WHEN cancel_requested THEN 'cancelled' ELSE 'queued' END,error=NULL,container_id=NULL,updated_at=now() WHERE id=$1 RETURNING state",
+                [job.id],
+              )
+            ).rows[0];
+            state = resumed.state;
+            if (state === "queued" && !saved)
+              await c.query(
+                "UPDATE chats SET session_id=NULL,session_account=NULL WHERE id=$1",
+                [chat.id],
+              );
+          }
+        }
+        if (state !== "queued")
+          await c.query(
+            "UPDATE jobs SET state=$2,error=$3,container_id=NULL,updated_at=now() WHERE id=$1",
+            [job.id, state, error || null],
+          );
+      });
       try {
         await event(chat.id, job.id, "status", { state, error });
       } catch (err) {
         if (!isOutputLimit(err)) throw err;
       }
     } finally {
-      active.delete(job.id);
+      if (active.get(job.id) === runtime) active.delete(job.id);
       bus.emit("refresh", chat.id);
     }
+    if (state === "queued") return;
     await notify(
       chat.id,
       state === "completed" ? "Task completed" : "Needs attention",
@@ -223,6 +257,16 @@ export async function runJob(job: any) {
         [chat.id, e.id, job.account_id],
       );
     if (e.type === "limits") await saveUsage(job.account_id, e.limits);
+    if (e.type === "packages_installed") {
+      const packages = packageNames(e.packages);
+      if (packages) {
+        await event(chat.id, job.id, e.type, { packages });
+        await event(chat.id, job.id, "log", {
+          text: "Debian packages ready for this run: " + packages.join(", "),
+        });
+      }
+      return;
+    }
     if (e.type === "model" && typeof e.model === "string")
       await db.query(
         "UPDATE chats SET resolved_model=$2,resolved_effort=$3 WHERE id=$1",
@@ -255,7 +299,13 @@ export async function runJob(job: any) {
             0,
             16000,
           ),
-          e.type === "question" ? "question" : "permission",
+          e.type === "question"
+            ? "question"
+            : e.planExit === true &&
+                chat.provider === "claude" &&
+                chat.mode === "plan"
+              ? "plan_exit"
+              : "permission",
           e.questions ? redact(JSON.stringify(e.questions)) : null,
           e.details == null ? null : redact(JSON.stringify(e.details)),
         ],
@@ -319,12 +369,24 @@ export async function runJob(job: any) {
         job.message_id,
       ])
     ).rows[0].content;
-    const shortcut = slashCommand(latest);
+    const originalShortcut = slashCommand(latest);
+    const approvedPlan =
+      job.attempt > 0 && chat.mode !== "plan"
+        ? (
+            await db.query(
+              "SELECT a.details #>> '{}' AS plan FROM approvals a JOIN jobs j ON j.id=a.job_id WHERE j.chat_id=$1 AND j.message_id=$2 AND a.kind='plan_exit' AND a.decision=true ORDER BY a.created_at DESC LIMIT 1",
+              [chat.id, job.message_id],
+            )
+          ).rows[0]?.plan
+        : undefined;
+    const shortcut = approvedPlan ? null : originalShortcut;
     const native = chat.session_id && chat.session_account === job.account_id;
     if (shortcut?.name === "compact" && !native)
       throw new Error(
         "This account has no session to compact. Send a message first.",
       );
+    const requestText =
+      originalShortcut?.name === "plan" ? originalShortcut.arguments : latest;
     let prompt =
       (native
         ? ""
@@ -332,7 +394,11 @@ export async function runJob(job: any) {
           ? "Context from earlier work (verify actual files and command outcomes):\n" +
             chat.summary +
             "\n\n"
-          : "") + (shortcut?.name === "plan" ? shortcut.arguments : latest);
+          : "") + requestText;
+    if (approvedPlan)
+      prompt +=
+        "\n\nThe Workspace owner approved the plan. Continue in execution mode. Request permission for actions as usual.\n\nApproved plan:\n" +
+        approvedPlan;
     const workingFolder = await chatWorkspace(chat.id);
     const servers = await chatServers(chat.id);
     if (servers.length)
@@ -398,8 +464,11 @@ export async function runJob(job: any) {
           );
         }
       },
-      // Lets a chat started before per-chat sessions keep its native session.
-      { sessionId: native ? chat.session_id : null },
+      {
+        // Lets a chat started before per-chat sessions keep its native session.
+        sessionId: native ? chat.session_id : null,
+        installPackages: chat.mode !== "plan" && !shortcut,
+      },
     );
     if (finished) {
       await runtime.stop();
@@ -455,7 +524,7 @@ export async function runJob(job: any) {
             : undefined,
         model: chat.model,
         effort: chat.effort,
-        autonomous: chat.autonomous,
+        autonomous: chat.autonomous && !approvedPlan,
         sessionId: native ? chat.session_id : undefined,
         attachments: attachments
           .filter((f) => f.message_id === job.message_id)

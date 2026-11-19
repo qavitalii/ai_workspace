@@ -38,6 +38,12 @@ Chat and project settings include **Folders**: upload files or directories, conn
 
 Choose a model and reasoning effort before the first message or from the composer. Type `/` for Workspace commands, `@` for files/folders, and `$` for workspace skills. These are supported Workspace features, not a claim of complete parity with every native CLI command or plugin.
 
+### System tools for agent tasks
+
+Agent tasks and chat terminals include C and C++ build tools (`gcc`, `g++`, `make`, `pkg-config`), the SQLite, PostgreSQL and MySQL-compatible clients (`sqlite3`, `psql`, `mysql`), and `rsync`, `zip`, `xz`, `file`, `less` and `tree`.
+
+During an execution task, ask Codex or Claude Code to install a Debian package such as `ffmpeg`. Both agents have a dedicated installer tool, also available as `workspace-install ffmpeg` in the task container. The tool accepts package names from Debian's signed repositories and records successful installs in the task log. Downloads and dependencies count toward a 1 GiB budget per run. Installed packages last for that run. Files the agent saves in the working folder persist as usual.
+
 ### SSH servers
 
 **Settings → Servers & SSH keys** manages SSH connections. Create or import a key (including passphrase-protected keys), install its public key on your server, confirm the server fingerprint and test the connection. Select servers in project or personal chat settings; project working copies inherit access. Agents and chat terminals can use SSH, SCP and SFTP by alias. Private keys stay in an isolated authentication helper for each run. Removing a connection does not revoke its public key on the remote server. [Setup, access and backup details](deployment.md#ssh-servers-and-keys).

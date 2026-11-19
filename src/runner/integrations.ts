@@ -16,10 +16,34 @@ import path from "node:path";
 import type { ProjectIntegration } from "../shared.js";
 
 const exec = promisify(execFile);
+const packageServer = {
+  command: "/usr/local/bin/node",
+  args: ["/app/dist/node/runner/package-tools.js"],
+};
+export const packageToolName = (serverName: string) =>
+  "mcp__" + serverName + "__install";
 
-export function codexIntegrations(entries: ProjectIntegration[]) {
+export function codexIntegrations(
+  entries: ProjectIntegration[],
+  packageServerName?: string,
+) {
   const args: string[] = [];
   const env: Record<string, string> = {};
+  if (packageServerName) {
+    const server = "mcp_servers." + packageServerName;
+    args.push(
+      "-c",
+      server + ".command=" + JSON.stringify(packageServer.command),
+      "-c",
+      server + ".args=" + JSON.stringify(packageServer.args),
+      "-c",
+      server + '.enabled_tools=["install"]',
+      "-c",
+      server + '.tools.install.approval_mode="approve"',
+      "-c",
+      server + ".tool_timeout_sec=300",
+    );
+  }
   for (const entry of entries) {
     if (entry.kind === "plugin") {
       args.push("-c", `plugins.${JSON.stringify(entry.target)}.enabled=true`);
@@ -40,6 +64,7 @@ export async function claudeIntegrations(
   entries: ProjectIntegration[],
   approvalBridge: boolean,
   root = "/workspace",
+  packageServerName?: string,
 ) {
   const args: string[] = [];
   const servers: Record<string, unknown> = {};
@@ -48,6 +73,10 @@ export async function claudeIntegrations(
       command: "node",
       args: ["/app/dist/node/runner/permissions.js"],
     };
+  if (packageServerName) {
+    servers[packageServerName] = packageServer;
+    args.push("--allowedTools", packageToolName(packageServerName));
+  }
   for (const entry of entries) {
     if (entry.kind === "plugin") {
       const dir = await realpath(path.join(root, entry.target));

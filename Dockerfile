@@ -33,7 +33,10 @@ CMD ["node","dist/node/server/main.js"]
 FROM node:22-bookworm-slim AS runner
 ARG CODEX_VERSION=0.169.0
 ARG CLAUDE_VERSION=2.1.325
-RUN apt-get update && apt-get install -y --no-install-recommends git openssh-client python3 python3-pip curl ca-certificates ripgrep jq unzip procps bubblewrap && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git openssh-client python3 python3-pip curl ca-certificates ripgrep jq unzip procps bubblewrap util-linux \
+    build-essential pkg-config sqlite3 postgresql-client default-mysql-client rsync zip xz-utils file less tree \
+    && rm -rf /var/lib/apt/lists/*
 RUN npm install -g @openai/codex@${CODEX_VERSION} @anthropic-ai/claude-code@${CLAUDE_VERSION} && npm cache clean --force
 WORKDIR /app
 COPY --from=dependencies /app/node_modules ./node_modules
@@ -42,10 +45,22 @@ COPY package.json ./
 COPY --from=aws /usr/local/aws-cli /usr/local/aws-cli
 RUN ln -s /usr/local/aws-cli/v2/current/bin/aws /usr/local/bin/aws
 COPY --chmod=755 ops/git-askpass.sh /usr/local/bin/workspace-git-askpass
+COPY --chmod=755 ops/workspace-package-runner.sh /usr/local/bin/workspace-package-runner
+COPY --chmod=755 ops/workspace-install.sh /usr/local/bin/workspace-install
+COPY ops/workspace-apt.conf /etc/workspace-install/apt.conf
+COPY ops/workspace-install-sandbox.c /tmp/workspace-install-sandbox.c
+RUN install -d -m 0755 /usr/local/lib/workspace-install /run/workspace-packages /etc/workspace-install/empty \
+    && install -d -m 0710 -g "$(id -g _apt)" /var/lib/workspace-install \
+    && install -d -m 1770 -g "$(id -g _apt)" /var/lib/workspace-install/tmp \
+    && sed 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources > /etc/workspace-install/debian.sources \
+    && cc -std=c11 -O2 -Wall -Wextra -Werror -o /usr/local/lib/workspace-install/sandbox /tmp/workspace-install-sandbox.c \
+    && rm /tmp/workspace-install-sandbox.c \
+    && printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d && chmod 0755 /usr/sbin/policy-rc.d
 RUN mkdir -p /profile /workspace && chown node:node /profile /workspace
 RUN mkdir -p /run/workspace-ssh /private && chown node:node /run/workspace-ssh /private && chmod 700 /run/workspace-ssh /private \
     && printf 'Include /run/workspace-ssh/config\n' > /etc/ssh/ssh_config.d/00-workspace.conf
 ENV HOME=/profile CODEX_HOME=/profile/.codex CLAUDE_CONFIG_DIR=/profile/.claude
+LABEL ai.workspace.runner.package-installer="1"
 USER node
 WORKDIR /workspace
 CMD ["node","/app/dist/node/runner/main.js"]

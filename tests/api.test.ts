@@ -461,10 +461,12 @@ esac
         try {
           terminal.send({ type: "terminal", data: "aws configure list\r" });
           await vi.waitFor(
-            () => expect(output).toContain("shared-credentials-file"),
+            () => {
+              expect(output).toContain("shared-credentials-file");
+              expect(output).toContain("us-east-1");
+            },
             { timeout: 5_000 },
           );
-          expect(output).toContain("us-east-1");
           expect(output).not.toContain("TESTROLE");
         } finally {
           await terminal.stop();
@@ -3593,6 +3595,7 @@ esac
       await runJob(job);
       expect(launch).toHaveBeenCalledWith(chat, other, expect.any(Function), {
         sessionId: null,
+        installPackages: true,
       });
       expect(send.mock.calls[0][0].input).toMatchObject({
         provider: "claude",
@@ -3602,6 +3605,7 @@ esac
       expect(send.mock.calls[0][0].input.prompt).toContain(
         "Continue the change",
       );
+      await emit({ type: "packages_installed", packages: ["ffmpeg"] });
       await emit({ type: "delta", text: "Continued with Claude" });
       await emit({ type: "completed" });
       expect(
@@ -3612,11 +3616,160 @@ esac
           )
         ).rows,
       ).toEqual([{ provider: "claude", content: "Continued with Claude" }]);
+      const saved = await app.inject({
+        method: "GET",
+        url: `/api/chats/${chat}`,
+        headers,
+      });
+      expect(saved.json().events).toContainEqual(
+        expect.objectContaining({
+          type: "log",
+          data: { text: "Debian packages ready for this run: ffmpeg" },
+        }),
+      );
     } finally {
       vi.restoreAllMocks();
       active.delete(job.id);
     }
   });
+  it.each([false, true])(
+    "transitions a Claude plan with cancellation=%s",
+    async (cancelAfterApproval) => {
+      await db.query("UPDATE accounts SET provider='claude' WHERE id=$1", [
+        account,
+      ]);
+      await db.query(
+        "UPDATE chats SET provider='claude',autonomous=true WHERE id=$1",
+        [chat],
+      );
+      await app.inject({
+        method: "POST",
+        url: `/api/chats/${chat}/messages`,
+        headers,
+        payload: {
+          content: "/plan Convert the video",
+          client_id: randomUUID(),
+        },
+      });
+      const job = await claim();
+      const runners = [vi.fn(), vi.fn()];
+      const handlers: ((event: any) => void | Promise<void>)[] = [];
+      const stop = vi.fn().mockResolvedValue(undefined);
+      vi.spyOn(gitModule, "initializeWorkspace").mockResolvedValue();
+      const launch = vi
+        .spyOn(runtimeModule, "launch")
+        .mockImplementation(async (_chat, _account, handler) => {
+          const index = handlers.push(handler) - 1;
+          return {
+            id: `plan-stage-${index}`,
+            send: runners[index],
+            stop,
+            profileSaved: async () => true,
+          };
+        });
+      try {
+        await runJob(job);
+        expect(launch).toHaveBeenLastCalledWith(
+          chat,
+          account,
+          expect.any(Function),
+          {
+            sessionId: null,
+            installPackages: false,
+          },
+        );
+        expect(runners[0].mock.calls[0][0].input.mode).toBe("plan");
+        await handlers[0]({
+          type: "session",
+          id: "existing-claude-plan-session",
+        });
+        async function approval(allow: boolean) {
+          await handlers[0]({
+            type: "approval",
+            id: randomUUID(),
+            description: "Approve the plan and start execution?",
+            planExit: true,
+            details: "Install ffmpeg and convert the attached video.",
+          });
+          const plan = (
+            await db.query(
+              "SELECT id,request_id FROM approvals WHERE job_id=$1 AND kind='plan_exit' AND decision IS NULL",
+              [job.id],
+            )
+          ).rows[0];
+          const decision = await app.inject({
+            method: "POST",
+            url: `/api/approvals/${plan.id}`,
+            headers,
+            payload: { allow },
+          });
+          expect(decision.statusCode).toBe(200);
+          return plan;
+        }
+        const denied = await approval(false);
+        expect(runners[0]).toHaveBeenLastCalledWith({
+          type: "approve",
+          id: denied.request_id,
+          allow: false,
+        });
+        const accepted = await approval(true);
+        expect(runners[0]).toHaveBeenLastCalledWith({ type: "stop" });
+        expect(runners[0]).not.toHaveBeenCalledWith({
+          type: "approve",
+          id: accepted.request_id,
+          allow: true,
+        });
+        expect(await claim()).toBeNull();
+        if (cancelAfterApproval) {
+          const result = await app.inject({
+            method: "POST",
+            url: `/api/chats/${chat}/stop`,
+            headers,
+          });
+          expect(result.statusCode).toBe(200);
+        }
+        await handlers[0]({ type: "interrupted" });
+        expect(stop).toHaveBeenCalledTimes(1);
+        const continued = await claim();
+        if (cancelAfterApproval) {
+          expect(continued).toBeNull();
+          expect(
+            (await db.query("SELECT state FROM jobs WHERE id=$1", [job.id]))
+              .rows[0].state,
+          ).toBe("cancelled");
+          return;
+        }
+        expect(continued.id).toBe(job.id);
+        await runJob(continued);
+        expect(launch).toHaveBeenLastCalledWith(
+          chat,
+          account,
+          expect.any(Function),
+          {
+            sessionId: "existing-claude-plan-session",
+            installPackages: true,
+          },
+        );
+        expect(runners[1].mock.calls[0][0].input).toMatchObject({
+          mode: "default",
+          operation: undefined,
+          autonomous: false,
+          prompt: expect.stringContaining(
+            "Install ffmpeg and convert the attached video.",
+          ),
+        });
+        expect(runners[1].mock.calls[0][0].input.prompt).not.toContain("/plan");
+        await handlers[1]({ type: "completed", result: "Video converted." });
+        expect(
+          (await db.query("SELECT state FROM jobs WHERE id=$1", [job.id]))
+            .rows[0].state,
+        ).toBe("completed");
+      } finally {
+        vi.restoreAllMocks();
+        active.delete(job.id);
+      }
+    },
+  );
   it("respects the default capacity and never shares one account concurrently", async () => {
     const project = (
       await db.query("SELECT project_id FROM chats WHERE id=$1", [chat])
@@ -3905,6 +4058,119 @@ esac
     },
     60_000,
   );
+  it.skipIf(process.env.DOCKER_TESTS !== "1")(
+    "installs a Debian package for one task while keeping the runner unprivileged",
+    async () => {
+      const baseTools = [
+        "gcc",
+        "g++",
+        "make",
+        "pkg-config",
+        "sqlite3",
+        "psql",
+        "mysql",
+        "rsync",
+        "zip",
+        "xz",
+        "file",
+        "less",
+        "tree",
+      ];
+      async function execute(command: string, installed?: string) {
+        let output = "";
+        const packages: string[] = [];
+        const run = await launch(
+          chat,
+          account,
+          (event) => {
+            if (event.type === "terminal") output += event.data;
+            if (event.type === "packages_installed")
+              packages.push(...event.packages);
+          },
+          { installPackages: true },
+        );
+        try {
+          const { HostConfig: host } = await docker
+            .getContainer(run.id)
+            .inspect();
+          expect(host).toMatchObject({
+            Memory: 2 * 1024 ** 3,
+            NanoCpus: 2e9,
+            PidsLimit: 256,
+            CapDrop: ["ALL"],
+            SecurityOpt: ["no-new-privileges:true"],
+            NetworkMode: "bridge",
+            AutoRemove: true,
+          });
+          expect(host.Privileged).toBe(false);
+          expect(host.CapAdd).not.toContain("SYS_ADMIN");
+          expect(host.CapAdd).not.toContain("NET_RAW");
+          run.send({
+            type: "terminal",
+            data: `( ${command} ); rc=$?; echo; echo WORKSPACE_PACKAGE_EXIT_''$rc\r`,
+          });
+          await vi.waitFor(
+            () => expect(output).toMatch(/^WORKSPACE_PACKAGE_EXIT_\d+\r?$/m),
+            {
+              timeout: 150_000,
+            },
+          );
+          expect(output, "Package runner output").toMatch(
+            /^WORKSPACE_PACKAGE_EXIT_0\r?$/m,
+          );
+          if (installed)
+            await vi.waitFor(() => expect(packages).toContain(installed));
+          return { output, packages };
+        } finally {
+          await run.stop();
+        }
+      }
+
+      const mcpInstall = JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: { name: "install", arguments: { packages: ["g++"] } },
+      });
+      const mcpClient = `
+        const { spawn } = require("node:child_process");
+        const { createInterface } = require("node:readline");
+        const server = spawn(process.execPath, ["/app/dist/node/runner/package-tools.js"], { stdio: ["pipe", "pipe", "inherit"] });
+        createInterface({ input: server.stdout }).once("line", (line) => {
+          console.log(line);
+          server.stdin.end();
+        });
+        server.stdin.write(process.argv[1] + "\\n");
+      `.replace(/\s+/g, " ");
+      const first = await execute(
+        [
+          `for tool in ${baseTools.join(" ")}; do "$tool" --version >/dev/null || exit 1; done`,
+          'test "$(id -u):$(id -g)" = 1000:1000',
+          "awk '/^Cap(Inh|Prm|Eff|Bnd|Amb):/ && $2 != \"0000000000000000\" {bad=1} /^NoNewPrivs:/ && $2 == 1 {nnp=1} END {exit (bad || !nnp)}' /proc/self/status",
+          "test ! -S /var/run/docker.sock",
+          "! command -v ffmpeg",
+          "for arg in --reinstall https://example.invalid/file.deb ./file.deb bash=1 'tree; echo invalid'; do if workspace-install \"$arg\"; then exit 1; fi; done",
+          "! workspace-install tree-",
+          "workspace-install ffmpeg",
+          "ffmpeg -version | head -n 1",
+          `node -e '${mcpClient}' '${mcpInstall}' | tee /dev/stderr | grep -Fq '"isError":false'`,
+          'touch /workspace/package-test && test "$(stat -c %u /workspace/package-test)" = 1000',
+          "echo PACKAGE_CHECKS_PASSED",
+        ].join(" && "),
+        "g++",
+      );
+      expect(first.output).toMatch(/^ffmpeg version /m);
+      expect(first.output).toMatch(/^PACKAGE_CHECKS_PASSED\r?$/m);
+      expect(first.packages).toEqual(["ffmpeg", "g++"]);
+
+      const next = await execute(
+        "test -f /workspace/package-test && ! command -v ffmpeg && echo CLEAN_NEXT_RUN",
+      );
+      expect(next.output).toMatch(/^CLEAN_NEXT_RUN\r?$/m);
+      expect(next.packages).toEqual([]);
+    },
+    190_000,
+  );
   it("removes an account and local credentials while keeping chats, files and history", async () => {
     await mkdir(path.join(data, "profiles", account), { recursive: true });
     await writeFile(
@@ -4146,7 +4412,9 @@ esac
       await writeFile(path.join(cp, "uploaded.pdf"), Buffer.from([0, 2]));
       await writeFile(path.join(root, "uploaded.pdf"), Buffer.from([0, 3]));
       const conflict = await reviewCopy(copy.id);
-      expect(conflict.changes[0].conflict).toBe(true);
+      expect(conflict.changes).toContainEqual(
+        expect.objectContaining({ path: "uploaded.pdf", conflict: true }),
+      );
       await expect(applyCopy(copy.id, conflict.id, {})).rejects.toThrow(
         /every conflict/,
       );

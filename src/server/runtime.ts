@@ -4,6 +4,7 @@ import { consumeRunnerOutput } from "./runner-output.js";
 import { mkdir, chown, chmod } from "node:fs/promises";
 import path from "node:path";
 import { config } from "./config.js";
+import { concurrentTasks } from "./settings.js";
 import type { AgentEvent, RunnerCommand } from "../shared.js";
 import { db } from "./db.js";
 import {
@@ -44,8 +45,28 @@ export async function launch(
   chatId: string | null,
   accountId: string | null,
   onEvent: (e: AgentEvent) => void | Promise<void>,
-  options: { sessionId?: string | null; signIn?: boolean } = {},
+  options: {
+    sessionId?: string | null;
+    signIn?: boolean;
+    installPackages?: boolean;
+  } = {},
 ): Promise<Running> {
+  const image = options.installPackages
+    ? await docker.getImage(config.image).inspect()
+    : undefined;
+  const installPackages =
+    image?.Config?.Labels?.["ai.workspace.runner.package-installer"] === "1";
+  let packageConcurrency: number | undefined;
+  if (installPackages) {
+    const [configured, running] = await Promise.all([
+      concurrentTasks(),
+      db.query(
+        "SELECT count(*) n FROM jobs WHERE state IN ('running','waiting_approval')",
+      ),
+    ]);
+    // Lowering the limit does not stop the jobs already admitted.
+    packageConcurrency = Math.max(configured, Number(running.rows[0].n));
+  }
   const w = chatId ? await chatWorkspace(chatId) : null;
   const work = w
     ? workspace(w.id)
@@ -131,9 +152,18 @@ export async function launch(
   let c: Docker.Container;
   try {
     c = await docker.createContainer({
-      Image: config.image,
-      User: "1000:1000",
-      WorkingDir: "/workspace",
+      // A concurrently retagged image must not inherit the inspected image's
+      // permission to start the broker.
+      Image: image?.Id ?? config.image,
+      User: installPackages ? "0:0" : "1000:1000",
+      WorkingDir: installPackages ? "/" : "/workspace",
+      ...(installPackages
+        ? {
+            Entrypoint: ["/usr/local/bin/workspace-package-runner"],
+            Cmd: [],
+            Healthcheck: { Test: ["NONE"] },
+          }
+        : {}),
       AttachStdin: true,
       AttachStdout: true,
       AttachStderr: true,
@@ -154,6 +184,9 @@ export async function launch(
         ...Object.entries(aws?.env ?? {}).map(
           ([key, value]) => key + "=" + value,
         ),
+        ...(packageConcurrency === undefined
+          ? []
+          : ["WORKSPACE_PACKAGE_CONCURRENCY=" + packageConcurrency]),
       ],
       HostConfig: {
         Mounts: mounts,
@@ -165,8 +198,20 @@ export async function launch(
         NanoCpus: 2e9,
         PidsLimit: 256,
         CapDrop: ["ALL"],
+        ...(installPackages
+          ? {
+              CapAdd: [
+                "CHOWN",
+                "DAC_OVERRIDE",
+                "FOWNER",
+                "SETUID",
+                "SETGID",
+                "SETPCAP",
+              ],
+            }
+          : {}),
         SecurityOpt: ["no-new-privileges:true"],
-        ReadonlyRootfs: true,
+        ReadonlyRootfs: !installPackages,
         Tmpfs: {
           "/tmp": "rw,nosuid,nodev,size=512m",
           ...(!accountId
@@ -228,6 +273,12 @@ export async function launch(
   void output.catch(() => {});
   try {
     await c.start();
+    if (image && !installPackages)
+      await onEvent({
+        type: "warning",
+        message:
+          "This runner image does not support installing system packages during a task. Refresh the bundled image with ./ops/compose.sh build runner-image, or rebuild your custom image from the current Workspace runner.",
+      });
   } catch (error) {
     await stop();
     throw error;

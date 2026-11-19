@@ -53,6 +53,8 @@ INTEGRATION_TESTS=1 DOCKER_TESTS=1 RUNNER_IMAGE=ai-workspace-runner:tests DATABA
 
 If the Node Docker client cannot find Docker Desktop's socket on macOS, prefix that test command with `DOCKER_HOST="unix://$HOME/.docker/run/docker.sock"`. The separate image tag avoids replacing the installed runner. Tests use temporary files and simulated agent results; they do not authenticate or make inference calls.
 
+The system-package test needs Landlock ABI 3 or newer in the Docker kernel and access to the signed Debian repositories. It installs `ffmpeg` in a disposable runner and verifies that a fresh run starts with the bundled tools.
+
 ### Include SSH tests
 
 Build the disposable SSH target, then enable both container test groups:

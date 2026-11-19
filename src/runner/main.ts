@@ -2,16 +2,34 @@ import {
   codexIntegrations,
   codexPluginHome,
   claudeIntegrations,
+  packageToolName,
 } from "./integrations.js";
+import { drainPackageAudit } from "./package-audit.js";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createInterface } from "node:readline";
 import { createServer } from "node:http";
-import { readFile, mkdir, writeFile } from "node:fs/promises";
-import { randomUUID } from "node:crypto";
+import { constants } from "node:fs";
+import {
+  readFile,
+  mkdir,
+  mkdtemp,
+  open,
+  readdir,
+  writeFile,
+} from "node:fs/promises";
+import path from "node:path";
+import { randomBytes, randomUUID } from "node:crypto";
 import { quotaError, type RunInput, type RunnerCommand } from "../shared.js";
 import { claudeSubscriptionUsage } from "../usage.js";
 const emit = (data: unknown) =>
   process.stdout.write(JSON.stringify(data) + "\n");
+function flushPackageAudit() {
+  if (process.env.WORKSPACE_SYSTEM_PACKAGES === "1")
+    for (const packages of drainPackageAudit())
+      emit({ type: "packages_installed", packages });
+}
+if (process.env.WORKSPACE_SYSTEM_PACKAGES === "1")
+  setInterval(flushPackageAudit, 250).unref();
 let child: ChildProcessWithoutNullStreams | undefined,
   terminal: any,
   threadId: string | undefined,
@@ -47,6 +65,7 @@ function rpc(method: string, params: unknown = {}) {
 function finish(type: string, extra: object = {}) {
   if (ended) return;
   ended = true;
+  flushPackageAudit();
   emit({ type, ...extra });
 }
 function processChild(
@@ -84,8 +103,11 @@ function processChild(
       });
   });
 }
-async function codex(entries: NonNullable<RunInput["integrations"]> = []) {
-  const integrations = codexIntegrations(entries);
+async function codex(
+  entries: NonNullable<RunInput["integrations"]> = [],
+  packageServerName?: string,
+) {
+  const integrations = codexIntegrations(entries, packageServerName);
   await mkdir("/profile/.codex", { recursive: true });
   const home = await codexPluginHome(entries);
   if (home) {
@@ -230,8 +252,27 @@ async function codex(entries: NonNullable<RunInput["integrations"]> = []) {
   });
   send({ method: "initialized" });
 }
+function packageServerFor(input: RunInput) {
+  // Project MCP configuration cannot predefine an automatically approved tool
+  // if the server name changes with every runner invocation.
+  if (
+    process.env.WORKSPACE_SYSTEM_PACKAGES === "1" &&
+    input.mode !== "plan" &&
+    !input.operation
+  )
+    return "workspace_packages_" + randomBytes(8).toString("hex");
+}
+function executionPrompt(input: RunInput, packageServerName?: string) {
+  return packageServerName
+    ? input.prompt +
+        "\n\nIf this task needs a system package, call " +
+        packageToolName(packageServerName) +
+        " with its Debian package name, for example ffmpeg. The tool is the same installer as workspace-install and avoids shell permission prompts. Installed packages last only for this run."
+    : input.prompt;
+}
 async function runCodex(input: RunInput) {
-  await codex(input.integrations);
+  const packageServerName = packageServerFor(input);
+  await codex(input.integrations, packageServerName);
   const args: any = {
     cwd: "/workspace",
     approvalPolicy:
@@ -274,7 +315,9 @@ async function runCodex(input: RunInput) {
     });
     return;
   }
-  const prompt: any[] = [{ type: "text", text: input.prompt }];
+  const prompt: any[] = [
+    { type: "text", text: executionPrompt(input, packageServerName) },
+  ];
   for (const f of input.attachments)
     if (["image/png", "image/jpeg", "image/webp", "image/gif"].includes(f.mime))
       prompt.push({ type: "localImage", path: f.path });
@@ -292,7 +335,36 @@ async function runCodex(input: RunInput) {
     ...(input.effort ? { effort: input.effort } : {}),
   });
 }
+async function readClaudePlan(directory: string) {
+  const limit = 128 * 1024;
+  try {
+    const plans = (await readdir(directory, { withFileTypes: true })).filter(
+      (entry) => entry.isFile() && entry.name.endsWith(".md"),
+    );
+    if (plans.length !== 1) return undefined;
+    const file = await open(
+      path.join(directory, plans[0].name),
+      constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+    );
+    try {
+      if (!(await file.stat()).isFile()) return undefined;
+      const buffer = Buffer.alloc(limit + 1);
+      const { bytesRead } = await file.read(buffer);
+      if (bytesRead <= limit)
+        return buffer.toString("utf8", 0, bytesRead).trim() || undefined;
+    } finally {
+      await file.close();
+    }
+  } catch {
+    // The native session can still supply the plan if the file was unavailable.
+  }
+}
 async function runClaude(input: RunInput) {
+  const packageServerName = packageServerFor(input);
+  const plansDirectory =
+    input.mode === "plan"
+      ? await mkdtemp("/tmp/workspace-claude-plan-")
+      : undefined;
   const server = createServer(async (req, res) => {
     if (req.method !== "POST" || req.url !== "/approve") {
       res.writeHead(404).end();
@@ -334,14 +406,22 @@ async function runClaude(input: RunInput) {
         };
         allowed = true;
       } else {
+        const planExit = !!plansDirectory && p.tool_name === "ExitPlanMode";
+        const plan = planExit
+          ? typeof p.input?.plan === "string" && p.input.plan.trim()
+            ? p.input.plan
+            : await readClaudePlan(plansDirectory)
+          : undefined;
         emit({
           type: "approval",
           id,
-          description:
-            p.tool_name === "ExitPlanMode"
+          description: planExit
+            ? "Approve the plan and start execution?"
+            : p.tool_name === "ExitPlanMode"
               ? "Allow Claude to leave planning mode and implement the plan in this run?"
               : p.tool_name || "Allow this action?",
-          details: p.input,
+          details: planExit ? (plan ?? null) : p.input,
+          ...(planExit ? { planExit: true } : {}),
         });
         allowed = await new Promise<boolean>((resolve) =>
           approvals.set(id, resolve),
@@ -372,6 +452,8 @@ async function runClaude(input: RunInput) {
     "--include-partial-messages",
   ];
   if (input.sessionId) args.push("--resume", input.sessionId);
+  if (plansDirectory)
+    args.push("--settings", JSON.stringify({ plansDirectory }));
   if (input.model) args.push("--model", input.model);
   if (input.effort) args.push("--effort", input.effort);
   if (input.autonomous && input.mode !== "plan")
@@ -387,6 +469,8 @@ async function runClaude(input: RunInput) {
     ...(await claudeIntegrations(
       input.integrations ?? [],
       !input.autonomous || input.mode === "plan",
+      "/workspace",
+      packageServerName,
     )),
   );
   processChild("claude", args, (line) => {
@@ -433,7 +517,9 @@ async function runClaude(input: RunInput) {
         });
     }
   });
-  const content: any[] = [{ type: "text", text: input.prompt }];
+  const content: any[] = [
+    { type: "text", text: executionPrompt(input, packageServerName) },
+  ];
   for (const f of input.attachments)
     if (
       ["image/png", "image/jpeg", "image/webp", "image/gif"].includes(f.mime)

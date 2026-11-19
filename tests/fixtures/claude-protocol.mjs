@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 import { createInterface } from "node:readline";
 import assert from "node:assert/strict";
+import { writeFile } from "node:fs/promises";
+import path from "node:path";
 const send = (m) => process.stdout.write(JSON.stringify(m) + "\n");
 createInterface({ input: process.stdin }).on("line", async (line) => {
   try {
@@ -10,7 +12,7 @@ createInterface({ input: process.stdin }).on("line", async (line) => {
       "plan",
     );
     assert.ok(!process.argv.includes("--dangerously-skip-permissions"));
-    assert.equal(m.message.content[0].text, "Plan the task");
+    const prompt = m.message.content[0].text;
     send({
       type: "system",
       subtype: "init",
@@ -27,6 +29,23 @@ createInterface({ input: process.stdin }).on("line", async (line) => {
         resetsAt: 2000000000,
       },
     });
+    if (prompt === "Plan an install") {
+      const settings = JSON.parse(
+        process.argv[process.argv.indexOf("--settings") + 1],
+      );
+      await writeFile(
+        path.join(settings.plansDirectory, "install.md"),
+        "# Install\nUse ffmpeg.\n",
+      );
+      const approval = await fetch("http://127.0.0.1:47831/approve", {
+        method: "POST",
+        body: JSON.stringify({ tool_name: "ExitPlanMode", input: {} }),
+      });
+      assert.equal((await approval.json()).behavior, "deny");
+      send({ type: "result", is_error: false, result: "Plan denied." });
+      return;
+    }
+    assert.equal(prompt, "Plan the task");
     const response = await fetch("http://127.0.0.1:47831/approve", {
       method: "POST",
       body: JSON.stringify({

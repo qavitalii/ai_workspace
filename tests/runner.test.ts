@@ -72,6 +72,10 @@ async function run(input: RunInput | { type: "usage"; provider: "codex" }) {
               ),
             }) + "\n",
           );
+        if (e.type === "approval" && e.planExit)
+          proc.stdin.write(
+            JSON.stringify({ type: "approve", id: e.id, allow: false }) + "\n",
+          );
         if (e.type === "completed" || e.type === "limits_read") {
           clearTimeout(timer);
           resolve();
@@ -140,6 +144,16 @@ it.skipIf(process.env.DOCKER_TESTS !== "1")(
     expect(claude.find((e) => e.type === "completed").result).toBe(
       "Claude plan complete",
     );
+    const exitPlan = await run({
+      ...base,
+      provider: "claude",
+      mode: "plan",
+      prompt: "Plan an install",
+    });
+    expect(exitPlan.find((e) => e.type === "approval")).toMatchObject({
+      planExit: true,
+      details: "# Install\nUse ffmpeg.",
+    });
   },
   120000,
 );

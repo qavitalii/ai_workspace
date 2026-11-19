@@ -35,6 +35,15 @@ describe("project integrations", () => {
     expect(args.join(" ")).not.toContain(docs.token);
     expect(env.WORKSPACE_MCP_TOKEN_docs).toBe(docs.token);
     expect(args).toContain('plugins."demo@local".enabled=true');
+    expect(args.join(" ")).not.toContain("workspace_packages");
+    const packages = codexIntegrations([docs], "workspace_packages_a85f14");
+    expect(packages.args).toContain(
+      'mcp_servers.workspace_packages_a85f14.tools.install.approval_mode="approve"',
+    );
+    expect(packages.args).toContain(
+      'mcp_servers.workspace_packages_a85f14.enabled_tools=["install"]',
+    );
+    expect(packages.args.join(" ")).not.toContain("mcp_servers.ws_docs.tools");
   });
 
   it("keeps Claude's permission bridge alongside project servers and confines plugin paths", async () => {
@@ -49,9 +58,20 @@ describe("project integrations", () => {
     let config: string | undefined;
     try {
       await mkdir(path.join(root, plugin.target), { recursive: true });
-      const args = await claudeIntegrations([docs, plugin], true, root);
+      const args = await claudeIntegrations(
+        [docs, plugin],
+        true,
+        root,
+        "workspace_packages_a85f14",
+      );
       config = args[args.indexOf("--mcp-config") + 1];
       expect(args).toContain(path.join(root, plugin.target));
+      expect(
+        args.slice(
+          args.indexOf("--allowedTools"),
+          args.indexOf("--allowedTools") + 2,
+        ),
+      ).toEqual(["--allowedTools", "mcp__workspace_packages_a85f14__install"]);
       expect(args.join(" ")).not.toContain(docs.token);
       expect((await stat(config)).mode & 0o777).toBe(0o600);
       expect(
@@ -63,6 +83,10 @@ describe("project integrations", () => {
           headers: { Authorization: "Bearer " + docs.token },
         },
         workspace_permissions: { command: "node" },
+        workspace_packages_a85f14: {
+          command: "/usr/local/bin/node",
+          args: ["/app/dist/node/runner/package-tools.js"],
+        },
       });
       await symlink(path.dirname(root), path.join(root, "outside"));
       await expect(

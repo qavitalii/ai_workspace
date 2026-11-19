@@ -91,6 +91,18 @@ const authRuns = new Map<
   { runtime: Running; events: any[]; timer: NodeJS.Timeout }
 >();
 const terminals = new Map<string, Running>();
+function requestJobStop(id: string, runtime: Running | undefined) {
+  if (!runtime) return;
+  runtime.send({ type: "stop" });
+  setTimeout(() => {
+    if (active.get(id) === runtime)
+      void runtime
+        .stop()
+        .catch((error) =>
+          console.error("Could not stop task runner:", redact(String(error))),
+        );
+  }, 10000).unref();
+}
 const idOf = (req: any, key = "id") => uuid.parse(req.params[key]);
 async function chatBy(id: string) {
   const c = (
@@ -970,25 +982,20 @@ export async function createApp() {
   });
   app.post("/api/chats/:id/stop", async (req) => {
     const id = idOf(req);
-    await db.query(
-      "UPDATE jobs SET cancel_requested=true WHERE chat_id=$1 AND state IN ('running','waiting_approval')",
-      [id],
-    );
-    for (const j of (
-      await db.query(
-        "SELECT id FROM jobs WHERE chat_id=$1 AND state IN ('running','waiting_approval')",
+    const running = await transaction(async (c) => {
+      // Prevent a queued continuation from being claimed between these updates.
+      await c.query("SELECT pg_advisory_xact_lock(417028)");
+      const stopped = await c.query(
+        "UPDATE jobs SET cancel_requested=true WHERE chat_id=$1 AND state IN ('running','waiting_approval') RETURNING id",
         [id],
-      )
-    ).rows) {
-      active.get(j.id)?.send({ type: "stop" });
-      setTimeout(() => {
-        void active.get(j.id)?.stop();
-      }, 10000);
-    }
-    await db.query(
-      "UPDATE jobs SET state='cancelled' WHERE chat_id=$1 AND state IN ('queued','waiting_account')",
-      [id],
-    );
+      );
+      await c.query(
+        "UPDATE jobs SET state='cancelled' WHERE chat_id=$1 AND state IN ('queued','waiting_account')",
+        [id],
+      );
+      return stopped.rows;
+    });
+    for (const job of running) requestJobStop(job.id, active.get(job.id));
     await event(id, null, "status", { state: "cancelled" });
     return { ok: true };
   });
@@ -1007,14 +1014,15 @@ export async function createApp() {
   app.post("/api/approvals/:id", async (req) => {
     const id = idOf(req),
       { allow } = z.object({ allow: z.boolean() }).parse(req.body);
-    await transaction(async (c) => {
+    const plan = await transaction(async (c) => {
       const a = (
         await c.query(
-          "SELECT * FROM approvals WHERE id=$1 AND decision IS NULL AND kind='permission' FOR UPDATE",
+          "SELECT * FROM approvals WHERE id=$1 AND decision IS NULL AND kind IN ('permission','plan_exit') FOR UPDATE",
           [id],
         )
       ).rows[0];
-      if (!a || !active.has(a.job_id))
+      const runtime = a && active.get(a.job_id);
+      if (!runtime)
         throw Object.assign(new Error("This request is no longer active"), {
           statusCode: 409,
         });
@@ -1025,16 +1033,34 @@ export async function createApp() {
           ),
           { statusCode: 409 },
         );
+      const planApproved = allow && a.kind === "plan_exit";
+      if (planApproved) {
+        if (typeof a.details !== "string" || !a.details.trim())
+          throw Object.assign(new Error("The proposed plan is unavailable."), {
+            statusCode: 409,
+          });
+        const updated = await c.query(
+          "UPDATE chats SET mode='default' WHERE provider='claude' AND mode='plan' AND id=(SELECT chat_id FROM jobs WHERE id=$1 AND state='waiting_approval' AND NOT cancel_requested FOR UPDATE)",
+          [a.job_id],
+        );
+        if (!updated.rowCount)
+          throw Object.assign(new Error("This plan is no longer active"), {
+            statusCode: 409,
+          });
+      }
       await c.query("UPDATE approvals SET decision=$2 WHERE id=$1", [
         id,
         allow,
       ]);
-      active.get(a.job_id)!.send({ type: "approve", id: a.request_id, allow });
+      if (!planApproved)
+        runtime.send({ type: "approve", id: a.request_id, allow });
       await c.query(
         "UPDATE jobs SET state='running' WHERE id=$1 AND state='waiting_approval' AND NOT EXISTS (SELECT 1 FROM approvals WHERE job_id=$1 AND decision IS NULL)",
         [a.job_id],
       );
+      return planApproved ? { id: a.job_id, runtime } : undefined;
     });
+    if (plan) requestJobStop(plan.id, plan.runtime);
     return { ok: true };
   });
   app.post("/api/questions/:id", async (req) => {

@@ -4,7 +4,9 @@ import { mkdtemp, rm } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import { config } from "../src/server/config";
+import { db } from "../src/server/db";
 import { docker, launch, type Running } from "../src/server/runtime";
+import * as settings from "../src/server/settings";
 
 function frame(value: unknown) {
   const body = Buffer.from(JSON.stringify(value) + "\n");
@@ -50,9 +52,80 @@ describe("runtime output lifecycle with an isolated Docker fixture", () => {
       }),
       remove: vi.fn(async () => {}),
     };
-    vi.spyOn(docker, "createContainer").mockResolvedValue(container as any);
-    return { stream, container, exit };
+    const create = vi
+      .spyOn(docker, "createContainer")
+      .mockResolvedValue(container as any);
+    return { stream, container, exit, create };
   }
+  it("runs an older image without package-install privileges", async () => {
+    const { create } = await fixture();
+    const inspect = vi.fn().mockResolvedValue({
+      Id: "sha256:legacy",
+      Config: { Labels: null },
+    });
+    vi.spyOn(docker, "getImage").mockReturnValue({ inspect } as any);
+    const concurrentTasks = vi.spyOn(settings, "concurrentTasks");
+    const onEvent = vi.fn();
+    const running = await launch(null, "fixture-account", onEvent, {
+      installPackages: true,
+    });
+    try {
+      expect(inspect).toHaveBeenCalledOnce();
+      expect(concurrentTasks).not.toHaveBeenCalled();
+      expect(create).toHaveBeenCalledOnce();
+      const options = create.mock.calls[0][0];
+      expect(options).toMatchObject({
+        Image: "sha256:legacy",
+        User: "1000:1000",
+        WorkingDir: "/workspace",
+        HostConfig: {
+          CapDrop: ["ALL"],
+          ReadonlyRootfs: true,
+          SecurityOpt: ["no-new-privileges:true"],
+        },
+      });
+      expect(options.Entrypoint).toBeUndefined();
+      expect(options.Cmd).toBeUndefined();
+      expect(options.HostConfig?.CapAdd).toBeUndefined();
+      expect(onEvent).toHaveBeenCalledWith({
+        type: "warning",
+        message: expect.stringContaining("./ops/compose.sh build runner-image"),
+      });
+    } finally {
+      await running.stop();
+    }
+  });
+  it("uses the installer entrypoint only on the exact compatible image and never retries startup", async () => {
+    const { container, create } = await fixture();
+    const inspect = vi.fn().mockResolvedValue({
+      Id: "sha256:compatible",
+      Config: {
+        Labels: { "ai.workspace.runner.package-installer": "1" },
+        Entrypoint: ["/other-image-entrypoint"],
+      },
+    });
+    vi.spyOn(docker, "getImage").mockReturnValue({ inspect } as any);
+    vi.spyOn(settings, "concurrentTasks").mockResolvedValue(7);
+    vi.spyOn(db, "query").mockResolvedValue({ rows: [{ n: "9" }] } as any);
+    container.start.mockRejectedValueOnce(new Error("Docker start failed"));
+    await expect(
+      launch(null, "fixture-account", vi.fn(), { installPackages: true }),
+    ).rejects.toThrow("Docker start failed");
+    expect(create).toHaveBeenCalledOnce();
+    expect(create.mock.calls[0][0]).toMatchObject({
+      Image: "sha256:compatible",
+      User: "0:0",
+      Entrypoint: ["/usr/local/bin/workspace-package-runner"],
+      Cmd: [],
+      Healthcheck: { Test: ["NONE"] },
+      Env: expect.arrayContaining(["WORKSPACE_PACKAGE_CONCURRENCY=9"]),
+      HostConfig: {
+        ReadonlyRootfs: false,
+        SecurityOpt: ["no-new-privileges:true"],
+      },
+    });
+    expect(container.remove).toHaveBeenCalledOnce();
+  });
   it("allows a completion handler to await stop without deadlocking or double stopping", async () => {
     const { stream, container } = await fixture();
     let running!: Running, completed!: () => void;
