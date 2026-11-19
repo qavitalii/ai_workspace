@@ -1,10 +1,14 @@
 # Deployment and operations
 
+**Installing for the first time?** Start with [the setup walkthrough](getting-started.md). It explains prerequisites, the installer prompts, account sign-in and a first task. This guide is the reference for configuration, maintenance and advanced features. For daily workflows, see the [user guide](user-guide.md).
+
+[Local installation](#1-local-installation) · [VPS and HTTPS](#2-vps-deployment-with-https) · [Configuration](#3-configuration) · [Accounts](#4-github-and-agent-accounts) · [Backups](#6-backups) · [Updates](#7-updates) · [Troubleshooting](#8-troubleshooting)
+
 ## 1. Local installation
 
 ### macOS
 
-Install and start Docker Desktop. Under Settings → Resources, allocate approximately 8 GB RAM for three concurrent agents; one agent may need less, depending on its workload. Keep the repository in a folder available to Docker Desktop for bind mounts. Use a path without spaces.
+Install Git, Python 3 and OpenSSL, then install and start Docker Desktop. Under Settings → Resources, allocate approximately 8 GB RAM for three concurrent agents; one agent may need less, depending on its workload. Keep the repository in a folder available to Docker Desktop for bind mounts. Use a path without spaces.
 
 ```bash
 git clone https://github.com/qavitalii/ai_workspace.git
@@ -14,11 +18,11 @@ cd ai_workspace
 
 ### Windows
 
-Use WSL2 with Docker Desktop's WSL integration enabled. Clone the repository inside your Linux home directory, such as `~/ai_workspace`, and run the same three commands from WSL. Run the Bash scripts in WSL, not PowerShell.
+Use WSL2 with Docker Desktop's WSL integration enabled. Install Git, Python 3 and OpenSSL inside WSL. Clone the repository inside your Linux home directory, such as `~/ai_workspace`, and run the same three commands from WSL. Run the Bash scripts in WSL, not PowerShell.
 
 ### Linux
 
-Install Docker Engine and Compose v2.24.4 or newer. Run the installer with `--local`. If your user cannot access Docker, use `sudo`. Docker access effectively grants administrative privileges.
+Install Git, Python 3, OpenSSL, Docker Engine and Compose v2.24.4 or newer. Run the installer with `--local`. If your user cannot access Docker, use `sudo`. Docker access effectively grants administrative privileges.
 
 ### What the installer does
 
@@ -322,7 +326,7 @@ The agent receives an isolated authentication socket for its current run, never 
 
 Back up the database and `.env` using the existing encrypted backup procedure: the SSH key ciphertext is in the database and requires the original `ENCRYPTION_KEY`. Restoring that backup restores saved SSH access, so review assignments after recovery. Rebuild **both server and runner images** when upgrading to this feature; the older runner lacks the SSH helper. Existing installations start with no SSH keys or assignments. No provider-account login or remote access is required for migration.
 
-To run isolated SSH tests (in addition to the disposable PostgreSQL and runner tests described in the README):
+To run isolated SSH tests (in addition to the disposable PostgreSQL and runner tests in [Contributing](../CONTRIBUTING.md#integration-tests)):
 
 ```bash
 docker build --target runner -t ai-workspace-runner:ssh-tests .
@@ -330,4 +334,4 @@ docker build -f tests/fixtures/sshd.Dockerfile -t ai-workspace-sshd:tests .
 SSH_DOCKER_TESTS=1 RUNNER_IMAGE=ai-workspace-runner:ssh-tests npm test
 ```
 
-The SSH tests create temporary keys, SSH targets and authentication helpers, verify SSH/SCP/SFTP and rejection of unassigned destinations, and clean them up. Add `INTEGRATION_TESTS=1` and the disposable `DATABASE_URL` to include actual runtime/terminal access and database/API tests. On Docker Desktop, set `DOCKER_HOST` as described in the README if necessary. These checks use synthetic credentials; they do not sign into Codex/Claude or touch real SSH servers.
+The SSH tests create temporary keys, SSH targets and authentication helpers, verify SSH/SCP/SFTP and rejection of unassigned destinations, and clean them up. Add `INTEGRATION_TESTS=1` and the disposable `DATABASE_URL` to include actual runtime/terminal access and database/API tests. On Docker Desktop, set `DOCKER_HOST` as described in Contributing if necessary. These checks use synthetic credentials; they do not sign into Codex/Claude or touch real SSH servers.
