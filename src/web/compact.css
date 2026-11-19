@@ -4771,11 +4771,7 @@ input[type="radio"] {
   color: #87909b;
   font-size: 10px;
 }
-.execution-entries {
-  max-height: 460px;
-  overflow: auto;
-  overscroll-behavior: contain;
-}
+/* The conversation owns vertical scrolling, including expanded log entries. */
 .execution-entry + .execution-entry {
   border-top: 1px solid #edf0f3;
 }
@@ -4858,8 +4854,7 @@ input[type="radio"] {
 .execution-entry-detail pre {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
-  max-height: 280px;
-  overflow: auto;
+  overflow: visible;
   background: #f6f8fa;
   border: 1px solid #e6eaef;
   border-radius: 7px;
