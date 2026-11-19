@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 cd "$(dirname "$0")/.."
+source ./ops/maintenance-lock.sh
+keep_stopped=0
+if [[ $# != 0 ]]; then
+  [[ $# == 1 && "$1" == --keep-stopped ]] || { echo 'Usage: ./ops/backup.sh [--keep-stopped]' >&2; exit 1; }
+  keep_stopped=1
+fi
 [[ -f .env ]] || { echo 'Install the application first.'; exit 1; }
 set -a; source .env; set +a
 umask 077
@@ -20,3 +26,4 @@ archive="backups/workspace-$(date -u +%Y%m%dT%H%M%SZ).tar.gz.enc"
 tar -C "$work" -czf - . | openssl enc -aes-256-cbc -salt -pbkdf2 -iter 200000 -pass file:.backup-key -out "$archive"
 find backups -name 'workspace-*.tar.gz.enc' -mtime +7 -delete
 printf 'Saved encrypted backup: %s\nKeep .backup-key separately; this server alone is not an offsite backup.\n' "$archive"
+if [[ "$keep_stopped" == 1 ]]; then restart=0; fi

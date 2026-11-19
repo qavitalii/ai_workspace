@@ -11,5 +11,6 @@ coverage/
 .wikillm/
 .install-mode
 .backup-key
+.update-state/
 
 .data.before-restore-*/

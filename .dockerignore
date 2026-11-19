@@ -6,6 +6,7 @@ dist
 backups
 .wikillm
 .backup-key
+.update-state
 .install-mode
 .env.*
 

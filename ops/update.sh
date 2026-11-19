@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 cd "$(dirname "$0")/.."
+source ./ops/maintenance-lock.sh
 repo_dir="$(pwd)"
 [[ -z "$(git -c safe.directory="$repo_dir" status --porcelain)" ]] || { echo 'Commit or stash local source changes before updating.'; exit 1; }
 ./ops/backup.sh

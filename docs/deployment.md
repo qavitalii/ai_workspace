@@ -187,6 +187,24 @@ This explicitly replaces the installation's current data. The script retains the
 
 ## 7. Updates
 
+### From the browser on a Linux VPS
+
+Open **Settings → Updates** to see the installed version and any available release. Select **Update to v…** to schedule it. Finish running tasks, respond to pending approvals, and close open terminals. Queued tasks resume after the update. The host updater builds both images, creates an encrypted backup, and restarts Workspace. The browser reconnects and displays the result.
+
+New root-managed Linux VPS installations with systemd enable browser updates during setup. For an existing VPS, run this once from the installation directory:
+
+```bash
+sudo ./ops/update.sh && sudo ./ops/enable-browser-updates.sh
+```
+
+If you already use the connected-folders override, perform your manual update with the same [Compose files](#9-files-and-connected-folders) before running the enable command. The host updater preserves this override. Docker Desktop and custom Compose setups use the manual update command.
+
+The host checks the checkout's Git `origin` about every ten minutes. Browser updates use stable tags in the form `vX.Y.Z` that match the release's `package.json` version and can fast-forward the installed checkout. Publish these tags only for tested releases you intend to offer through the button. Workspace installs the release selected by the owner.
+
+For updater details, use `sudo journalctl -u ai-workspace-updates.service`. If activation fails, the updater attempts to restart the previous code and images. If the new release changed the database incompatibly, recover using the matching code version and the pre-update [backup](#6-backups).
+
+### Manual updates
+
 ```bash
 ./ops/update.sh
 ```
@@ -241,7 +259,7 @@ To use an existing collection elsewhere on the server, put `FOLDER_ROOT=/srv/age
 ./ops/compose.sh -f compose.yaml -f compose.local.yaml -f compose.folders.yaml up -d --wait
 ```
 
-Keep this override in subsequent Compose commands. The current `ops/update.sh` does not include this optional override: for external folders, perform its backup, fast-forward pull, build, and restart steps manually, passing the same `-f` files to both build and restart. Each direct subdirectory appears in the folder picker. The path must be shared with Docker Desktop when running locally. Only selected subfolders are mounted into agents; the supervisor needs the collection mounted at the identical absolute path. Choose a dedicated data directory, not your home directory, system directories, Docker socket directory, or Workspace's private credential/database directories. External collections are **not** part of the built-in backup and need their own backup. Files on a laptop are copied to the server by upload; keeping a laptop folder live requires a separately configured sync service.
+Keep this override in subsequent Compose commands. For the manual update script on a VPS, set `COMPOSE_FILE=compose.yaml:compose.folders.yaml` in the installation's `.env` so its backup and restart use the same files. On local installations with this override, run the backup, fast-forward pull, build, and restart steps with the same three Compose files. Each direct subdirectory appears in the folder picker. The path must be shared with Docker Desktop when running locally. Only selected subfolders are mounted into agents; the supervisor needs the collection mounted at the identical absolute path. Choose a dedicated data directory, not your home directory, system directories, Docker socket directory, or Workspace's private credential/database directories. External collections are **not** part of the built-in backup and need their own backup. Files on a laptop are copied to the server by upload; keeping a laptop folder live requires a separately configured sync service.
 
 ## 10. Models, commands and references
 

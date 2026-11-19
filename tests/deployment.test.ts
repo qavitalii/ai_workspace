@@ -99,7 +99,7 @@ function installerFixture() {
   fixtures.push(root);
   mkdirSync(path.join(root, "ops"));
   mkdirSync(path.join(root, "bin"));
-  for (const file of ["install.sh", "server-address.py"])
+  for (const file of ["install.sh", "maintenance-lock.sh", "server-address.py"])
     copyFileSync(
       path.join(repository, "ops", file),
       path.join(root, "ops", file),

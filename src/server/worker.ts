@@ -10,6 +10,7 @@ import { chatServers } from "./ssh-runtime.js";
 import { initializeWorkspace, git } from "./git.js";
 import { config } from "./config.js";
 import { concurrentTasks, modelDefaults } from "./settings.js";
+import { updatePhase } from "./updates.js";
 import { chatWorkspace, workspaceBusy } from "./workspaces.js";
 import { isOutputLimit, outputLimitMessage } from "./output-storage.js";
 import { MAX_RESPONSE_BYTES } from "./runner-output.js";
@@ -55,6 +56,8 @@ export async function recover() {
 export async function claim() {
   return transaction(async (c) => {
     await c.query("SELECT pg_advisory_xact_lock(417028)");
+    const phase = await updatePhase();
+    if (phase === "waiting" || phase === "updating") return null;
     const n = Number(
       (
         await c.query(
@@ -565,6 +568,8 @@ export async function startWorker() {
     if (ticking || shutting) return;
     ticking = true;
     try {
+      const phase = await updatePhase();
+      if (phase === "waiting" || phase === "updating") return;
       await db.query(
         "UPDATE accounts SET status='ready',reset_at=NULL WHERE status='limited' AND reset_at IS NOT NULL AND reset_at<=now()",
       );

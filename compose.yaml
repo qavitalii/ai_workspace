@@ -34,12 +34,16 @@ services:
       MAX_FILE_MB: ${MAX_FILE_MB:-25}
       MAX_ATTACHMENTS: ${MAX_ATTACHMENTS:-10}
       ENABLE_AUTO_HANDOFF: ${ENABLE_AUTO_HANDOFF:-false}
+      WORKSPACE_UPDATE_STATUS: /run/workspace-updates/status/status.json
+      WORKSPACE_UPDATE_REQUESTS: /run/workspace-updates/requests
       VAPID_PUBLIC_KEY: ${VAPID_PUBLIC_KEY:-}
       VAPID_PRIVATE_KEY: ${VAPID_PRIVATE_KEY:-}
       VAPID_SUBJECT: ${VAPID_SUBJECT:-mailto:owner@example.com}
     volumes:
       - ${DATA_ROOT}:${DATA_ROOT}
       - /var/run/docker.sock:/var/run/docker.sock
+      - ./.update-state/status:/run/workspace-updates/status:ro
+      - ./.update-state/requests:/run/workspace-updates/requests
     networks:
       control:
       proxy:

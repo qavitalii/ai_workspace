@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 cd "$(dirname "$0")/.."
+source ./ops/maintenance-lock.sh
 [[ $# == 2 && "$2" == --replace-existing ]] || { echo 'Usage: ./ops/restore.sh /path/backup.tar.gz.enc --replace-existing'; exit 1; }
 [[ -f .backup-key ]] || { echo 'Restore the original .backup-key first.'; exit 1; }
 work=$(mktemp -d); trap 'rm -rf "$work"' EXIT

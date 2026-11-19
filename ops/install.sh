@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 cd "$(dirname "$0")/.."
+source ./ops/maintenance-lock.sh
 mode="${1:---server}"
 if [[ "$mode" != '--local' && "$mode" != '--server' ]]; then echo 'Usage: ./ops/install.sh [--local|--server]'; exit 1; fi
 if [[ "$(pwd)" =~ [[:space:]] ]]; then echo 'Install into a path without spaces.'; exit 1; fi
@@ -84,6 +85,9 @@ if [[ "$mode" == '--server' && "$EUID" == 0 ]]; then
   [[ -f .backup-key ]] || (umask 077; openssl rand -hex 32 > .backup-key)
   printf '17 3 * * * root cd %s && ./ops/backup.sh >> /var/log/ai-workspace-backup.log 2>&1\n' "$(pwd)" > /etc/cron.d/ai-workspace-backup
   echo 'Daily encrypted backups enabled at 03:17 server time. Copy .backup-key to a separate safe location.'
+  if ! ./ops/enable-browser-updates.sh; then
+    echo 'Browser updates could not be enabled. The manual update command is available.' >&2
+  fi
 fi
 printf '\nWorkspace services started: %s\n' "$APP_ORIGIN"
 if [[ "$mode" == '--server' ]]; then

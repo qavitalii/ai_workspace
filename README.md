@@ -90,6 +90,8 @@ Deleting a chat keeps its working files; deleting a non-main folder also removes
 
 Run commands from the cloned `ai_workspace` directory. For a VPS installed with `sudo`, prefix maintenance commands with `sudo` too.
 
+On a supported Linux VPS, use **Settings → Updates** to install tagged releases from the browser. Existing installations need a [one-time setup](docs/deployment.md#7-updates).
+
 ```bash
 ./ops/compose.sh ps                 # check service status
 ./ops/compose.sh logs --tail=100 server

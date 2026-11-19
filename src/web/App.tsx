@@ -3,6 +3,7 @@ import { AccountSwitcher } from "./AccountSwitcher";
 import { ActivityLog } from "./ActivityLog";
 import { SshSettings, SshAccess } from "./SshSettings";
 import { SkillsSettings } from "./SkillsSettings";
+import { UpdateSettings, useWorkspaceUpdates } from "./UpdateSettings";
 import { RemovalConfirmation } from "./FolderActions";
 import { Select } from "./Select";
 import { ChatModelPicker } from "./ChatModelPicker";
@@ -290,6 +291,7 @@ export function App() {
     [newProjectId, setNewProjectId] = useState<string | null>(null),
     [detail, setDetail] = useState<any>(null),
     [modal, setModal] = useState(""),
+    [settingsStart, setSettingsStart] = useState("models"),
     [editingChat, setEditingChat] = useState<any>(null),
     [chatActionBusy, setChatActionBusy] = useState(false),
     [editingProject, setEditingProject] = useState<any>(null),
@@ -305,6 +307,13 @@ export function App() {
     [streams, setStreams] = useState<Record<string, string>>({}),
     [liveLogs, setLiveLogs] = useState<any[]>([]),
     [connected, setConnected] = useState(false);
+  const updates = useWorkspaceUpdates(Boolean(me), modal === "settings");
+  const updateAvailable =
+    updates.status?.updater === "ready" &&
+    !updates.connectionLost &&
+    Boolean(updates.status.available) &&
+    !updates.status.checkFailed &&
+    !["waiting", "updating"].includes(updates.status.phase);
   const [text, setText] = useState(""),
     [drafts, setDrafts] = useState<any[]>([]),
     [sending, setSending] = useState(false),
@@ -863,9 +872,19 @@ export function App() {
               {overview.accounts.length}
             </span>
           </button>
-          <button onClick={() => setModal("settings")}>
+          <button
+            onClick={() => {
+              setSettingsStart(updateAvailable ? "updates" : "models");
+              setModal("settings");
+            }}
+          >
             <Settings size={17} />
             Settings
+            {updateAvailable && (
+              <span className="count" title="Workspace update available">
+                Update
+              </span>
+            )}
           </button>
           <div className="owner">
             <span className="avatar">Y</span>
@@ -2018,6 +2037,8 @@ export function App() {
           onClose={() => setModal("")}
         >
           <SettingsForm
+            initialSection={settingsStart}
+            updates={updates}
             accounts={overview.accounts}
             defaults={overview.modelDefaults}
             onSaved={loadOverview}
@@ -3033,6 +3054,8 @@ function ChatSettings({ chat, me, onSave, onError }: any) {
   );
 }
 function SettingsForm({
+  initialSection,
+  updates,
   me,
   projects,
   accounts,
@@ -3044,7 +3067,7 @@ function SettingsForm({
 }: any) {
   const [saved, setSaved] = useState(false),
     [enabling, setEnabling] = useState(false),
-    [section, setSection] = useState("models");
+    [section, setSection] = useState(initialSection);
   const settingsLayoutRef = useRef<HTMLDivElement>(null);
   const sections = [
     { id: "models", label: "Models" },
@@ -3052,6 +3075,7 @@ function SettingsForm({
     { id: "ssh", label: "Servers & SSH" },
     { id: "skills", label: "Skills" },
     { id: "resources", label: "Resources" },
+    { id: "updates", label: "Updates" },
     { id: "notifications", label: "Notifications" },
   ];
   function selectSection(next: string) {
@@ -3186,6 +3210,15 @@ function SettingsForm({
           aria-labelledby="settings-tab-resources"
         >
           <ServerSettings />
+        </div>
+      )}
+      {section === "updates" && (
+        <div
+          role="tabpanel"
+          id="settings-panel-updates"
+          aria-labelledby="settings-tab-updates"
+        >
+          <UpdateSettings {...updates} />
         </div>
       )}
       {section === "connections" && (

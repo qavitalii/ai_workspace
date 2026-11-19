@@ -32,6 +32,7 @@ import { safeName, seal, redact } from "./security.js";
 import { normalizeGithubRepo } from "../shared.js";
 import { concurrentTasks, modelDefaults } from "./settings.js";
 import { createResourceMonitor } from "./resources.js";
+import { updatePhase, updateRoutes } from "./updates.js";
 import { disconnectAccount, deleteAccount } from "./accounts.js";
 import { active, switchAccount } from "./worker.js";
 import {
@@ -154,6 +155,7 @@ export async function createApp() {
     limits: { fileSize: config.maxFile, files: 1, fields: 4 },
   });
   await app.register(websocket, { options: { maxPayload: 65536 } });
+  updateRoutes(app, () => terminalCleanups.size > 0);
   await authRoutes(app);
   app.setErrorHandler((e: any, _req, reply) => {
     const code =
@@ -1516,6 +1518,9 @@ export async function createApp() {
     }
     starting = (async () => {
       try {
+        const phase = await updatePhase();
+        if (phase === "waiting" || phase === "updating")
+          throw new Error("Workspace is preparing an update. Open the terminal after it restarts.");
         const chat = await chatBy(id);
         await idle(id);
         if (terminals.has(id)) throw new Error("Terminal already open");
