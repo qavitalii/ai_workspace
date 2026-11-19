@@ -102,6 +102,77 @@ describe("AWS availability for new runs", () => {
 });
 afterAll(() => app.close());
 
+describe("AWS SSO device sign-in", () => {
+  const originalPath = process.env.PATH;
+  const loginEndpoint = endpoint + "/connect";
+  let fake = "";
+
+  async function fakeAws(script: string) {
+    fake = await mkdtemp(path.join(tmpdir(), "aws-device-"));
+    await writeFile(path.join(fake, "aws"), "#!/bin/sh\n" + script, {
+      mode: 0o700,
+    });
+    process.env.PATH = fake;
+    query.mockResolvedValue({
+      rowCount: 1,
+      rows: [
+        {
+          settings: { ...settings, startUrl: "https://test.awsapps.com/start" },
+          session: null,
+          identity: null,
+        },
+      ],
+    });
+  }
+
+  afterEach(async () => {
+    await app.inject({ method: "DELETE", url: loginEndpoint });
+    process.env.PATH = originalPath;
+    if (fake) await rm(fake, { recursive: true, force: true });
+    fake = "";
+  });
+
+  it.each([
+    "https://device.sso.eu-west-1.amazonaws.com/",
+    "https://eu-west-1.signin.aws/platform/authorize?request_uri=urn%3Aexample%3Arequest&identitystore_id=d-example",
+  ])(
+    "shows the manual URL and code while AWS waits for approval (%s)",
+    async (url) => {
+      const code = "AB12-CD34";
+      await fakeAws(
+        `printf '%s\\n' 'Please visit the following URL:' '' '${url}'
+printf '%s\\n' '' 'Then enter the code:' '' '${code}'
+printf '%s\\n' '' 'Alternatively, you may visit the following URL which will autofill the code upon loading:'
+printf '%s\\n' 'https://device.sso.eu-west-1.amazonaws.com/?user_code=${code}'
+exec /bin/sleep 30\n`,
+      );
+      const started = await app.inject({ method: "POST", url: loginEndpoint });
+      expect(started.statusCode, started.body).toBe(200);
+      await vi.waitFor(async () => {
+        const status = await app.inject({ method: "GET", url: endpoint });
+        expect(status.headers["cache-control"]).toBe("no-store");
+        expect(status.json()).toMatchObject({
+          pending: true,
+          challenge: { url, code },
+        });
+      });
+    },
+  );
+
+  it("reports a failure before AWS returns a sign-in code", async () => {
+    await fakeAws("exit 1\n");
+    const started = await app.inject({ method: "POST", url: loginEndpoint });
+    expect(started.statusCode, started.body).toBe(200);
+    await vi.waitFor(async () => {
+      const status = await app.inject({ method: "GET", url: endpoint });
+      expect(status.json()).toMatchObject({
+        pending: false,
+        problem: expect.stringContaining("could not get a sign-in code"),
+      });
+    });
+  });
+});
+
 describe("AWS SSO settings URL validation", () => {
   it.each([
     "https://my-company.awsapps.com/start",
