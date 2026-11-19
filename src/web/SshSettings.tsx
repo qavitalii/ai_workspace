@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { Server as ServerIcon, KeyRound, Trash2 } from "lucide-react";
 import { api } from "./api";
+import { Select } from "./Select";
 
 type Server = {
   id: string;
@@ -188,9 +189,11 @@ export function SshSettings() {
                 onChange={(e) => setName(e.target.value)}
               />
             </label>
-            <label className="field">
+            <div className="field">
               <span>Key source</span>
-              <select
+              <Select
+                aria-label="Key source"
+                disabled={busy}
                 value={operation}
                 onChange={(e) => {
                   setOperation(e.target.value);
@@ -200,8 +203,8 @@ export function SshSettings() {
               >
                 <option value="generate">Create an Ed25519 key</option>
                 <option value="import">Import a private key</option>
-              </select>
-            </label>
+              </Select>
+            </div>
             {operation === "import" && (
               <>
                 <label className="field">
@@ -495,9 +498,11 @@ export function SshSettings() {
                 }
               />
             </label>
-            <label className="field">
+            <div className="field">
               <span>SSH key</span>
-              <select
+              <Select
+                aria-label="SSH key"
+                disabled={busy}
                 required
                 value={form.key_id}
                 onChange={(e) => setForm({ ...form, key_id: e.target.value })}
@@ -508,8 +513,8 @@ export function SshSettings() {
                     {k.name}
                   </option>
                 ))}
-              </select>
-            </label>
+              </Select>
+            </div>
             {!keys.length && (
               <p className="muted">Create or import an SSH key above first.</p>
             )}

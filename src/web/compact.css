@@ -1965,7 +1965,7 @@ input[type="file"]::file-selector-button {
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 0 12px;
 }
-.settings-layout .ssh-key-form fieldset > .field:nth-of-type(n + 3),
+.settings-layout .ssh-key-form fieldset > :nth-child(n + 3 of .field),
 .settings-layout .ssh-key-form fieldset > p,
 .settings-layout .ssh-key-form .settings-card-actions {
   grid-column: 1 / -1;
@@ -4406,6 +4406,15 @@ input[type="radio"] {
 }
 .integration-list > li:last-child {
   padding-bottom: 0;
+}
+.project-integration-list {
+  margin-bottom: 14px;
+}
+.project-integration-list .server-access-info {
+  flex: 1 1 180px;
+}
+.project-integration-list .checkbox {
+  margin: 0;
 }
 .integration-skill-name.checkbox {
   align-items: flex-start;

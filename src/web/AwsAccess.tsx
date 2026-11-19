@@ -1,5 +1,6 @@
 import { useEffect, useState, type FormEvent } from "react";
 import { api } from "./api";
+import { Select } from "./Select";
 
 type AwsSettings = {
   startUrl: string;
@@ -190,9 +191,11 @@ export function AwsAccess({ projectId }: { projectId: string }) {
               />
             </label>
           </div>
-          <label className="field">
+          <div className="field">
             <span>AWS availability</span>
-            <select
+            <Select
+              aria-label="AWS availability"
+              disabled={busy}
               value={fields.required ? "required" : "optional"}
               onChange={(e) =>
                 setFields({
@@ -207,8 +210,8 @@ export function AwsAccess({ projectId }: { projectId: string }) {
               <option value="required">
                 Required — block tasks and terminals without AWS
               </option>
-            </select>
-          </label>
+            </Select>
+          </div>
           <div className="settings-card-actions integration-actions">
             {editing && (
               <button
