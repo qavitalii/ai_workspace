@@ -1,17 +1,51 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { RefreshCw, ChevronDown } from "lucide-react";
 import { usageWindows } from "../usage";
 import { api } from "./api";
+import { ProviderIcon } from "./ProviderIcon";
+
+const AUTO_INTERVAL = 5 * 60 * 1000;
+const lastAttempt = new Map<string, number>();
 
 export function AccountUsage({
   account,
   refresh,
   compact = false,
   sidebar = false,
+  autoRefresh = false,
 }: any) {
   const [busy, setBusy] = useState(false),
     [error, setError] = useState(""),
     [expanded, setExpanded] = useState(false);
+  const idle = !!account && ["ready", "limited"].includes(account.status);
+  async function load(quiet = false) {
+    if (!account) return;
+    lastAttempt.set(account.id, Date.now());
+    setBusy(true);
+    setError("");
+    try {
+      await api(`/accounts/${account.id}/usage`, {});
+      await refresh?.();
+    } catch (e: any) {
+      if (!quiet) setError(e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+  // Refresh stale limits when the panel is opened, at most once per interval.
+  useEffect(() => {
+    if (!autoRefresh || !idle || !refresh || busy) return;
+    const updated = account.limits_updated_at
+      ? new Date(account.limits_updated_at).getTime()
+      : 0;
+    const expired = usageWindows(account.limits).some(
+      (w) => w.resetsAt !== null && w.resetsAt * 1000 <= Date.now(),
+    );
+    const now = Date.now();
+    if (now - (lastAttempt.get(account.id) ?? 0) < AUTO_INTERVAL) return;
+    if (!expired && now - updated < AUTO_INTERVAL) return;
+    void load(true);
+  }, [autoRefresh, idle, account?.id, account?.limits_updated_at]);
   if (!account) return null;
   const windows = usageWindows(account.limits);
   return (
@@ -24,27 +58,19 @@ export function AccountUsage({
       aria-label={account.name + " usage limits"}
     >
       <div className="usage-heading">
-        <strong title={account.name}>{account.name}</strong>
+        <strong className="usage-account" title={account.name}>
+          <ProviderIcon provider={account.provider} size={14} />
+          {account.name}
+        </strong>
         <span>{account.provider === "codex" ? "Codex" : "Claude Code"}</span>
-        {account.provider === "codex" && refresh && (
+        {refresh && (
           <button
             type="button"
             className="icon"
-            disabled={busy || !["ready", "limited"].includes(account.status)}
+            disabled={busy || !idle}
             aria-label={"Refresh limits for " + account.name}
             title="Refresh limits"
-            onClick={async () => {
-              setBusy(true);
-              setError("");
-              try {
-                await api(`/accounts/${account.id}/usage`, {});
-                await refresh();
-              } catch (e: any) {
-                setError(e.message);
-              } finally {
-                setBusy(false);
-              }
-            }}
+            onClick={() => load()}
           >
             <RefreshCw size={14} className={busy ? "spin" : ""} />
           </button>
@@ -167,8 +193,8 @@ export function AccountUsage({
           )}
           {!compact && account.provider === "claude" && (
             <small>
-              Updated when Claude reports limits during a task. Some reports do
-              not include a percentage.
+              Refresh reads current limits without starting a task. During a
+              task, Claude's own reports update them; some omit a percentage.
             </small>
           )}
         </>

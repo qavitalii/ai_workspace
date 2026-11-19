@@ -244,6 +244,28 @@ Plan mode persists across turns. The composer shows **Plan mode** and **Switch t
 The web interface does not provide every interactive terminal command. MCP/plugin management, native session forks, terminal themes and account-wide app mentions are not implemented here. Claude commands are discovered per chat and forwarded only when advertised; availability may change with CLI versions. Codex plan mode uses the experimental collaboration API of the pinned CLI version. See [Codex App Server](https://developers.openai.com/codex/app-server) and [Claude SDK skills and commands](https://code.claude.com/docs/en/agent-sdk/slash-commands).
 
 
+### AWS access and portable skills
+
+In **Project settings → AWS access**, enter the AWS-hosted SSO start URL or Issuer URL, the Identity Center region, the 12-digit AWS account ID and your permission set name. Use the optional AWS region when it differs from the SSO region. Select **Continue to AWS**, open the sign-in link and enter the displayed code. Workspace verifies the AWS account after sign-in. See the [AWS CLI setup guide](https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-sso.html) for where to find these values. Your organization must allow device authorization.
+
+AWS CLI v2 is included in the server and runner images. The server stores the sign-in session encrypted and prepares temporary role credentials for each new agent run or terminal in that project, including working copies. AWS CLI and SDKs can use the default profile. A long-running task or terminal may need a fresh run when its credentials expire. Use **Check access** or **Sign in again** in project settings. **Disconnect** stops Workspace from issuing credentials to new runs. Stop active runs and terminals to remove their access within Workspace. AWS decides when already-issued credentials expire.
+
+Use a dedicated permission set with only the permissions this project needs; start with read-only access. Agents and terminals receive every permission granted by that role. Approval prompts and instructions to ask before remote changes do not restrict AWS permissions.
+
+**AWS availability** defaults to **Optional**. If an existing session expires or AWS cannot issue credentials, new tasks and terminals continue without AWS access and display a warning; the agent is told not to attempt AWS work. Sign in again and start a new run when AWS is needed. Choose **Required** to block new tasks and terminals whenever AWS access cannot be prepared, including before the first sign-in or after Disconnect. Changing this choice preserves the saved sign-in session. Internal storage/database failures and concurrent connection changes still stop startup.
+
+To move local skills, open **Settings → Skills** for all chats or **Project settings → Skills** for that project and its working copies. Select a skill folder, a parent folder containing several skills, or a ZIP. On macOS, use **Go to Folder** (`⌘⇧G`) in the picker to reach hidden folders such as `~/.codex/skills` or `~/.claude/skills`. Review the preview and decide whether to skip, replace or keep both versions of a skill with the same name. Select any imported skills in the library and choose **Export selected** to download a ZIP that can be imported into another Workspace.
+
+Workspace keeps each `SKILL.md` and its supporting files together. Each library holds up to 50 skills, 500 files and 20 MB of file contents. Imported directories are available read-only in new agent runs and terminals. The `$` menu lists both imported skills and working-folder skills. Review any dependency hints in the preview and set up tools, plugins and accounts separately. Common local credential files are skipped. Check the scripts and notes for inline secrets before sharing them.
+
+Select imported skills through `$`; importing does not register them for automatic discovery by the native CLI. Descriptions come from the YAML frontmatter at the beginning of `SKILL.md`, including folded (`>`) and literal (`|`) multiline text. Invalid frontmatter is rejected with an import error.
+
+### Reviewing and publishing Git changes
+
+The Changes panel opens a local, read-only preview without contacting GitHub or reserving the folder. It remains available while a task is running, so the displayed files may change. New files are listed separately. Choose **Prepare commit review** when the folder is idle to inspect the complete proposed commit, including new files, then enter a message and select **Commit**. Preparing a commit review does not require GitHub access.
+
+For publishing, choose **Outgoing commits → Review outgoing commits** to compare the committed history with GitHub. Inspect the result before selecting **Push** or **Create PR**. Push does not require a message; Create PR requires a title. Preparing a review briefly reserves the folder. Any subsequent change to the files, commits or destination invalidates that review and requires a new one before publication.
+
 ## 11. Working folders and conflict resolution
 
 A chat stores the conversation; its selected working folder stores the files. **New chat** beside a folder starts another conversation using that folder. It does not create another copy. The new-chat form defaults to main, or to the existing folder when launched from that folder’s card.

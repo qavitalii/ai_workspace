@@ -29,9 +29,9 @@ Use disposable files/projects and repeat this workflow with each provider you in
 
 ## Switching accounts
 
-1. Connect two of your own accounts for the same provider.
+1. Connect one Codex and one Claude Code account. Also test two accounts of the same provider when available.
 2. Complete or stop a task, then switch to the second account.
-3. Confirm the handoff event, previous messages, working files, and attachments. Ask the agent to continue an unfinished change.
+3. Test both Codex → Claude and Claude → Codex. Confirm the target model defaults, handoff event, original message authors, working files, and attachments. Ask the agent to continue an unfinished change.
 4. Expected behavior: a new native session with a context checkpoint. Exact cross-account native-session restoration is not claimed.
 5. Separately test a real quota error, all accounts being unavailable, and recovery. Do not confuse subscription exhaustion with server overload or a shell-command error.
 

@@ -5,6 +5,8 @@ import { accountModels } from "./models.js";
 import { chatFolders } from "./folders.js";
 import { folderRoutes } from "./folder-routes.js";
 import { sshRoutes } from "./ssh-routes.js";
+import { awsRoutes } from "./aws.js";
+import { skillEntries, skillRoutes } from "./skills.js";
 import { projectRoutes } from "./project-routes.js";
 import Fastify from "fastify";
 import { proxyTrust } from "./proxy.js";
@@ -40,11 +42,14 @@ import {
 } from "./workspaces.js";
 import { launch, type Running } from "./runtime.js";
 import {
-  git,
   github,
   initializeWorkspace,
   pushBranch,
   projectToken,
+  reviewPublication,
+  localChanges,
+  validatePublication,
+  commitReviewed,
 } from "./git.js";
 const effortSchema = z.enum([
   "",
@@ -170,6 +175,8 @@ export async function createApp() {
   });
   folderRoutes(app);
   sshRoutes(app);
+  awsRoutes(app);
+  skillRoutes(app);
   app.get("/api/overview", async () => ({
     modelDefaults: await modelDefaults(),
     projects: (
@@ -632,7 +639,7 @@ export async function createApp() {
       ).rows,
       events: (
         await db.query(
-          "SELECT * FROM (SELECT * FROM events WHERE chat_id=$1 AND type IN ('handoff','tool','log') ORDER BY id DESC LIMIT 100) e ORDER BY id",
+          "SELECT * FROM (SELECT * FROM events WHERE chat_id=$1 AND type IN ('handoff','tool','log','warning') ORDER BY id DESC LIMIT 100) e ORDER BY id",
           [id],
         )
       ).rows,
@@ -1170,6 +1177,7 @@ export async function createApp() {
     const entries = chat.initialized
       ? await inspectWorkspace(id, "", "index")
       : [];
+    entries.push(...(await skillEntries(chat.project_id)));
     const folders = await chatFolders(id);
     for (const f of folders)
       entries.push({
@@ -1219,15 +1227,26 @@ export async function createApp() {
       throw Object.assign(new Error("This chat has no Git repository."), {
         statusCode: 409,
       });
-    return {
-      diff: await git(workspacePath(chat.workspace_id), [
-        "diff",
-        "HEAD",
-        "--",
-        ".",
-        ":!.workspace-attachments",
-      ]),
-    };
+    return localChanges(chat);
+  });
+  app.post("/api/chats/:id/publication-review", async (req) => {
+    const chat = await chatBy(idOf(req));
+    const { target } = z
+      .object({ target: z.enum(["commit", "push"]) })
+      .parse(req.body);
+    const project = (
+      await db.query("SELECT * FROM projects WHERE id=$1", [chat.project_id])
+    ).rows[0];
+    if (!project?.repo)
+      throw Object.assign(new Error("This chat has no Git repository."), {
+        statusCode: 409,
+      });
+    await acquireWorkspace(chat.id, "publication review");
+    try {
+      return await reviewPublication(chat, project, target === "push");
+    } finally {
+      await releaseWorkspace(chat.id);
+    }
   });
   app.post("/api/chats/:id/git", async (req) => {
     const id = idOf(req);
@@ -1254,14 +1273,25 @@ export async function createApp() {
     const p = z
       .object({
         action: z.enum(["commit", "push", "pr"]),
-        message: z.string().min(1).max(500),
+        review_token: z.string().min(1).max(10000),
+        message: z.string().trim().max(500).default(""),
         client_id: uuid,
+      })
+      .refine((value) => value.action === "push" || !!value.message, {
+        message: "A commit message or pull request title is required.",
       })
       .parse(req.body);
     const previous = (
       await db.query("SELECT * FROM publications WHERE id=$1", [p.client_id])
     ).rows[0];
-    if (previous) return previous;
+    if (previous) {
+      if (previous.chat_id !== id || previous.kind !== p.action)
+        throw Object.assign(
+          new Error("Publication request belongs to a different action."),
+          { statusCode: 409 },
+        );
+      return previous;
+    }
     await acquireWorkspace(id, "publication");
     try {
       await db.query(
@@ -1276,28 +1306,36 @@ export async function createApp() {
       const project = (
         await db.query("SELECT * FROM projects WHERE id=$1", [chat.project_id])
       ).rows[0];
+      const review = await validatePublication(chat, project, p.review_token);
       let result: any = {};
       if (p.action === "commit") {
-        await git(workspacePath(chat.workspace_id), [
-          "add",
-          "--all",
-          "--",
-          ".",
-        ]);
-        await git(workspacePath(chat.workspace_id), [
-          "reset",
-          "--",
-          ".workspace-attachments",
-          ".workspace-folders",
-        ]).catch(() => {});
-        result.output = await git(workspacePath(chat.workspace_id), [
-          "commit",
-          "-m",
-          p.message,
-        ]);
+        result.output = await commitReviewed(review, p.message);
       } else if (p.action === "push") {
-        result.output = await pushBranch(chat, project);
+        result.output = await pushBranch(chat, project, review);
       } else {
+        if (review.remote === null)
+          throw Object.assign(
+            new Error(
+              "Refresh the outgoing commits review before creating a pull request.",
+            ),
+            { statusCode: 409 },
+          );
+        const remote = await github(
+          "/repos/" +
+            project.repo +
+            "/git/ref/heads/" +
+            encodeURIComponent(chat.branch),
+          "GET",
+          undefined,
+          projectToken(project),
+        );
+        if (remote.object.sha !== review.head)
+          throw Object.assign(
+            new Error(
+              "Push the reviewed commits before creating a pull request.",
+            ),
+            { statusCode: 409 },
+          );
         const existing = await github(
           "/repos/" +
             project.repo +
@@ -1365,10 +1403,6 @@ export async function createApp() {
     return { ok: true };
   });
   app.get("/api/events", { websocket: true }, (socket, req) => {
-    if (req.headers.origin !== config.origin) {
-      socket.close(1008);
-      return;
-    }
     const authTimer = setInterval(() => {
       void authenticated(req.cookies.session)
         .then((ok) => {
@@ -1436,10 +1470,6 @@ export async function createApp() {
   });
   app.get("/api/chats/:id/terminal", { websocket: true }, (socket, req) => {
     const id = idOf(req);
-    if (req.headers.origin !== config.origin) {
-      socket.close(1008);
-      return;
-    }
     const authTimer = setInterval(() => {
       void authenticated(req.cookies.session)
         .then((ok) => {
@@ -1502,6 +1532,13 @@ export async function createApp() {
         if (closed) return;
         terminals.set(id, runtime);
         runtime.send({ type: "terminal", data: "" });
+        if (runtime.awsWarning && socket.readyState === 1)
+          socket.send(
+            JSON.stringify({
+              type: "terminal",
+              data: "\r\nWarning: " + runtime.awsWarning + "\r\n",
+            }),
+          );
       } catch (e: any) {
         disconnect(e.message);
       }

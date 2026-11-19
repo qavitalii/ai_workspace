@@ -1,10 +1,14 @@
 import { ChangesPanel } from "./ChangesPanel";
+import { AccountSwitcher } from "./AccountSwitcher";
+import { ActivityLog } from "./ActivityLog";
 import { SshSettings, SshAccess } from "./SshSettings";
+import { SkillsSettings } from "./SkillsSettings";
 import { RemovalConfirmation } from "./FolderActions";
 import { Select } from "./Select";
 import { ChatModelPicker } from "./ChatModelPicker";
 import { ModelDefaults } from "./ModelDefaults";
 import { AccountUsage } from "./AccountUsage";
+import { ProviderIcon } from "./ProviderIcon";
 import { modelLabel, effortLabel } from "../usage";
 import { SidebarNavigation } from "./Sidebar";
 import { WorkspaceHome } from "./WorkspaceHome";
@@ -501,13 +505,14 @@ export function App() {
             ...s,
             [ev.job_id]: (s[ev.job_id] || "") + ev.data.text,
           }));
-        if (["tool", "log", "handoff"].includes(ev.type))
+        if (["tool", "log", "handoff", "warning"].includes(ev.type))
           setLiveLogs((s) => [...s.slice(-149), ev]);
         if (
           [
             "status",
             "approval",
             "handoff",
+            "warning",
             "request_resolved",
             "commands",
             "model",
@@ -1051,11 +1056,16 @@ export function App() {
                   }
                   onClick={() => setModal("switch")}
                 >
-                  <span className={"provider-symbol " + chat.provider}>
-                    {chat.provider === "codex" ? "◈" : "✳"}
+                  <ProviderIcon
+                    provider={chat.provider}
+                    size={14}
+                    className="provider-symbol"
+                  />
+                  <span className="chat-account-name">
+                    {account?.name || "Choose account"}
                   </span>
-                  <span>{account?.name || "Choose account"}</span>
-                  <ChevronDown size={12} />
+                  <ArrowRightLeft size={14} />
+                  <span className="chat-switch-label">Switch account</span>
                 </button>
                 {chat.mode === "plan" && (
                   <span className="chat-context-mode">Plan mode</span>
@@ -1072,6 +1082,21 @@ export function App() {
                     Waiting for another chat to finish using this folder.
                   </p>
                 )}
+              {[
+                ...new Map(
+                  [...detail.events, ...liveLogs]
+                    .filter(
+                      (e: any) =>
+                        e.type === "warning" &&
+                        e.job_id === detail.jobs?.[0]?.id,
+                    )
+                    .map((e: any) => [e.id, e]),
+                ).values(),
+              ].map((e: any) => (
+                <div className="run-notice" role="alert" key={e.id}>
+                  {e.data.message}
+                </div>
+              ))}
               {!account && (
                 <div className="run-notice">
                   <p>
@@ -1111,7 +1136,7 @@ export function App() {
                 {!detail.messages.length && (
                   <div className="chat-start">
                     <span className="agent-orb">
-                      {chat.provider === "codex" ? "◈" : "✳"}
+                      <ProviderIcon provider={chat.provider} size={36} />
                     </span>
                     <h2>What are we working on?</h2>
                     <p>Describe a task, ask a question, or attach a file.</p>
@@ -1172,17 +1197,28 @@ export function App() {
                   <article className={"message " + m.role} key={m.id}>
                     <div className="message-content">
                       <div className="message-heading">
-                        <span className="message-avatar" aria-hidden="true">
-                          {m.role === "user"
-                            ? "Y"
-                            : chat.provider === "codex"
-                              ? "◈"
-                              : "✳"}
+                        <span
+                          className={
+                            "message-avatar" +
+                            (m.role === "user"
+                              ? ""
+                              : " " + (m.provider || chat.provider))
+                          }
+                          aria-hidden="true"
+                        >
+                          {m.role === "user" ? (
+                            "Y"
+                          ) : (
+                            <ProviderIcon
+                              provider={m.provider || chat.provider}
+                              size={17}
+                            />
+                          )}
                         </span>
 
                         {m.role === "user"
                           ? "You"
-                          : chat.provider === "codex"
+                          : (m.provider || chat.provider) === "codex"
                             ? "Codex"
                             : "Claude Code"}
                         <time
@@ -1210,8 +1246,11 @@ export function App() {
                   <article className="message assistant">
                     <div className="message-content">
                       <div className="message-heading" role="status">
-                        <span className="message-avatar" aria-hidden="true">
-                          {chat.provider === "codex" ? "◈" : "✳"}
+                        <span
+                          className={"message-avatar " + chat.provider}
+                          aria-hidden="true"
+                        >
+                          <ProviderIcon provider={chat.provider} size={17} />
                         </span>
                         {job.state === "waiting_approval"
                           ? detail.approvals.some(
@@ -1235,26 +1274,12 @@ export function App() {
                     </div>
                   </article>
                 )}
-                {(liveLogs.length > 0 || detail.events.length > 0) && (
-                  <details className="activity">
-                    <summary>
-                      <TerminalIcon size={14} />
-                      Actions and execution log
-                      <ChevronDown size={13} />
-                    </summary>
-                    {(liveLogs.length ? liveLogs : detail.events)
-                      .slice(-60)
-                      .map((e: any) => (
-                        <pre key={e.id}>
-                          {e.type === "handoff"
-                            ? "↔ " + e.data.message
-                            : e.type === "log"
-                              ? e.data.text
-                              : JSON.stringify(e.data.item || e.data, null, 2)}
-                        </pre>
-                      ))}
-                  </details>
-                )}
+                <ActivityLog
+                  key={chat.id}
+                  history={detail.events}
+                  live={liveLogs}
+                  running={job?.state === "running"}
+                />
                 {detail.approvals.map((a: any) =>
                   a.kind === "question" ? (
                     <AgentQuestions
@@ -1798,37 +1823,29 @@ export function App() {
       )}
       {modal === "switch" && chat && (
         <Modal
-          error={error}
-          title="Continue with another account"
+          title="Switch agent account"
+          className="account-switch-modal"
           onClose={() => setModal("")}
         >
-          <p className="muted">
-            Your chat and files stay in place. The new agent receives a summary
-            of the previous work. Stop the active task before switching.
-          </p>
-          {overview.accounts
-            .filter((a: any) => a.provider === chat.provider)
-            .map((a: any) => (
-              <button
-                className="account-choice"
-                key={a.id}
-                disabled={
-                  a.status !== "ready" ||
-                  ["running", "waiting_approval", "queued"].includes(job?.state)
-                }
-                onClick={() =>
-                  run(async () => {
-                    await api(`/chats/${chat.id}/switch`, { account_id: a.id });
-                    await loadDetail();
-                    setModal("");
-                  })
-                }
-              >
-                <span>{a.name}</span>
-                <small>{labels[a.status]}</small>
-                <ChevronRight size={16} />
-              </button>
-            ))}
+          <AccountSwitcher
+            key={chat.id}
+            accounts={overview.accounts}
+            currentId={chat.account_id}
+            provider={chat.provider}
+            runState={job?.state}
+            onCancel={() => setModal("")}
+            onManage={() => {
+              setError("");
+              setModal("accounts");
+            }}
+            onSwitch={async (id) => {
+              await api(`/chats/${chat.id}/switch`, { account_id: id });
+              setModal("");
+              await run(async () => {
+                await Promise.all([loadDetail(), loadOverview()]);
+              });
+            }}
+          />
         </Modal>
       )}
       {modal === "delete-chat" && editingChat && (
@@ -2365,7 +2382,7 @@ function NewChat({
               className={provider === "codex" ? "selected" : ""}
               onClick={() => selectProvider("codex")}
             >
-              ◈ Codex
+              <ProviderIcon provider="codex" size={16} /> Codex
             </button>
             <button
               type="button"
@@ -2373,7 +2390,7 @@ function NewChat({
               className={provider === "claude" ? "selected" : ""}
               onClick={() => selectProvider("claude")}
             >
-              ✳ Claude Code
+              <ProviderIcon provider="claude" size={16} /> Claude Code
             </button>
           </div>
           {accounts.length ? (
@@ -2563,7 +2580,10 @@ function Accounts({ accounts, refresh, onError }: any) {
               aria-label={service.name + " accounts"}
             >
               <header>
-                <strong>{service.name}</strong>
+                <strong className="service-name">
+                  <ProviderIcon provider={service.id} size={16} />
+                  {service.name}
+                </strong>
                 <span>
                   {
                     accounts.filter((a: any) => a.provider === service.id)
@@ -2581,7 +2601,7 @@ function Accounts({ accounts, refresh, onError }: any) {
                   <div className="account-entry" key={a.id}>
                     <div className="account-row">
                       <span className={"provider-icon " + a.provider}>
-                        {a.provider === "codex" ? "◈" : "✳"}
+                        <ProviderIcon provider={a.provider} size={20} />
                       </span>
                       <div>
                         <strong>{a.name}</strong>
@@ -3030,6 +3050,7 @@ function SettingsForm({
     { id: "models", label: "Models" },
     { id: "connections", label: "Connections" },
     { id: "ssh", label: "Servers & SSH" },
+    { id: "skills", label: "Skills" },
     { id: "resources", label: "Resources" },
     { id: "notifications", label: "Notifications" },
   ];
@@ -3147,6 +3168,15 @@ function SettingsForm({
           aria-labelledby="settings-tab-ssh"
         >
           <SshSettings />
+        </div>
+      )}
+      {section === "skills" && (
+        <div
+          role="tabpanel"
+          id="settings-panel-skills"
+          aria-labelledby="settings-tab-skills"
+        >
+          <SkillsSettings />
         </div>
       )}
       {section === "resources" && (

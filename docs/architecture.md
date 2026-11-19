@@ -76,7 +76,8 @@ All `/api/*` routes except `/login` and `/health` require an HttpOnly session co
 | `GET /api/events?chat_id=…&after=…` | WebSocket replay from an event cursor |
 | `GET /api/chats/:id/terminal` | Interactive terminal WebSocket |
 | `GET /api/chats/:id/files`, `/file`, `/diff` | Browse, download, inspect changes |
-| `POST /api/chats/:id/git` | Explicit commit/push/PR with `client_id` |
+| `POST /api/chats/:id/publication-review` | Prepare a frozen review with `{target: "commit" \| "push"}`; only push reviews contact GitHub |
+| `POST /api/chats/:id/git` | Explicit commit/push/PR with `client_id` and `review_token`; message required for commit and PR |
 | `POST /api/push` | Web Push subscription |
 | `GET/POST /api/folders`, `GET/POST /api/folders/:name/files` | Folder catalog, creation, browsing and isolated uploads |
 | `GET/POST/DELETE /api/{chats,projects}/:id/folders[/name]` | Persistent folder connections, project inheritance and read/write permissions |

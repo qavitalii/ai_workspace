@@ -36,7 +36,7 @@ export function ModelOptions({
   useEffect(() => {
     const current = ++generation.current;
     setError("");
-    if (!accountId || provider !== "codex") {
+    if (!accountId) {
       setBusy(false);
       return;
     }
@@ -86,7 +86,11 @@ export function ModelOptions({
   const choices = models.length
     ? models
     : provider === "claude"
-      ? [{ id: "sonnet" }, { id: "opus" }, { id: "haiku" }]
+      ? [
+          { id: "sonnet", displayName: "Sonnet · always latest" },
+          { id: "opus", displayName: "Opus · always latest" },
+          { id: "haiku", displayName: "Haiku · always latest" },
+        ]
       : [];
   return (
     <div

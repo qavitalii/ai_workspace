@@ -2,6 +2,7 @@ import { FolderActions } from "./FolderActions";
 import { ProjectWorkspaces } from "./ProjectWorkspaces";
 import { workspaceLabel } from "./WorkspaceFiles";
 import { modelLabel } from "../usage";
+import { ProviderIcon } from "./ProviderIcon";
 import {
   Activity,
   ChevronRight,
@@ -94,7 +95,7 @@ export function WorkspaceHome({
             <div className="home-chat-list">
               {chats.map((c: any) => (
                 <button key={c.id} onClick={() => onChat(c.id)}>
-                  <MessageSquare size={18} />
+                  <ProviderIcon provider={c.provider} size={18} />
                   <span>
                     <strong>{c.title}</strong>
                     <small>

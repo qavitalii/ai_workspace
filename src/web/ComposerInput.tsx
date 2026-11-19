@@ -65,7 +65,7 @@ export function ComposerInput({
       .then((r) => {
         if (live) {
           setEntries(r.entries);
-          if (!r.initialized)
+          if (!r.initialized && symbol === "@")
             setError(
               "Workspace files and skills appear after the workspace is prepared. Connected folders are available now.",
             );
@@ -174,7 +174,7 @@ export function ComposerInput({
           {!loading && !options.length && (
             <p>
               {symbol === "$"
-                ? "No matching workspace skills. Add a SKILL.md file to the workspace."
+                ? "No matching skills. Import one in Settings or add SKILL.md to the working folder."
                 : "No matches."}
             </p>
           )}

@@ -108,12 +108,10 @@ try {
     }),
   ]);
   assert.ok(Array.isArray(list));
-  console.log(
-    "PASS: three isolated runners, terminal I/O, persistent files, Git helper, complete large-file reads, Codex app-server handshake and model catalog. No inference calls.",
-  );
 } finally {
   for (const r of runners) await r.stop();
   await transaction(async (c) => {
+    await c.query("DELETE FROM events WHERE chat_id=ANY($1::uuid[])", [ids]);
     await c.query("DELETE FROM chats WHERE id=ANY($1::uuid[])", [ids]);
     await c.query("DELETE FROM workspaces WHERE id=ANY($1::uuid[])", [ids]);
   });
@@ -121,3 +119,6 @@ try {
   for (const id of ids)
     await rm(workspace(id), { recursive: true, force: true });
 }
+console.log(
+  "PASS: three isolated runners, terminal I/O, persistent files, Git helper, complete large-file reads, Codex app-server handshake and model catalog; temporary records and files removed. No inference calls.",
+);

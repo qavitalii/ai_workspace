@@ -18,9 +18,11 @@ export async function concurrentTasks(
 export type ModelDefaults = Partial<
   Record<"codex" | "claude", { model: string; effort: string }>
 >;
-export async function modelDefaults(): Promise<ModelDefaults> {
+export async function modelDefaults(
+  queryable: Pick<typeof db, "query"> = db,
+): Promise<ModelDefaults> {
   const rows = (
-    await db.query(
+    await queryable.query(
       "SELECT key,value FROM settings WHERE key IN ('model_default_codex','model_default_claude')",
     )
   ).rows;

@@ -19,15 +19,21 @@ export async function authenticated(token?: string) {
 }
 export async function authRoutes(app: FastifyInstance) {
   app.addHook("onRequest", async (req, reply) => {
-    if (!req.url.startsWith("/api/")) return;
+    // Apply the policy to the matched route, regardless of the URL's wire encoding.
+    const route = req.routeOptions.url;
+    if (!route?.startsWith("/api/")) return;
     if (req.headers.origin && req.headers.origin !== config.origin)
       return reply.code(403).send({ error: "Origin not allowed" });
     if (
-      !["GET", "HEAD", "OPTIONS"].includes(req.method) &&
+      (req.ws || !["GET", "HEAD", "OPTIONS"].includes(req.method)) &&
       req.headers.origin !== config.origin
     )
       return reply.code(403).send({ error: "Origin required" });
-    if (req.url === "/api/login" || req.url === "/api/health") return;
+    if (
+      (route === "/api/login" && req.method === "POST") ||
+      (route === "/api/health" && ["GET", "HEAD"].includes(req.method))
+    )
+      return;
     if (!(await authenticated(req.cookies.session)))
       return reply.code(401).send({ error: "Sign in to Workspace" });
   });

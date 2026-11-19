@@ -15,6 +15,8 @@ import { folderMounts } from "./folders.js";
 import { prepareSsh, cleanSshVolumes } from "./ssh-runtime.js";
 import { attachInput } from "./docker-attach.js";
 import { removeDockerResource } from "./docker-cleanup.js";
+import { cleanAwsCredentials, awsForRun } from "./aws.js";
+import { cleanSkillSnapshots, prepareSkills } from "./skills.js";
 export const docker = new Docker();
 // IDs here identify persistent folders, not chats.
 export const workspace = workspacePath;
@@ -26,6 +28,8 @@ async function writable(dir: string) {
 }
 export type Running = {
   id: string;
+  aws?: boolean;
+  awsWarning?: string;
   send: (c: RunnerCommand) => void;
   stop: () => Promise<void>;
 };
@@ -34,13 +38,13 @@ export async function launch(
   accountId: string | null,
   onEvent: (e: AgentEvent) => void | Promise<void>,
 ): Promise<Running> {
-  const work = chatId
-    ? workspace((await chatWorkspace(chatId)).id)
+  const w = chatId ? await chatWorkspace(chatId) : null;
+  const work = w
+    ? workspace(w.id)
     : path.join(config.data, "auth-workspaces", accountId!);
   await writable(work);
   const mounts: any[] = [{ Type: "bind", Source: work, Target: "/workspace" }];
-  if (chatId) {
-    const w = await chatWorkspace(chatId);
+  if (chatId && w) {
     mounts.push(...workspaceGitMounts(w));
     if (w.resolution_operation_id)
       mounts.push({
@@ -86,8 +90,24 @@ export async function launch(
       Target: "/profile",
     });
   }
-  const ssh = chatId ? await prepareSsh(chatId) : null;
+  const { access: aws, warning: awsWarning } =
+    w && !w.resolution_operation_id
+      ? await awsForRun(w.project_id)
+      : { access: null, warning: "" };
+  let skills: Awaited<ReturnType<typeof prepareSkills>> = null;
+  let ssh: Awaited<ReturnType<typeof prepareSsh>> = null;
+  const cleanMounts = () =>
+    Promise.all([ssh?.stop(), skills?.stop(), aws?.stop()]);
+  try {
+    if (w) skills = await prepareSkills(w.project_id);
+    if (chatId) ssh = await prepareSsh(chatId);
+  } catch (error) {
+    await cleanMounts();
+    throw error;
+  }
   if (ssh) mounts.push(ssh.mount);
+  if (skills) mounts.push(skills.mount);
+  if (aws) mounts.push(aws.mount);
   let c: Docker.Container;
   try {
     c = await docker.createContainer({
@@ -110,6 +130,9 @@ export async function launch(
         "CODEX_HOME=/profile/.codex",
         "CLAUDE_CONFIG_DIR=/profile/.claude",
         "GIT_OPTIONAL_LOCKS=0",
+        ...Object.entries(aws?.env ?? {}).map(
+          ([key, value]) => key + "=" + value,
+        ),
       ],
       HostConfig: {
         Mounts: mounts,
@@ -135,7 +158,7 @@ export async function launch(
       StopTimeout: 10,
     });
   } catch (error) {
-    await ssh?.stop();
+    await cleanMounts();
     throw error;
   }
   let stream: Duplex;
@@ -143,7 +166,7 @@ export async function launch(
     stream = await attachInput(c);
   } catch (error) {
     await c.remove({ force: true }).catch(() => {});
-    await ssh?.stop();
+    await cleanMounts();
     throw error;
   }
   let stopped = false;
@@ -154,9 +177,12 @@ export async function launch(
     stopped = true;
     stream.destroy();
     stopping = (async () => {
-      await c.stop({ t: 5 }).catch(() => {});
-      await removeDockerResource(() => c.remove({ force: true }));
-      await ssh?.stop();
+      try {
+        await c.stop({ t: 5 }).catch(() => {});
+        await removeDockerResource(() => c.remove({ force: true }));
+      } finally {
+        await cleanMounts();
+      }
     })().catch((error) => {
       stopping = undefined;
       throw error;
@@ -200,12 +226,14 @@ export async function launch(
     .then(async () => {
       exited = true;
       await output;
-      await ssh?.stop();
+      await cleanMounts();
       if (!stopped) await onEvent({ type: "exit" });
     })
     .catch(() => {});
   return {
     id: c.id,
+    aws: !!aws,
+    awsWarning,
     send(c) {
       if (!stopped) stream.write(JSON.stringify(c) + "\n");
     },
@@ -233,4 +261,5 @@ export async function cleanOrphans() {
       .catch(() => {});
   }
   await cleanSshVolumes();
+  await Promise.all([cleanSkillSnapshots(), cleanAwsCredentials()]);
 }

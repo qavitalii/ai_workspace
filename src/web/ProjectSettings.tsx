@@ -1,3 +1,5 @@
+import { AwsAccess } from "./AwsAccess";
+import { SkillsSettings } from "./SkillsSettings";
 import { SshAccess } from "./SshSettings";
 import { GithubTokenHelp } from "./GithubTokenHelp";
 import { useState } from "react";
@@ -113,6 +115,14 @@ export function ProjectSettings({
       <details className="settings-disclosure">
         <summary>Server access</summary>
         <SshAccess embedded scope="projects" id={project.id} />
+      </details>
+      <details className="settings-disclosure">
+        <summary>AWS access</summary>
+        <AwsAccess key={project.id} projectId={project.id} />
+      </details>
+      <details className="settings-disclosure">
+        <summary>Skills</summary>
+        <SkillsSettings key={project.id} projectId={project.id} />
       </details>
     </>
   );

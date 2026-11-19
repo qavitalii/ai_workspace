@@ -10,12 +10,22 @@ COPY public ./public
 COPY ops/build.mjs ./ops/build.mjs
 RUN npm run build && npm prune --omit=dev
 
+FROM node:22-bookworm-slim AS aws
+ARG AWS_CLI_VERSION=2.39.3
+RUN apt-get update && apt-get install -y --no-install-recommends curl unzip ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN set -eu; case "$(dpkg --print-architecture)" in amd64) arch=x86_64 ;; arm64) arch=aarch64 ;; *) exit 1 ;; esac; \
+    curl --fail --silent --show-error --location --retry 3 "https://awscli.amazonaws.com/awscli-exe-linux-${arch}-${AWS_CLI_VERSION}.zip" -o /tmp/aws.zip; \
+    unzip -q /tmp/aws.zip -d /tmp; /tmp/aws/install; rm -rf /tmp/aws /tmp/aws.zip
+
 FROM node:22-bookworm-slim AS server
-RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates python3 && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=dependencies /app/node_modules ./node_modules
 COPY --from=dependencies /app/dist ./dist
 COPY package.json ./
+COPY ops/skill-zip.py ./ops/skill-zip.py
+COPY --from=aws /usr/local/aws-cli /usr/local/aws-cli
+RUN ln -s /usr/local/aws-cli/v2/current/bin/aws /usr/local/bin/aws
 ENV NODE_ENV=production
 EXPOSE 3000
 CMD ["node","dist/node/server/main.js"]
@@ -29,6 +39,8 @@ WORKDIR /app
 COPY --from=dependencies /app/node_modules ./node_modules
 COPY --from=dependencies /app/dist/node ./dist/node
 COPY package.json ./
+COPY --from=aws /usr/local/aws-cli /usr/local/aws-cli
+RUN ln -s /usr/local/aws-cli/v2/current/bin/aws /usr/local/bin/aws
 COPY --chmod=755 ops/git-askpass.sh /usr/local/bin/workspace-git-askpass
 RUN mkdir -p /profile /workspace && chown node:node /profile /workspace
 RUN mkdir -p /run/workspace-ssh /private && chown node:node /run/workspace-ssh /private && chmod 700 /run/workspace-ssh /private \

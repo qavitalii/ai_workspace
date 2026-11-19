@@ -318,6 +318,29 @@ export function FolderActions({
                   ))}
                 </fieldset>
               )}
+              {change.children?.map((child: any) => (
+                <details key={child.path} open>
+                  <summary>
+                    {child.path} · {child.status}
+                  </summary>
+                  <div className="copy-comparison">
+                    <div>
+                      <strong>Current main</strong>
+                      <pre>
+                        {child.main ??
+                          "Binary or large file — preview unavailable"}
+                      </pre>
+                    </div>
+                    <div>
+                      <strong>Working copy</strong>
+                      <pre>
+                        {child.copy ??
+                          "Binary or large file — preview unavailable"}
+                      </pre>
+                    </div>
+                  </div>
+                </details>
+              ))}
               <div className="copy-comparison">
                 <div>
                   <strong>Current main</strong>

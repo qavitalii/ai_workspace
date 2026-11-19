@@ -283,6 +283,7 @@ async function run() {
     );
     return {
       changes: result.changes,
+      reviewVersion: 2,
       copyHash: copy.tree.hash,
       mainHash: main.tree.hash,
       excluded: [...new Set([...copy.excluded, ...main.excluded])],

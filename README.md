@@ -88,7 +88,7 @@ Use **Disconnect** in Agent accounts to sign out through the official CLI. Stop 
 - Server failures mark active jobs as interrupted. Resume only after reviewing existing changes and external operations; publishing is never blindly retried.
 - Web Push requires browser permission. On iPhone/iPad, use HTTPS and install the web app on the Home Screen.
 - A server running 24/7 does not remove subscription limits. Enable automatic switching only after checking integration compatibility and the applicable provider terms.
-- Not included in v1: multi-user SaaS, billing, website previews, scheduled tasks, or switching Codex ↔ Claude within a chat.
+- Not included in v1: multi-user SaaS, billing, website previews, or scheduled tasks.
 
 ## Operations
 
@@ -155,11 +155,15 @@ Choose a model and reasoning effort before the first message or from the compose
 
 **Settings → Servers & SSH keys** manages SSH connections. Create or import a key (including passphrase-protected keys), install its public key on your server, confirm the server fingerprint and test the connection. Select servers in project or personal chat settings; project working copies inherit access. Agents and chat terminals can use SSH, SCP and SFTP by alias. Private keys stay in an isolated authentication helper for each run. Removing a connection does not revoke its public key on the remote server. [Setup, access and backup details](docs/deployment.md#ssh-servers-and-keys).
 
+### AWS access and portable skills
+
+Use **Project settings → AWS access** to sign in to AWS IAM Identity Center in your browser and give that project’s agents and terminals a temporary role. Use **Settings → Skills** to import a local skill folder or ZIP for all chats, or **Project settings → Skills** to keep it within a project. Choose imported skills with `$`. Export selected skills as a ZIP with their supporting files. [Setup and limits](docs/deployment.md#aws-access-and-portable-skills).
+
 ### Chat models and account limits
 
 **Settings → Models** saves a starting model and thinking depth separately for Codex and Claude Code. New chats copy those values; existing chats keep their own settings. Override the model when creating a chat or in chat settings. The UI displays the provider-reported model once available, including the exact model behind a Claude alias. Older chats without a reported model show that it has not been reported yet.
 
-The sidebar labels each chat with its agent and model, and shows remaining limits for each account. Open **Details** for reset times and the last report timestamp. Codex limits can be refreshed without starting an inference task when the account is idle. Claude reports limits during tasks and may omit utilization; missing percentages are shown as unknown, never as a full balance. Expired windows require a fresh report. Credits or usage costs are not treated as subscription percentages.
+The sidebar labels each chat with its agent and model, and shows remaining limits for each account. Open **Details** for reset times and the last report timestamp. Limits for both Codex and Claude Code accounts can be refreshed without starting an inference task when the account is idle; opening **Account limits** in the sidebar refreshes stale values automatically. Claude limits are read with the signed-in CLI profile's own token from the same subscription usage data the CLI shows in `/usage`; this is not a documented public API and may change. During tasks, Claude's own reports also update limits and may omit utilization; missing percentages are shown as unknown, never as a full balance. Expired windows require a fresh report. Credits or usage costs are not treated as subscription percentages.
 
 ## Screenshots
 
@@ -190,3 +194,5 @@ Keep your projects and conversations close, with a mobile layout for browsing ch
 This is an independent project and is not affiliated with OpenAI or Anthropic. You supply your own eligible provider accounts. Provider access is not included.
 
 Licensed under the [GNU General Public License v3.0 only](LICENSE) (`GPL-3.0-only`). Third-party dependencies and the separately installed provider CLIs retain their own licenses and terms.
+
+Manual account switching supports Codex ↔ Claude Code in the same chat. Messages, files, attachments, planning mode and permissions remain; a new agent session receives the saved context. Changing providers uses the target provider’s default model and clears native commands from the previous session. Stop or cancel an active/queued task before switching. Automatic quota handoff stays within the current provider.

@@ -51,13 +51,6 @@ async function load(id: string, start: typeof launch) {
     ).rows[0];
     if (!a)
       throw Object.assign(new Error("Account not found"), { statusCode: 404 });
-    if (a.provider !== "codex")
-      throw Object.assign(
-        new Error(
-          "Claude reports its limits during tasks. The latest reported values are shown here.",
-        ),
-        { statusCode: 409 },
-      );
     if (!["ready", "limited"].includes(a.status))
       throw Object.assign(
         new Error(
@@ -93,6 +86,8 @@ async function load(id: string, start: typeof launch) {
     void result.catch(() => {});
     runtime = await start(null, id, (e) => {
       if (e.type === "limits_read") resolve(e.limits);
+      if (e.type === "limits_error")
+        reject(Object.assign(new Error(e.error), { statusCode: 409 }));
       if (["failed", "exit"].includes(e.type))
         reject(
           new Error("Usage limits are temporarily unavailable. Try again."),
@@ -102,7 +97,7 @@ async function load(id: string, start: typeof launch) {
       () => reject(new Error("Loading usage limits timed out. Try again.")),
       30000,
     );
-    runtime.send({ type: "usage", provider: "codex" });
+    runtime.send({ type: "usage", provider: account.provider });
     await saveUsage(id, await result);
     return (
       await db.query(

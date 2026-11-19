@@ -4,6 +4,7 @@ import { createServer } from "node:http";
 import { readFile, mkdir, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { quotaError, type RunInput, type RunnerCommand } from "../shared.js";
+import { claudeSubscriptionUsage } from "../usage.js";
 const emit = (data: unknown) =>
   process.stdout.write(JSON.stringify(data) + "\n");
 let child: ChildProcessWithoutNullStreams | undefined,
@@ -438,6 +439,114 @@ async function auth(provider: string) {
     );
   }
 }
+// Calls an Anthropic endpoint with the signed-in CLI profile's own OAuth
+// token. Never makes inference requests and never rewrites credentials.
+async function claudeApi(path: string, headers: Record<string, string> = {}) {
+  const credentials = async () => {
+    try {
+      return JSON.parse(
+        await readFile("/profile/.claude/.credentials.json", "utf8"),
+      )?.claudeAiOauth;
+    } catch {
+      return undefined;
+    }
+  };
+  const request = (token: string) =>
+    fetch("https://api.anthropic.com" + path, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "anthropic-beta": "oauth-2025-04-20",
+        "Content-Type": "application/json",
+        ...headers,
+      },
+      signal: AbortSignal.timeout(10000),
+    });
+  let auth = await credentials();
+  if (!auth?.accessToken)
+    throw new Error("Claude is not signed in on this account.");
+  const stale =
+    typeof auth.expiresAt === "number" && auth.expiresAt <= Date.now() + 60000;
+  let response = stale ? undefined : await request(auth.accessToken);
+  if (!response || response.status === 401) {
+    // Let the official CLI renew its own token.
+    await new Promise<void>((resolve) => {
+      const status = spawn("claude", ["auth", "status"], {
+        env: {
+          ...process.env,
+          HOME: "/profile",
+          CLAUDE_CONFIG_DIR: "/profile/.claude",
+        },
+        stdio: "ignore",
+        timeout: 15000,
+      });
+      status.on("error", () => resolve());
+      status.on("close", () => resolve());
+    });
+    auth = await credentials();
+    if (auth?.accessToken) response = await request(auth.accessToken);
+  }
+  if (response?.status === 401 || response?.status === 403)
+    throw Object.assign(
+      new Error(
+        "Claude sign-in needs renewal. It renews on the next task; the latest reported values are shown.",
+      ),
+      { status: response.status },
+    );
+  if (!response?.ok)
+    throw Object.assign(
+      new Error(
+        `Claude account data is temporarily unavailable${response ? ` (HTTP ${response.status})` : ""}. Try again.`,
+      ),
+      { status: response?.status },
+    );
+  return response.json();
+}
+// Subscription limits: the same data as the CLI's /usage view.
+async function claudeUsage() {
+  return claudeSubscriptionUsage(await claudeApi("/api/oauth/usage"));
+}
+// Exact models available to the account, plus the CLI's aliases. Falls back
+// to the built-in list when the account's model list cannot be read.
+async function claudeModels() {
+  const aliases = [
+    { id: "opus", displayName: "Opus · always latest" },
+    { id: "sonnet", displayName: "Sonnet · always latest" },
+    { id: "haiku", displayName: "Haiku · always latest" },
+  ];
+  try {
+    const list: any = await claudeApi("/v1/models?limit=100", {
+      "anthropic-version": "2023-06-01",
+    });
+    const exact = (Array.isArray(list?.data) ? list.data : [])
+      .filter(
+        (m: any) => typeof m?.id === "string" && m.id.startsWith("claude"),
+      )
+      .map((m: any) => ({
+        id: m.id,
+        model: m.id,
+        displayName: m.display_name || m.id,
+      }));
+    if (exact.length) return [...exact, ...aliases];
+  } catch {}
+  return [...CLAUDE_FALLBACK_MODELS, ...aliases];
+}
+const CLAUDE_FALLBACK_MODELS = [
+  {
+    id: "claude-opus-5-5",
+    model: "claude-opus-5-5",
+    displayName: "Claude Opus 5.5",
+  },
+  {
+    id: "claude-sonnet-5-5",
+    model: "claude-sonnet-5-5",
+    displayName: "Claude Sonnet 5.5",
+  },
+  {
+    id: "claude-haiku-5-5",
+    model: "claude-haiku-5-5",
+    displayName: "Claude Haiku 5.5",
+  },
+];
 createInterface({ input: process.stdin }).on("line", async (line) => {
   try {
     const c = JSON.parse(line) as RunnerCommand;
@@ -493,8 +602,14 @@ createInterface({ input: process.stdin }).on("line", async (line) => {
     }
     if (c.type === "auth_input") terminal?.write(c.data);
     if (c.type === "usage") {
-      if (c.provider !== "codex")
-        throw new Error("Usage is reported during Claude tasks.");
+      if (c.provider !== "codex") {
+        try {
+          emit({ type: "limits_read", limits: await claudeUsage() });
+        } catch (e: any) {
+          emit({ type: "limits_error", error: e.message });
+        }
+        return;
+      }
       await codex();
       emit({
         type: "limits_read",
@@ -505,15 +620,7 @@ createInterface({ input: process.stdin }).on("line", async (line) => {
       if (c.provider === "codex") {
         await codex();
         emit({ type: "models", models: (await rpc("model/list", {})).data });
-      } else
-        emit({
-          type: "models",
-          models: [
-            { id: "sonnet", displayName: "Sonnet" },
-            { id: "opus", displayName: "Opus" },
-            { id: "haiku", displayName: "Haiku" },
-          ],
-        });
+      } else emit({ type: "models", models: await claudeModels() });
     }
     if (c.type === "terminal") {
       if (!terminal) {
@@ -523,7 +630,16 @@ createInterface({ input: process.stdin }).on("line", async (line) => {
           cwd: "/workspace",
           cols: 100,
           rows: 30,
-          env: { PATH: process.env.PATH, HOME: "/tmp", TERM: "xterm-256color" },
+          env: {
+            PATH: process.env.PATH,
+            HOME: "/tmp",
+            TERM: "xterm-256color",
+            ...(Object.fromEntries(
+              Object.entries(process.env).filter(
+                ([key, value]) => key.startsWith("AWS_") && value !== undefined,
+              ),
+            ) as Record<string, string>),
+          },
         });
         terminal.onData((data: string) => emit({ type: "terminal", data }));
         terminal.onExit(() => {

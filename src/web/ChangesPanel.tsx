@@ -12,7 +12,27 @@ import { api } from "./api";
 import { parseDiff } from "./diff";
 
 export function ChangesPanel({ chatId }: { chatId: string }) {
-  const [diff, setDiff] = useState("");
+  const [review, setReview] = useState<{
+    diff: string;
+    pushDiff: string;
+    commits: string;
+    pushError: string;
+    review_token: string;
+  } | null>(null);
+  const [view, setView] = useState<"commit" | "push">("commit");
+  const [reviewTarget, setReviewTarget] = useState<"commit" | "push" | null>(
+    null,
+  );
+  const [local, setLocal] = useState<{
+    diff: string;
+    untracked: string[];
+  } | null>(null);
+  const diff =
+    (view === "commit"
+      ? (review?.diff ?? local?.diff)
+      : reviewTarget === "push"
+        ? review?.pushDiff
+        : "") || "";
   const [message, setMessage] = useState("");
   const [result, setResult] = useState("");
   const [error, setError] = useState("");
@@ -21,15 +41,19 @@ export function ChangesPanel({ chatId }: { chatId: string }) {
   const [revision, setRevision] = useState(0);
   const [raw, setRaw] = useState(false);
   const files = useMemo(() => parseDiff(diff), [diff]);
+  const fileCount = new Set(files.map((file) => file.path)).size;
   const added = files.reduce((total, f) => total + f.added, 0);
   const removed = files.reduce((total, f) => total + f.removed, 0);
   useEffect(() => {
     let live = true;
     setLoading(true);
+    setReview(null);
+    setReviewTarget(null);
+    setLocal(null);
     setError("");
     api(`/chats/${chatId}/diff`)
       .then((r) => {
-        if (live) setDiff(r.diff);
+        if (live) setLocal(r);
       })
       .catch((e) => {
         if (live) setError(e.message);
@@ -41,8 +65,32 @@ export function ChangesPanel({ chatId }: { chatId: string }) {
       live = false;
     };
   }, [chatId, revision]);
+  async function prepareReview() {
+    setLoading(true);
+    setError("");
+    setReview(null);
+    setReviewTarget(null);
+    try {
+      const prepared = await api(`/chats/${chatId}/publication-review`, {
+        target: view,
+      });
+      setReview(prepared);
+      setReviewTarget(view);
+    } catch (e: any) {
+      setError(e.message);
+    } finally {
+      setLoading(false);
+    }
+  }
   async function publish(action: string) {
-    if (publishing || loading || !message.trim()) return;
+    if (
+      publishing ||
+      loading ||
+      (action !== "push" && !message.trim()) ||
+      !review ||
+      (action !== "commit" && reviewTarget !== "push")
+    )
+      return;
     setPublishing(true);
     setResult("");
     setError("");
@@ -51,25 +99,77 @@ export function ChangesPanel({ chatId }: { chatId: string }) {
         action,
         message,
         client_id: crypto.randomUUID(),
+        review_token: review.review_token,
       });
       setResult(r.html_url || r.output || r.status || "Done");
-      const updated = await api(`/chats/${chatId}/diff`);
-      setDiff(updated.diff);
+      setReview(null);
+      setReviewTarget(null);
+      setRevision((value) => value + 1);
+      if (action === "commit") setView("push");
     } catch (e: any) {
       setError(e.message);
+      setReview(null);
     } finally {
       setPublishing(false);
     }
   }
-  const disabled = !message.trim() || publishing || loading;
+  const disabled = publishing || loading || !review;
   return (
     <section className="changes-panel" aria-label="Code changes">
+      <div className="changes-tools">
+        <button
+          aria-pressed={view === "commit"}
+          disabled={loading || publishing}
+          onClick={() => setView("commit")}
+        >
+          Next commit
+        </button>
+        <button
+          disabled={loading || publishing}
+          aria-pressed={view === "push"}
+          onClick={() => setView("push")}
+        >
+          Outgoing commits
+        </button>
+      </div>
+      <p className="settings-section-note">
+        {review && (view === "commit" || reviewTarget === "push")
+          ? "Review the prepared changes below before publishing. Later edits require a new review."
+          : view === "commit"
+            ? "Live local preview. Files may change while a task runs. Prepare a review to inspect the complete next commit, including new files."
+            : "Prepare a review to compare outgoing commits with GitHub."}
+      </p>
+      <button
+        className="secondary"
+        disabled={loading || publishing}
+        onClick={() => void prepareReview()}
+      >
+        {loading
+          ? "Loading…"
+          : view === "commit"
+            ? "Prepare commit review"
+            : "Review outgoing commits"}
+      </button>
+      {view === "commit" && !review && !!local?.untracked.length && (
+        <details open>
+          <summary>New files ({local.untracked.length})</summary>
+          <ul>
+            {local.untracked.map((name) => (
+              <li key={name}>{name}</li>
+            ))}
+          </ul>
+        </details>
+      )}
+      {view === "push" && review?.commits && <pre>{review.commits}</pre>}
+      {view === "push" && review?.pushError && (
+        <p role="alert">{review.pushError}</p>
+      )}
       <div className="changes-toolbar">
         <div className="changes-count" aria-live="polite">
           <strong>
             {loading
               ? "Loading…"
-              : `${files.length} ${files.length === 1 ? "file" : "files"} changed`}
+              : `${fileCount} ${fileCount === 1 ? "file" : "files"} changed`}
           </strong>
           {!!files.length && (
             <span
@@ -106,16 +206,22 @@ export function ChangesPanel({ chatId }: { chatId: string }) {
             {error}
           </p>
         )}
-        {!loading && !error && !diff && (
-          <div className="changes-empty">
-            <Check size={24} />
-            <strong>No tracked changes</strong>
-            <p>
-              Changes to tracked files will appear here. New files appear after
-              a commit.
-            </p>
-          </div>
-        )}
+        {!loading &&
+          !error &&
+          !diff &&
+          (view === "commit"
+            ? !local?.untracked.length || !!review
+            : reviewTarget === "push") &&
+          !(view === "push" && review?.pushError) && (
+            <div className="changes-empty">
+              <Check size={24} />
+              <strong>
+                {view === "commit"
+                  ? "No changes to commit"
+                  : "No outgoing file changes"}
+              </strong>
+            </div>
+          )}
         {raw && diff ? (
           <pre className="changes-raw">{diff}</pre>
         ) : (
@@ -172,7 +278,9 @@ export function ChangesPanel({ chatId }: { chatId: string }) {
         <div className="changes-actions">
           <button
             className="primary"
-            disabled={disabled}
+            disabled={
+              disabled || !message.trim() || view !== "commit" || !review?.diff
+            }
             onClick={() => publish("commit")}
           >
             <GitCommitHorizontal size={15} />
@@ -180,7 +288,12 @@ export function ChangesPanel({ chatId }: { chatId: string }) {
           </button>
           <button
             className="secondary"
-            disabled={disabled}
+            disabled={
+              disabled ||
+              view !== "push" ||
+              reviewTarget !== "push" ||
+              !!review?.pushError
+            }
             onClick={() => publish("push")}
           >
             <Upload size={15} />
@@ -188,7 +301,13 @@ export function ChangesPanel({ chatId }: { chatId: string }) {
           </button>
           <button
             className="secondary"
-            disabled={disabled}
+            disabled={
+              disabled ||
+              !message.trim() ||
+              view !== "push" ||
+              reviewTarget !== "push" ||
+              !!review?.pushError
+            }
             onClick={() => publish("pr")}
           >
             <GitPullRequest size={15} />

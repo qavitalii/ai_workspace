@@ -25,6 +25,17 @@ CREATE TABLE IF NOT EXISTS settings(key text PRIMARY KEY,value text NOT NULL);
 CREATE TABLE IF NOT EXISTS ssh_keys(id uuid PRIMARY KEY,name text NOT NULL,private_key text NOT NULL,public_key text NOT NULL,fingerprint text NOT NULL,created_at timestamptz NOT NULL DEFAULT now());
 CREATE TABLE IF NOT EXISTS ssh_servers(id uuid PRIMARY KEY,name text NOT NULL,alias text NOT NULL UNIQUE,host text NOT NULL,port int NOT NULL CHECK(port BETWEEN 1 AND 65535),username text NOT NULL,key_id uuid NOT NULL REFERENCES ssh_keys(id),host_keys jsonb NOT NULL DEFAULT '[]',last_checked_at timestamptz,last_check_ok boolean,last_check_message text);
 CREATE TABLE IF NOT EXISTS projects(id uuid PRIMARY KEY,name text NOT NULL,repo text NOT NULL,base_branch text NOT NULL DEFAULT 'main',created_at timestamptz NOT NULL DEFAULT now());
+CREATE TABLE IF NOT EXISTS aws_connections(project_id uuid PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,settings jsonb NOT NULL,session text,identity text,generation uuid);
+CREATE TABLE IF NOT EXISTS imported_skills(
+  project_id uuid REFERENCES projects(id) ON DELETE CASCADE,
+  name text NOT NULL,
+  revision uuid NOT NULL,
+  description text NOT NULL,
+  hints text[] NOT NULL,
+  bytes int NOT NULL,
+  files jsonb NOT NULL,
+  UNIQUE NULLS NOT DISTINCT(project_id,name)
+);
 ALTER TABLE projects ADD COLUMN IF NOT EXISTS github_token text;
 UPDATE projects SET github_token=COALESCE((SELECT value FROM settings WHERE key='github_token'),'') WHERE github_token IS NULL;
 ALTER TABLE projects ALTER COLUMN github_token SET DEFAULT '';
@@ -79,6 +90,7 @@ CREATE TABLE IF NOT EXISTS folder_links(id uuid PRIMARY KEY,name text NOT NULL,c
 CREATE UNIQUE INDEX IF NOT EXISTS folder_link_chat ON folder_links(chat_id,name) WHERE chat_id IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS folder_link_project ON folder_links(project_id,name) WHERE project_id IS NOT NULL;
 CREATE TABLE IF NOT EXISTS messages(id uuid PRIMARY KEY,chat_id uuid NOT NULL REFERENCES chats(id),role text NOT NULL,content text NOT NULL,client_id uuid,created_at timestamptz NOT NULL DEFAULT now(),UNIQUE(chat_id,client_id));
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS provider text CHECK(provider IN ('codex','claude'));
 CREATE TABLE IF NOT EXISTS attachments(id uuid PRIMARY KEY,chat_id uuid NOT NULL REFERENCES chats(id),message_id uuid REFERENCES messages(id),name text NOT NULL,mime text NOT NULL,size bigint NOT NULL,storage_name text NOT NULL,client_id uuid NOT NULL,created_at timestamptz NOT NULL DEFAULT now(),UNIQUE(chat_id,client_id));
 ALTER TABLE attachments ADD COLUMN IF NOT EXISTS workspace_id uuid REFERENCES workspaces(id);
 UPDATE attachments a SET workspace_id=c.workspace_id FROM chats c WHERE a.chat_id=c.id AND a.workspace_id IS NULL;

@@ -72,6 +72,13 @@ describe("working copy file comparison", () => {
       shape: "copy",
     });
     expect(result.changes.filter((x) => x.conflict)).toHaveLength(3);
+    expect(result.changes.find((x) => x.path === "shape")?.children).toEqual([
+      expect.objectContaining({
+        path: "shape/nested",
+        status: "added",
+        copy: "copy",
+      }),
+    ]);
     await overlay(r + "/main", m.tree, result.tree);
     expect(await fs.readFile(r + "/main/deleted", "utf8")).toBe("edited");
     expect(await fs.readFile(r + "/main/shape/nested", "utf8")).toBe("copy");
@@ -90,6 +97,14 @@ describe("working copy file comparison", () => {
       ["base", "copy", "main"].map((x) => snapshot(r + "/" + x)),
     );
     const result = await mergeTrees(b.tree, c.tree, m.tree, r + "/merge");
+    expect(result.changes.find((x) => x.path === "dir")?.children).toEqual([
+      expect.objectContaining({
+        path: "dir/file",
+        status: "deleted",
+        main: "old",
+        copy: "(absent)",
+      }),
+    ]);
     await overlay(r + "/main", m.tree, result.tree);
     expect(await fs.readFile(r + "/main/dir/.env", "utf8")).toBe("keep");
     await fs.writeFile(r + "/copy/dir", "replacement");
@@ -116,5 +131,27 @@ describe("working copy file comparison", () => {
     await overlay(r + "/main", m.tree, result.tree);
     expect((await fs.stat(r + "/main/run")).mode & 0o777).toBe(0o755);
     expect((await fs.stat(r + "/main/empty")).isDirectory()).toBe(true);
+  });
+  it("shows every descendant of added directories including binary files", async () => {
+    const r = await fixture();
+    await fs.mkdir(r + "/copy/notes/nested", { recursive: true });
+    await fs.writeFile(r + "/copy/notes/nested/new.txt", "review me");
+    await fs.writeFile(r + "/copy/notes/binary", Buffer.from([0, 1]));
+    const [b, c, m] = await Promise.all(
+      ["base", "copy", "main"].map((d) => snapshot(r + "/" + d)),
+    );
+    const result = await mergeTrees(b.tree, c.tree, m.tree, r + "/merge");
+    expect(result.changes[0].children).toEqual([
+      expect.objectContaining({ path: "notes/binary", copy: null }),
+      expect.objectContaining({ path: "notes/nested", status: "added" }),
+      expect.objectContaining({
+        path: "notes/nested/new.txt",
+        copy: "review me",
+      }),
+    ]);
+    await overlay(r + "/main", m.tree, result.tree);
+    expect(await fs.readFile(r + "/main/notes/nested/new.txt", "utf8")).toBe(
+      "review me",
+    );
   });
 });

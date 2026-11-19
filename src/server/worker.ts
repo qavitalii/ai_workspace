@@ -9,7 +9,7 @@ import { launch, cleanOrphans, type Running } from "./runtime.js";
 import { chatServers } from "./ssh-runtime.js";
 import { initializeWorkspace, git } from "./git.js";
 import { config } from "./config.js";
-import { concurrentTasks } from "./settings.js";
+import { concurrentTasks, modelDefaults } from "./settings.js";
 import { chatWorkspace, workspaceBusy } from "./workspaces.js";
 import { isOutputLimit, outputLimitMessage } from "./output-storage.js";
 import { MAX_RESPONSE_BYTES } from "./runner-output.js";
@@ -120,8 +120,8 @@ export async function runJob(job: any) {
             [job.id],
           );
           await c.query(
-            "INSERT INTO messages(id,chat_id,role,content) VALUES($1,$2,$3,$4)",
-            [randomUUID(), chat.id, "assistant", text],
+            "INSERT INTO messages(id,chat_id,role,content,provider) VALUES($1,$2,$3,$4,$5)",
+            [randomUUID(), chat.id, "assistant", text, chat.provider],
           );
           await c.query("UPDATE output_storage SET limit_bytes=$1 WHERE id=1", [
             budget.limit_bytes,
@@ -410,18 +410,29 @@ export async function runJob(job: any) {
       job.id,
       runtime.id,
     ]);
+    if (runtime.aws)
+      prompt +=
+        "\nThis project has a temporary AWS role. Ask before making remote changes unless the user already authorized them. Do not print or copy AWS credentials.";
+    if (runtime.awsWarning) {
+      await event(chat.id, job.id, "warning", { message: runtime.awsWarning });
+    }
     runtime.send({
       type: "start",
       input: {
         provider: chat.provider,
         prompt:
-          shortcut?.name === "plan"
+          (shortcut?.name === "plan"
             ? prompt
             : shortcut && chat.provider === "claude"
               ? latest
               : shortcut?.name === "review"
                 ? shortcut.arguments
-                : prompt,
+                : prompt) +
+          (runtime.awsWarning
+            ? "\n" +
+              runtime.awsWarning +
+              " Do not attempt AWS work or look for alternative credentials in this run."
+            : ""),
         mode: chat.mode,
         operation:
           shortcut && shortcut.name !== "plan"
@@ -457,32 +468,83 @@ export async function switchAccount(
     const chat = (
       await c.query("SELECT * FROM chats WHERE id=$1 FOR UPDATE", [chatId])
     ).rows[0];
+    if (!chat)
+      throw Object.assign(new Error("Chat not found"), { statusCode: 404 });
     const a = (
       await c.query(
-        "SELECT * FROM accounts WHERE id=$1 AND provider=$2 AND status='ready'",
-        [accountId, chat.provider],
+        "SELECT * FROM accounts WHERE id=$1 AND status='ready' FOR UPDATE",
+        [accountId],
       )
     ).rows[0];
     if (!a)
       throw Object.assign(
-        new Error("Account unavailable or belongs to another provider"),
+        new Error(
+          "Account unavailable. Connect this account before switching.",
+        ),
         { statusCode: 409 },
       );
     if (
       (
         await c.query(
-          "SELECT 1 FROM jobs WHERE chat_id=$1 AND state IN ('running','waiting_approval')",
+          "SELECT 1 FROM jobs WHERE chat_id=$1 AND state IN ('queued','running','waiting_approval')",
           [chatId],
         )
       ).rowCount
     )
       throw Object.assign(
-        new Error("Stop the active run before switching accounts"),
+        new Error("Stop or cancel the active task before switching accounts"),
         { statusCode: 409 },
       );
+    const providerChanged = chat.provider !== a.provider;
+    if (providerChanged && jobId) {
+      const pending = (
+        await c.query(
+          "SELECT m.content FROM jobs j JOIN messages m ON m.id=j.message_id WHERE j.id=$1 AND j.chat_id=$2 AND j.state='waiting_account'",
+          [jobId, chatId],
+        )
+      ).rows[0];
+      const command = pending && slashCommand(pending.content);
+      if (command && command.name !== "plan")
+        throw Object.assign(
+          new Error(
+            `Cancel the pending /${command.name} command before switching agents, then send a task to the new agent.`,
+          ),
+          { statusCode: 409 },
+        );
+    }
+    const defaults = providerChanged
+      ? (await modelDefaults(c))[a.provider as "codex" | "claude"]
+      : undefined;
+    // Older messages predate per-message authorship. Attribute them before the
+    // chat's provider changes so previous replies keep their original identity.
     await c.query(
-      "UPDATE chats SET account_id=$2,session_id=NULL,session_account=NULL,resolved_model='',resolved_effort='' WHERE id=$1",
-      [chatId, accountId],
+      "UPDATE messages SET provider=$2 WHERE chat_id=$1 AND role='assistant' AND provider IS NULL",
+      [chatId, chat.provider],
+    );
+    let summary = chat.summary;
+    if (!summary) {
+      const history = (
+        await c.query(
+          "SELECT role,content FROM (SELECT role,right(content,50000) content,created_at FROM messages WHERE chat_id=$1 ORDER BY created_at DESC LIMIT 20) recent ORDER BY created_at",
+          [chatId],
+        )
+      ).rows;
+      if (history.length)
+        summary = summaryFrom(
+          history,
+          "account switched; verify existing work before continuing",
+        );
+    }
+    await c.query(
+      "UPDATE chats SET account_id=$2,provider=$3,model=$4,effort=$5,summary=$6,session_id=NULL,session_account=NULL,resolved_model='',resolved_effort='',native_commands='[]'::jsonb WHERE id=$1",
+      [
+        chatId,
+        accountId,
+        a.provider,
+        providerChanged ? defaults?.model || "" : chat.model,
+        providerChanged ? defaults?.effort || "" : chat.effort,
+        summary,
+      ],
     );
     if (jobId)
       await c.query(

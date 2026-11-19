@@ -1,3 +1,5 @@
+import { prepareAws } from "../src/server/aws";
+import { prepareSkills } from "../src/server/skills";
 import * as sshRuntime from "../src/server/ssh-runtime";
 import { accountUsage, saveUsage } from "../src/server/usage";
 import { accountModels } from "../src/server/models";
@@ -64,11 +66,14 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
   async function openTerminal() {
     // Exercise the real close handshake: injectWS uses paired in-memory streams
     // whose server-side close may wait for the WebSocket timeout.
-    if (!app.server.listening)
-      await app.listen({ host: "127.0.0.1", port: 0 });
+    if (!app.server.listening) await app.listen({ host: "127.0.0.1", port: 0 });
     const address = app.server.address();
-    if (!address || typeof address === "string") throw new Error("No test port");
-    const socket = new WebSocket(`ws://127.0.0.1:${address.port}/api/chats/${chat}/terminal`, { headers });
+    if (!address || typeof address === "string")
+      throw new Error("No test port");
+    const socket = new WebSocket(
+      `ws://127.0.0.1:${address.port}/api/chats/${chat}/terminal`,
+      { headers },
+    );
     await once(socket, "open");
     return socket;
   }
@@ -114,6 +119,567 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
       "INSERT INTO chats(id,project_id,workspace_id,title,provider,account_id,branch) VALUES($1,$2,$1,'Test','codex',$3,'workspace/test')",
       [chat, project, account],
     );
+  });
+
+  it("previews, scopes and round-trips imported skill files", async () => {
+    const project = (
+      await db.query("SELECT project_id FROM chats WHERE id=$1", [chat])
+    ).rows[0].project_id;
+    const previewPath = "/api/skills/preview?project=" + project;
+    const importPath = "/api/skills/import?project=" + project;
+    const files = [
+      [
+        "local-skills/deploy/SKILL.md",
+        "---\nname: deploy\ndescription: Prepare a release\n---\nUse the script.",
+      ],
+      ["local-skills/deploy/scripts/підготовка.sh", "#!/bin/sh\nexit 0\n"],
+      ["local-skills/deploy/.env", "PRIVATE_VALUE=fixture"],
+    ];
+    const boundary = "workspace-test-skill";
+    const body = (parts: string[][], zipped = false) =>
+      Buffer.from(
+        parts
+          .map(
+            ([name, value]) =>
+              `--${boundary}\r\nContent-Disposition: form-data; name="${zipped ? "archive" : "path:" + encodeURIComponent(name)}"; filename="file"\r\nContent-Type: application/octet-stream\r\n\r\n${value}\r\n`,
+          )
+          .join("") + `--${boundary}--\r\n`,
+      );
+    const preview = () =>
+      app.inject({
+        method: "POST",
+        url: previewPath,
+        headers: {
+          ...headers,
+          "content-type": "multipart/form-data; boundary=" + boundary,
+        },
+        payload: body(files),
+      });
+    const first = await preview();
+    expect(first.statusCode, first.body).toBe(200);
+    expect(first.json()).toMatchObject({
+      excluded: 1,
+      skills: [{ name: "deploy", fileCount: 2, conflict: false }],
+    });
+    const save = (id: string, conflicts = {}) =>
+      app.inject({
+        method: "POST",
+        url: importPath,
+        headers,
+        payload: { id, conflicts },
+      });
+    expect((await save(first.json().id)).json()).toMatchObject({ saved: 1 });
+    const another = await preview();
+    expect(another.json().skills[0].conflict).toBe(true);
+    expect(
+      (await save(another.json().id, { deploy: "copy" }))
+        .json()
+        .skills.map((skill: any) => skill.name),
+    ).toEqual(["deploy", "deploy-2"]);
+
+    const context = await app.inject({
+      method: "GET",
+      headers,
+      url: `/api/chats/${chat}/context`,
+    });
+    expect(context.json().entries).toContainEqual(
+      expect.objectContaining({ path: "/skills/project/deploy/SKILL.md" }),
+    );
+    expect(await prepareSkills(null)).toBeNull();
+    const snapshot = await prepareSkills(project);
+    try {
+      expect(snapshot?.mount.ReadOnly).toBe(true);
+      const script = path.join(
+        snapshot!.mount.Source,
+        "project/deploy/scripts/підготовка.sh",
+      );
+      expect(await readFile(script, "utf8")).toBe(files[1][1]);
+      await expect(
+        access(path.join(snapshot!.mount.Source, "project/deploy/.env")),
+      ).rejects.toThrow();
+    } finally {
+      await snapshot?.stop();
+    }
+
+    const archive = await app.inject({
+      method: "GET",
+      headers,
+      url: `/api/skills/export?project=${project}&names=deploy`,
+    });
+    expect(archive.statusCode, archive.body).toBe(200);
+    const roundTrip = await app.inject({
+      method: "POST",
+      url: "/api/skills/preview",
+      headers: {
+        ...headers,
+        "content-type": "multipart/form-data; boundary=" + boundary,
+      },
+      payload: Buffer.concat([
+        Buffer.from(
+          `--${boundary}\r\nContent-Disposition: form-data; name="archive"; filename="skills.zip"\r\nContent-Type: application/zip\r\n\r\n`,
+        ),
+        archive.rawPayload,
+        Buffer.from(`\r\n--${boundary}--\r\n`),
+      ]),
+    });
+    expect(roundTrip.json()).toMatchObject({
+      excluded: 0,
+      skills: [{ name: "deploy", fileCount: 2, conflict: false }],
+    });
+    const skipped = await preview();
+    expect(
+      (await save(skipped.json().id, { deploy: "skip" })).json().saved,
+    ).toBe(0);
+    const stale = await preview();
+    files[0][1] =
+      "---\ndescription: >\n  Updated deployment\n  instructions.\n---\n# Deploy";
+    const replacement = await preview();
+    expect(
+      (await save(replacement.json().id, { deploy: "replace" })).json().saved,
+    ).toBe(1);
+    expect(
+      (await save(stale.json().id, { deploy: "replace" })).statusCode,
+    ).toBe(409);
+    const library = (
+      await app.inject({ url: `/api/skills?project=${project}`, headers })
+    ).json();
+    expect(library).toHaveLength(2);
+    expect(library.find((s: any) => s.name === "deploy").description).toBe(
+      "Updated deployment instructions.",
+    );
+  });
+
+  it.each(["skills", "files", "bytes"])(
+    "rolls back a skill import exceeding the library %s limit",
+    async (limit) => {
+      const project = (
+        await db.query("SELECT project_id FROM chats WHERE id=$1", [chat])
+      ).rows[0].project_id;
+      const count = limit === "skills" ? 50 : 1;
+      const storedFiles = Array.from(
+        { length: limit === "files" ? 500 : 1 },
+        (_, i) => ({ path: i ? `file-${i}` : "SKILL.md", data: "eA==" }),
+      );
+      for (let i = 0; i < count; i++)
+        await db.query(
+          "INSERT INTO imported_skills(project_id,name,revision,description,hints,bytes,files) VALUES($1,$2,$3,'','{}',$4,$5)",
+          [
+            project,
+            `seed-${i}`,
+            randomUUID(),
+            limit === "bytes" ? 20 * 1024 * 1024 : storedFiles.length,
+            JSON.stringify(storedFiles),
+          ],
+        );
+      const boundary = "skill-limit-test";
+      const preview = await app.inject({
+        method: "POST",
+        url: `/api/skills/preview?project=${project}`,
+        headers: {
+          ...headers,
+          "content-type": `multipart/form-data; boundary=${boundary}`,
+        },
+        payload: `--${boundary}\r\nContent-Disposition: form-data; name="path:new/SKILL.md"; filename="SKILL.md"\r\nContent-Type: text/plain\r\n\r\n# New\r\n--${boundary}--\r\n`,
+      });
+      expect(preview.statusCode, preview.body).toBe(200);
+      const imported = await app.inject({
+        method: "POST",
+        url: `/api/skills/import?project=${project}`,
+        headers,
+        payload: { id: preview.json().id, conflicts: {} },
+      });
+      expect(imported.statusCode, imported.body).toBe(409);
+      expect(
+        (
+          await db.query(
+            "SELECT name FROM imported_skills WHERE project_id=$1",
+            [project],
+          )
+        ).rows,
+      ).toHaveLength(count);
+      expect(
+        (
+          await db.query(
+            "SELECT 1 FROM imported_skills WHERE project_id=$1 AND name='new'",
+            [project],
+          )
+        ).rowCount,
+      ).toBe(0);
+    },
+  );
+
+  it("keeps the AWS SSO cache encrypted and gives only the connected project temporary role credentials", async () => {
+    const project = (
+      await db.query("SELECT project_id FROM chats WHERE id=$1", [chat])
+    ).rows[0].project_id;
+    const fake = await mkdtemp(path.join(data, "aws-fixture-"));
+    await writeFile(
+      path.join(fake, "aws"),
+      `#!/bin/sh
+case " $* " in
+  *" sso login "*)
+    printf 'https://device.sso.us-east-1.amazonaws.com/\\n\\nThen enter the code:\\n\\nABCD-EF12\\n'
+    while [ ! -f "${fake}/authorized" ]; do sleep 0.1; done
+    printf '{"accessToken":"test-sso-token"}' > "$HOME/.aws/sso/cache/0123456789012345678901234567890123456789.json"
+    ;;
+  *" configure export-credentials "*)
+    test -f "$HOME/.aws/sso/cache/0123456789012345678901234567890123456789.json" || exit 1
+    printf '{"AccessKeyId":"TESTACCESS","SecretAccessKey":"TESTSECRET","SessionToken":"TESTROLE","Expiration":"2099-01-01T00:00:00Z"}'
+    ;;
+  *" sts get-caller-identity "*)
+    test "$AWS_SESSION_TOKEN" = "TESTROLE" || exit 1
+    printf '{"Account":"123456789012","Arn":"arn:aws:sts::123456789012:assumed-role/ReadOnlyAccess/test"}'
+    ;;
+esac
+`,
+      { mode: 0o700 },
+    );
+    const awsPath = "/api/projects/" + project + "/aws";
+    const before = process.env.PATH;
+    process.env.PATH = fake + ":" + before;
+    try {
+      const config = await app.inject({
+        method: "PUT",
+        url: awsPath,
+        headers,
+        payload: {
+          startUrl: "https://test.awsapps.com/start",
+          ssoRegion: "us-east-1",
+          region: "us-east-1",
+          accountId: "123456789012",
+          role: "ReadOnlyAccess",
+        },
+      });
+      expect(config.statusCode, config.body).toBe(200);
+      expect(await prepareAws(project)).toBeNull();
+      expect(
+        (
+          await app.inject({
+            method: "POST",
+            url: awsPath + "/connect",
+            headers,
+          })
+        ).json().pending,
+      ).toBe(true);
+      const status = () => app.inject({ method: "GET", url: awsPath, headers });
+      await vi.waitFor(async () =>
+        expect((await status()).json().challenge?.code).toBe("ABCD-EF12"),
+      );
+      await writeFile(path.join(fake, "authorized"), "");
+      await vi.waitFor(async () =>
+        expect((await status()).json().identity).toContain("ReadOnlyAccess"),
+      );
+      const stored = (
+        await db.query(
+          "SELECT session FROM aws_connections WHERE project_id=$1",
+          [project],
+        )
+      ).rows[0].session;
+      expect(stored).not.toContain("test-sso-token");
+      expect(unseal(stored)).toContain("test-sso-token");
+      // Changing availability policy must preserve the authenticated role session.
+      const connectionSettings = (await status()).json().settings;
+      for (const required of [true, false]) {
+        const updated = await app.inject({
+          method: "PUT",
+          url: awsPath,
+          headers,
+          payload: { ...connectionSettings, required },
+        });
+        expect(updated.statusCode, updated.body).toBe(200);
+        expect(updated.json().identity).toContain("ReadOnlyAccess");
+        expect(
+          (
+            await db.query(
+              "SELECT session FROM aws_connections WHERE project_id=$1",
+              [project],
+            )
+          ).rows[0].session,
+        ).toBe(stored);
+      }
+      expect(await prepareAws(randomUUID())).toBeNull();
+      const aws = await prepareAws(project);
+      try {
+        expect(aws?.env.AWS_REGION).toBe("us-east-1");
+        expect(aws?.mount.ReadOnly).toBe(true);
+        expect(
+          await readFile(path.join(aws!.mount.Source, "credentials"), "utf8"),
+        ).toContain("aws_session_token = TESTROLE");
+        expect(JSON.stringify(aws?.env)).not.toContain("TESTROLE");
+      } finally {
+        await aws?.stop();
+      }
+      if (process.env.DOCKER_TESTS === "1") {
+        let output = "";
+        const terminal = await launch(chat, null, (event) => {
+          if (event.type === "terminal") output += event.data;
+        });
+        try {
+          terminal.send({ type: "terminal", data: "aws configure list\r" });
+          await vi.waitFor(
+            () => expect(output).toContain("shared-credentials-file"),
+            { timeout: 5_000 },
+          );
+          expect(output).toContain("us-east-1");
+          expect(output).not.toContain("TESTROLE");
+        } finally {
+          await terminal.stop();
+        }
+      }
+      expect(
+        (await app.inject({ method: "DELETE", url: awsPath, headers })).json()
+          .identity,
+      ).toBeNull();
+      expect(await prepareAws(project)).toBeNull();
+    } finally {
+      await app.inject({
+        method: "DELETE",
+        url: awsPath + "/connect",
+        headers,
+      });
+      process.env.PATH = before;
+    }
+  }, 20_000);
+
+  it("keeps local preview independent from publication review and permits Push without a message", async () => {
+    const local = vi
+      .spyOn(gitModule, "localChanges")
+      .mockResolvedValue({ diff: "local preview", untracked: ["new.txt"] });
+    const review = vi.spyOn(gitModule, "reviewPublication").mockResolvedValue({
+      diff: "frozen",
+      pushDiff: "outgoing",
+      commits: "commit",
+      pushError: "",
+      review_token: "reviewed",
+    });
+    try {
+      await acquireWorkspace(chat, "terminal");
+      const preview = await app.inject({
+        url: `/api/chats/${chat}/diff`,
+        headers,
+      });
+      expect(preview.statusCode, preview.body).toBe(200);
+      expect(preview.json()).toEqual({
+        diff: "local preview",
+        untracked: ["new.txt"],
+      });
+      expect(local).toHaveBeenCalledTimes(1);
+      expect(review).not.toHaveBeenCalled();
+      const blocked = await app.inject({
+        method: "POST",
+        url: `/api/chats/${chat}/publication-review`,
+        headers,
+        payload: { target: "commit" },
+      });
+      expect(blocked.statusCode).toBe(409);
+      await releaseWorkspace(chat);
+      for (const target of ["commit", "push"]) {
+        const prepared = await app.inject({
+          method: "POST",
+          url: `/api/chats/${chat}/publication-review`,
+          headers,
+          payload: { target },
+        });
+        expect(prepared.statusCode, prepared.body).toBe(200);
+        expect(review).toHaveBeenLastCalledWith(
+          expect.objectContaining({ id: chat }),
+          expect.anything(),
+          target === "push",
+        );
+      }
+      vi.spyOn(gitModule, "validatePublication").mockResolvedValue({
+        workspace: chat,
+        head: "head",
+        tree: "tree",
+        repo: "test/repo",
+        branch: "workspace/test",
+        baseBranch: "main",
+        remote: "remote",
+      });
+      const push = vi
+        .spyOn(gitModule, "pushBranch")
+        .mockResolvedValue("pushed");
+      const post = (action: string, message?: string) =>
+        app.inject({
+          method: "POST",
+          url: `/api/chats/${chat}/git`,
+          headers,
+          payload: {
+            action,
+            message,
+            review_token: "reviewed",
+            client_id: randomUUID(),
+          },
+        });
+      expect((await post("push")).statusCode).toBe(200);
+      expect(push).toHaveBeenCalledTimes(1);
+      expect((await post("commit", " ")).statusCode).toBe(400);
+      expect((await post("pr", " ")).statusCode).toBe(400);
+    } finally {
+      await releaseWorkspace(chat);
+      vi.restoreAllMocks();
+    }
+  });
+
+  it.skipIf(process.env.DOCKER_TESTS !== "1")(
+    "previews a busy repository read-only and requires a fresh frozen review for commit",
+    async () => {
+      const folder = workspacePath(chat);
+      await mkdir(folder, { recursive: true });
+      // Match agent writes inside Docker; host-side writes can leave stale stat
+      // metadata in Docker Desktop's file sharing cache during rapid tests.
+      const write = async (name: string, text: string) => {
+        const writer = await docker.createContainer({
+          Image: config.image,
+          User: "1000:1000",
+          Cmd: [
+            "node",
+            "-e",
+            "require('node:fs').writeFileSync('/workspace/' + process.argv[1], process.argv[2])",
+            name,
+            text,
+          ],
+          HostConfig: {
+            NetworkMode: "none",
+            ReadonlyRootfs: true,
+            Mounts: [{ Type: "bind", Source: folder, Target: "/workspace" }],
+          },
+        });
+        try {
+          await writer.start();
+          expect((await writer.wait()).StatusCode).toBe(0);
+        } finally {
+          await writer.remove({ force: true });
+        }
+      };
+      const git = (args: string[]) => gitModule.git(folder, args);
+      await git(["init"]);
+      await write("tracked.txt", "base\n");
+      await git(["add", "."]);
+      await git(["commit", "-m", "base"]);
+      expect(await git(["show", "HEAD:tracked.txt"])).toBe("base\n");
+      await write("tracked.txt", "local edit\n");
+      await write("new.txt", "new file\n");
+      expect(await git(["diff", "HEAD"])).toContain("+local edit");
+      const index = await readFile(path.join(folder, ".git/index"));
+      await acquireWorkspace(chat, "terminal");
+      try {
+        const response = await app.inject({
+          url: `/api/chats/${chat}/diff`,
+          headers,
+        });
+        expect(response.statusCode, response.body).toBe(200);
+        expect(response.json().diff).toContain("+local edit");
+        expect(response.json().untracked).toContain("new.txt");
+        expect(response.json().review_token).toBeUndefined();
+        expect(await readFile(path.join(folder, ".git/index"))).toEqual(index);
+      } finally {
+        await releaseWorkspace(chat);
+      }
+      const containers = vi.spyOn(docker, "createContainer");
+      try {
+        const prepare = () =>
+          app.inject({
+            method: "POST",
+            url: `/api/chats/${chat}/publication-review`,
+            headers,
+            payload: { target: "commit" },
+          });
+        const prepared = await prepare();
+        expect(prepared.statusCode, prepared.body).toBe(200);
+        expect(prepared.json().diff).toContain("+new file");
+        expect(
+          containers.mock.calls.some(
+            ([options]) => options?.HostConfig?.NetworkMode === "bridge",
+          ),
+        ).toBe(false);
+        const commit = (token: string) =>
+          app.inject({
+            method: "POST",
+            url: `/api/chats/${chat}/git`,
+            headers,
+            payload: {
+              action: "commit",
+              message: "Reviewed changes",
+              review_token: token,
+              client_id: randomUUID(),
+            },
+          });
+        await write("new.txt", "changed after review\n");
+        expect((await commit(prepared.json().review_token)).statusCode).toBe(
+          409,
+        );
+        const refreshed = await prepare();
+        expect(refreshed.statusCode, refreshed.body).toBe(200);
+        const committed = await commit(refreshed.json().review_token);
+        expect(committed.statusCode, committed.body).toBe(200);
+        expect(await git(["show", "HEAD:new.txt"])).toBe(
+          "changed after review\n",
+        );
+      } finally {
+        containers.mockRestore();
+      }
+    },
+    120_000,
+  );
+
+  it("persists the missing-AWS warning and tells the agent while allowing local work", async () => {
+    const mid = randomUUID(),
+      id = randomUUID();
+    await db.query(
+      "INSERT INTO messages(id,chat_id,role,content) VALUES($1,$2,'user','Review the local files')",
+      [mid, chat],
+    );
+    const job = (
+      await db.query(
+        "INSERT INTO jobs(id,chat_id,message_id,account_id,state) VALUES($1,$2,$3,$4,'running') RETURNING *",
+        [id, chat, mid, account],
+      )
+    ).rows[0];
+    const warning = "This run started without AWS access.";
+    const send = vi.fn();
+    let emit!: (event: any) => void | Promise<void>;
+    vi.spyOn(gitModule, "initializeWorkspace").mockResolvedValue();
+    vi.spyOn(runtimeModule, "launch").mockImplementation(
+      async (_chat, _account, handler) => {
+        emit = handler;
+        return {
+          id: "warning-test",
+          aws: false,
+          awsWarning: warning,
+          send,
+          stop: async () => {},
+        };
+      },
+    );
+    try {
+      await runJob(job);
+      expect(send).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: "start",
+          input: expect.objectContaining({
+            prompt: expect.stringContaining(warning),
+          }),
+        }),
+      );
+      expect(send.mock.calls[0][0].input.prompt).not.toContain(
+        "This project has a temporary AWS role",
+      );
+      const detail = await app.inject({ url: `/api/chats/${chat}`, headers });
+      expect(detail.json().events).toContainEqual(
+        expect.objectContaining({
+          type: "warning",
+          data: { message: warning },
+        }),
+      );
+      await emit({ type: "completed", result: "Local review completed" });
+      expect(
+        (await db.query("SELECT state FROM jobs WHERE id=$1", [id])).rows[0]
+          .state,
+      ).toBe("completed");
+    } finally {
+      vi.restoreAllMocks();
+    }
   });
 
   it("stores SSH secrets encrypted, controls inheritance and blocks access changes while busy", async () => {
@@ -2593,7 +3159,7 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
     await db.query("UPDATE jobs SET state='waiting_account'");
     const account2 = randomUUID();
     await db.query(
-      "INSERT INTO accounts(id,name,provider,status) VALUES($1,'B','codex','ready')",
+      "INSERT INTO accounts(id,name,provider,status) VALUES($1,'B','claude','ready')",
       [account2],
     );
     const r = await app.inject({
@@ -2628,11 +3194,109 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
     expect(r.statusCode).toBe(413);
     expect((await db.query("SELECT * FROM attachments")).rowCount).toBe(0);
   });
-  it("blocks provider changes and switching while running", async () => {
+  it.each([
+    ["codex", "claude"],
+    ["claude", "codex"],
+  ])(
+    "switches %s to %s with a fresh session and preserved context",
+    async (from, to) => {
+      const other = randomUUID();
+      await db.query("UPDATE accounts SET provider=$2 WHERE id=$1", [
+        account,
+        from,
+      ]);
+      await db.query(
+        "INSERT INTO accounts(id,name,provider,status) VALUES($1,'Other',$2,'ready')",
+        [other, to],
+      );
+      await db.query("INSERT INTO settings(key,value) VALUES($1,$2)", [
+        "model_default_" + to,
+        JSON.stringify({ model: "target-model", effort: "high" }),
+      ]);
+      await db.query(
+        "UPDATE chats SET provider=$2,model='old-model',effort='low',resolved_model='old-resolved',resolved_effort='low',native_commands='[\"context\"]',session_id='old-session',session_account=$3,mode='plan',summary='Checkpoint: navigation was updated' WHERE id=$1",
+        [chat, from, account],
+      );
+      const reply = randomUUID();
+      await db.query(
+        "INSERT INTO messages(id,chat_id,role,content) VALUES($1,$2,'assistant','Previous answer')",
+        [reply, chat],
+      );
+      const before = (await db.query("SELECT * FROM chats WHERE id=$1", [chat]))
+        .rows[0];
+      const response = await app.inject({
+        method: "POST",
+        url: `/api/chats/${chat}/switch`,
+        headers,
+        payload: { account_id: other },
+      });
+      expect(response.statusCode).toBe(200);
+      const after = (await db.query("SELECT * FROM chats WHERE id=$1", [chat]))
+        .rows[0];
+      expect(after).toMatchObject({
+        provider: to,
+        account_id: other,
+        session_id: null,
+        session_account: null,
+        model: "target-model",
+        effort: "high",
+        resolved_model: "",
+        resolved_effort: "",
+        native_commands: [],
+        mode: "plan",
+        autonomous: false,
+        summary: before.summary,
+        workspace_id: before.workspace_id,
+        branch: before.branch,
+      });
+      expect(
+        (await app.inject({ url: `/api/chats/${chat}`, headers })).json()
+          .messages,
+      ).toContainEqual(
+        expect.objectContaining({
+          id: reply,
+          provider: from,
+          content: "Previous answer",
+        }),
+      );
+      // Returning to the previous provider must not relabel old messages or reuse a native session.
+      expect(
+        (
+          await app.inject({
+            method: "POST",
+            url: `/api/chats/${chat}/switch`,
+            headers,
+            payload: { account_id: account },
+          })
+        ).statusCode,
+      ).toBe(200);
+      expect(
+        (
+          await db.query(
+            "SELECT provider,model,effort,session_id FROM chats WHERE id=$1",
+            [chat],
+          )
+        ).rows[0],
+      ).toEqual({ provider: from, model: "", effort: "", session_id: null });
+      expect(
+        (await db.query("SELECT provider FROM messages WHERE id=$1", [reply]))
+          .rows[0].provider,
+      ).toBe(from);
+    },
+  );
+  it("keeps model settings when switching accounts of the same provider and builds missing context", async () => {
     const other = randomUUID();
     await db.query(
-      "INSERT INTO accounts(id,name,provider,status) VALUES($1,'Other','claude','ready')",
+      "INSERT INTO accounts(id,name,provider,status) VALUES($1,'Other','codex','ready')",
       [other],
+    );
+    await db.query(
+      "UPDATE chats SET model='chosen-model',effort='high' WHERE id=$1",
+      [chat],
+    );
+    await db.query(
+      "INSERT INTO messages(id,chat_id,role,content) VALUES($1,$2,'assistant','Saved progress')",
+      [randomUUID(), chat],
     );
     expect(
       (
@@ -2643,7 +3307,164 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
           payload: { account_id: other },
         })
       ).statusCode,
-    ).toBeGreaterThanOrEqual(400);
+    ).toBe(200);
+    expect(
+      (
+        await db.query("SELECT model,effort,summary FROM chats WHERE id=$1", [
+          chat,
+        ])
+      ).rows[0],
+    ).toMatchObject({
+      model: "chosen-model",
+      effort: "high",
+      summary: expect.stringContaining("Saved progress"),
+    });
+  });
+  it.each(["queued", "running", "waiting_approval"])(
+    "blocks switching while a task is %s",
+    async (state) => {
+      const other = randomUUID();
+      await db.query(
+        "INSERT INTO accounts(id,name,provider,status) VALUES($1,'Other','claude','ready')",
+        [other],
+      );
+      await app.inject({
+        method: "POST",
+        url: `/api/chats/${chat}/messages`,
+        headers,
+        payload: { content: "Work", client_id: randomUUID() },
+      });
+      await db.query("UPDATE jobs SET state=$1", [state]);
+      expect(
+        (
+          await app.inject({
+            method: "POST",
+            url: `/api/chats/${chat}/switch`,
+            headers,
+            payload: { account_id: other },
+          })
+        ).statusCode,
+      ).toBe(409);
+      expect(
+        (
+          await db.query("SELECT account_id,provider FROM chats WHERE id=$1", [
+            chat,
+          ])
+        ).rows[0],
+      ).toEqual({ account_id: account, provider: "codex" });
+    },
+  );
+  it("does not forward a pending provider-specific command to another agent", async () => {
+    const other = randomUUID();
+    await db.query(
+      "INSERT INTO accounts(id,name,provider,status) VALUES($1,'Other','claude','ready')",
+      [other],
+    );
+    await app.inject({
+      method: "POST",
+      url: `/api/chats/${chat}/messages`,
+      headers,
+      payload: { content: "/review", client_id: randomUUID() },
+    });
+    await db.query("UPDATE jobs SET state='waiting_account'");
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/chats/${chat}/switch`,
+      headers,
+      payload: { account_id: other },
+    });
+    expect(response.statusCode).toBe(409);
+    expect(response.json().error).toContain("Cancel the pending /review");
+    expect(
+      (await db.query("SELECT provider FROM chats WHERE id=$1", [chat])).rows[0]
+        .provider,
+    ).toBe("codex");
+  });
+  it.each(["disconnected", "limited"])(
+    "rejects a %s target account",
+    async (status) => {
+      const other = randomUUID();
+      await db.query(
+        "INSERT INTO accounts(id,name,provider,status) VALUES($1,'Other','claude',$2)",
+        [other, status],
+      );
+      expect(
+        (
+          await app.inject({
+            method: "POST",
+            url: `/api/chats/${chat}/switch`,
+            headers,
+            payload: { account_id: other },
+          })
+        ).statusCode,
+      ).toBe(409);
+    },
+  );
+  it("resumes a waiting task on the new provider with context and records the correct author", async () => {
+    const other = randomUUID();
+    await db.query(
+      "INSERT INTO accounts(id,name,provider,status) VALUES($1,'Other','claude','ready')",
+      [other],
+    );
+    await db.query(
+      "UPDATE chats SET summary='Previous work: updated navigation',session_id='old-session',session_account=$2 WHERE id=$1",
+      [chat, account],
+    );
+    await app.inject({
+      method: "POST",
+      url: `/api/chats/${chat}/messages`,
+      headers,
+      payload: { content: "Continue the change", client_id: randomUUID() },
+    });
+    await db.query("UPDATE jobs SET state='waiting_account',account_id=$1", [
+      account,
+    ]);
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: `/api/chats/${chat}/switch`,
+          headers,
+          payload: { account_id: other },
+        })
+      ).statusCode,
+    ).toBe(200);
+    const job = await claim();
+    expect(job).toMatchObject({ account_id: other, provider: "claude" });
+    const send = vi.fn();
+    let emit!: (event: any) => void | Promise<void>;
+    vi.spyOn(gitModule, "initializeWorkspace").mockResolvedValue();
+    const launch = vi
+      .spyOn(runtimeModule, "launch")
+      .mockImplementation(async (_chat, _account, handler) => {
+        emit = handler;
+        return { id: "switched-runtime", send, stop: async () => {} };
+      });
+    try {
+      await runJob(job);
+      expect(launch).toHaveBeenCalledWith(chat, other, expect.any(Function));
+      expect(send.mock.calls[0][0].input).toMatchObject({
+        provider: "claude",
+        sessionId: undefined,
+        prompt: expect.stringContaining("Previous work: updated navigation"),
+      });
+      expect(send.mock.calls[0][0].input.prompt).toContain(
+        "Continue the change",
+      );
+      await emit({ type: "delta", text: "Continued with Claude" });
+      await emit({ type: "completed" });
+      expect(
+        (
+          await db.query(
+            "SELECT provider,content FROM messages WHERE role='assistant' AND chat_id=$1",
+            [chat],
+          )
+        ).rows,
+      ).toEqual([{ provider: "claude", content: "Continued with Claude" }]);
+    } finally {
+      vi.restoreAllMocks();
+      active.delete(job.id);
+    }
   });
   it("respects the default capacity and never shares one account concurrently", async () => {
     const project = (

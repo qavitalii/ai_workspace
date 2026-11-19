@@ -1,5 +1,6 @@
 import { workspaceLabel } from "./WorkspaceFiles";
 import { AccountUsage } from "./AccountUsage";
+import { ProviderIcon } from "./ProviderIcon";
 import { modelLabel } from "../usage";
 import { useEffect, useState, useRef, useId, type ReactNode } from "react";
 import {
@@ -7,7 +8,6 @@ import {
   ChevronRight,
   FolderGit2,
   Home,
-  MessageSquare,
   MoreHorizontal,
   Plus,
   Pencil,
@@ -175,7 +175,7 @@ function SidebarChat({ chat, activeId, onSelect, onManage }: any) {
               (chat.state ? " · " + chatStatus[chat.state] : "")
             }
           >
-            <MessageSquare size={16} />
+            <ProviderIcon provider={chat.provider} size={16} />
             <span className="chat-caption">
               <span>{chat.title}</span>
               <small
@@ -273,6 +273,7 @@ export function SidebarNavigation({
   onProjectSettings,
 }: any) {
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+  const [limitsOpen, setLimitsOpen] = useState(false);
   useEffect(() => {
     if (projectId) setExpanded((old) => ({ ...old, [projectId]: true }));
   }, [projectId, chatId]);
@@ -488,7 +489,12 @@ export function SidebarNavigation({
         )}
       </nav>
       {!!accounts?.length && (
-        <details className="sidebar-usage">
+        <details
+          className="sidebar-usage"
+          onToggle={(e) =>
+            setLimitsOpen((e.currentTarget as HTMLDetailsElement).open)
+          }
+        >
           <summary>
             Account limits <span>{accounts.length} accounts</span>
           </summary>
@@ -499,6 +505,7 @@ export function SidebarNavigation({
               refresh={onRefreshAccounts}
               compact
               sidebar
+              autoRefresh={limitsOpen}
             />
           ))}
         </details>

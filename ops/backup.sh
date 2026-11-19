@@ -15,7 +15,7 @@ trap cleanup EXIT
 ./ops/compose.sh exec -T db pg_dump -U workspace -d workspace -Fc > "$work/database.dump"
 cp .env "$work/env"
 cp .install-mode "$work/install-mode"
-tar -C "$DATA_ROOT" -czf "$work/data.tar.gz" .
+tar -C "$DATA_ROOT" --exclude=./aws-run-credentials --exclude=./skill-snapshots -czf "$work/data.tar.gz" .
 archive="backups/workspace-$(date -u +%Y%m%dT%H%M%SZ).tar.gz.enc"
 tar -C "$work" -czf - . | openssl enc -aes-256-cbc -salt -pbkdf2 -iter 200000 -pass file:.backup-key -out "$archive"
 find backups -name 'workspace-*.tar.gz.enc' -mtime +7 -delete

@@ -21,6 +21,7 @@ export type Change = {
   main: string | null;
   copy: string | null;
   result?: string | null;
+  children?: Change[];
 };
 const hash = (s: string | Buffer) =>
   createHash("sha256").update(s).digest("hex");
@@ -140,6 +141,29 @@ export async function mergeTrees(
   let serial = 0;
   await fs.mkdir(scratch, { recursive: true });
   const same = (a?: Node, b?: Node) => a?.hash === b?.hash;
+  async function descendants(m?: Node, c?: Node, rel = ""): Promise<Change[]> {
+    const entries: Change[] = [];
+    const names = new Set([
+      ...Object.keys(m?.children || {}),
+      ...Object.keys(c?.children || {}),
+    ]);
+    for (const name of [...names].sort()) {
+      const before = m?.children?.[name],
+        after = c?.children?.[name];
+      if (same(before, after)) continue;
+      const childPath = path.join(rel, name);
+      entries.push({
+        path: childPath,
+        status: !before ? "added" : !after ? "deleted" : "modified",
+        conflict: false,
+        main: await preview(before),
+        copy: await preview(after),
+        result: await preview(after),
+      });
+      entries.push(...(await descendants(before, after, childPath)));
+    }
+    return entries;
+  }
   async function merge(
     b: Node | undefined,
     c: Node | undefined,
@@ -225,6 +249,7 @@ export async function mergeTrees(
       main: await preview(m),
       copy: await preview(c),
       result: conflict ? undefined : await preview(result),
+      children: await descendants(m, c, rel),
     });
     return result;
   }

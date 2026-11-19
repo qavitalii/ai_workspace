@@ -11,6 +11,7 @@ const labels: Record<string, string> = {
   seven_day: "7 days",
   seven_day_opus: "7 days · Opus",
   seven_day_sonnet: "7 days · Sonnet",
+  seven_day_cowork: "7 days · Cowork",
   overage: "Extra usage",
 };
 function duration(minutes: unknown, fallback: string) {
@@ -73,6 +74,28 @@ export function usageWindows(limits: any): UsageWindow[] {
       labels[limits.rateLimitType || limits.rate_limit_type] || "Usage limit",
     );
   return result;
+}
+
+// Claude subscription usage (the data behind the CLI's /usage view) reports
+// utilization as a percentage and reset times as ISO strings. Normalize it to
+// the same `windows` shape that Claude's in-task rate limit events produce.
+// Extra usage is a credit balance, not a subscription window, so it is skipped.
+export function claudeSubscriptionUsage(data: any) {
+  const windows: Record<string, any> = {};
+  if (data && typeof data === "object")
+    for (const [key, w] of Object.entries<any>(data)) {
+      if (!/^(five_hour|seven_day)/.test(key) || key.endsWith("oauth_apps"))
+        continue;
+      if (!w || typeof w !== "object" || !number(w.utilization)) continue;
+      const reset =
+        typeof w.resets_at === "string" ? Date.parse(w.resets_at) : NaN;
+      windows[key] = {
+        utilization: w.utilization / 100,
+        resets_at: Number.isFinite(reset) ? Math.floor(reset / 1000) : null,
+        ...(w.utilization >= 100 ? { status: "rejected" } : {}),
+      };
+    }
+  return { windows };
 }
 
 export function modelLabel(chat: any) {

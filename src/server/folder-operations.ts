@@ -257,6 +257,7 @@ export async function applyCopy(
     if (op.status === "applied") return { ok: true, checkpoint: reviewId };
     if (
       op.status !== "reviewed" ||
+      op.result?.reviewVersion !== 2 ||
       op.base_snapshot_id !== (await workspaceBy(id)).base_snapshot_id
     )
       fail("This review is out of date. Refresh the review.");

@@ -136,6 +136,54 @@ describe("Git link validation", () => {
   }, 3000);
 });
 
+describe("API route authentication", () => {
+  it("applies the same session and origin checks to equivalent route spellings", async () => {
+    const app = await createApp();
+    try {
+      for (const prefix of ["/api", "/%61pi"]) {
+        const read = await app.inject(prefix + "/me");
+        expect(read.statusCode).toBe(401);
+        const write = { method: "POST" as const, url: prefix + "/logout" };
+        expect((await app.inject(write)).statusCode).toBe(403);
+        expect(
+          (await app.inject({ ...write, headers: { origin: config.origin } }))
+            .statusCode,
+        ).toBe(401);
+      }
+      // Query strings must not change the public login route's policy.
+      const login = await app.inject({
+        method: "POST",
+        url: "/api/login?from=web",
+        headers: { origin: config.origin },
+        payload: {},
+      });
+      expect(login.statusCode).toBe(400);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it("rejects unauthenticated terminal and event upgrades before accepting the socket", async () => {
+    const app = await createApp();
+    try {
+      await app.ready();
+      for (const path of [
+        "/api/chats/00000000-0000-4000-8000-000000000000/terminal",
+        "/api/events",
+      ]) {
+        await expect(
+          app.injectWS(path, { headers: { origin: config.origin } }),
+        ).rejects.toThrow("Unexpected server response: 401");
+        await expect(app.injectWS(path)).rejects.toThrow(
+          "Unexpected server response: 403",
+        );
+      }
+    } finally {
+      await app.close();
+    }
+  });
+});
+
 describe("login proxy boundary", () => {
   it("trusts only exact configured addresses at the immediate hop", () => {
     const trust = proxyTrust("172.30.250.2");
