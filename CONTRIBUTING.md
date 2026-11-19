@@ -86,4 +86,6 @@ Read the [architecture and API overview](docs/architecture.md) and the [provider
 
 Explain the problem, resulting behavior, and checks performed. Add meaningful regression coverage for behavior changes, update affected documentation, and include screenshots for visible UI changes. State which integration checks were skipped. Preserve the isolation, approval, and credential boundaries described in the architecture.
 
+Never list Codex or any other AI agent as a Git co-author, including in `Co-authored-by` commit trailers.
+
 Never include `.env`, credentials, real conversations, account profiles, backups, or private repository content. Report security issues privately; see [SECURITY.md](SECURITY.md).

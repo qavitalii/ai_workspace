@@ -61,13 +61,18 @@ input:not([type="checkbox"]):not([type="radio"]):not([type="hidden"]),
 select,
 textarea,
 .select-trigger {
-  font-size: 14px;
   line-height: 1.4;
   padding: 8px 10px;
   border-radius: var(--control-radius);
   border-color: #e1e1e1;
 }
+input:not([type="checkbox"]):not([type="radio"]):not([type="hidden"]),
+select,
+textarea {
+  font-size: var(--touch-input-font-size, 14px);
+}
 .select-trigger {
+  font-size: 14px;
   min-height: var(--control-height);
 }
 .select-option {
@@ -763,6 +768,16 @@ summary:focus-visible {
     font-size: 24px;
   }
 }
+@media (pointer: coarse), (max-width: 760px) {
+  :root {
+    /* iOS Safari zooms when editable controls use text smaller than 16px. */
+    --touch-input-font-size: 16px;
+  }
+  dialog.modal {
+    inset-block: var(--app-viewport-top, 0px)
+      calc(100% - var(--app-height, 100dvh) - var(--app-viewport-top, 0px));
+  }
+}
 @media (max-width: 760px) {
   :root {
     --control-height: 44px;
@@ -783,11 +798,6 @@ summary:focus-visible {
   .modal > header {
     padding: 10px 0;
     margin-bottom: 16px;
-  }
-  .modal input:not([type="checkbox"]):not([type="radio"]),
-  .modal textarea,
-  .modal select {
-    font-size: 16px;
   }
   .select-trigger {
     min-height: 44px;
@@ -844,17 +854,23 @@ summary:focus-visible {
   .settings-tabs {
     position: static;
     flex-direction: row;
-    overflow-x: auto;
+    flex-wrap: wrap;
     padding: 3px;
     gap: 3px;
     margin: 0 0 18px;
-    background: #f5f5f5;
+    background: var(--canvas);
   }
   .settings-tabs button {
-    flex: 0 0 auto;
-    min-height: 40px;
-    padding: 7px 10px;
+    flex: 1 0 auto;
+    justify-content: center;
+    text-align: center;
+    min-height: var(--control-height);
+    padding: 7px 8px;
     font-size: 12px;
+  }
+  .settings-tabs .selected {
+    background: #e3e8f0;
+    color: #283d5c;
   }
   .settings-layout > [role="tabpanel"] {
     min-height: 0;
@@ -1730,9 +1746,6 @@ input[type="file"]::file-selector-button {
 }
 
 /* Every workspace tab shares headings, cards and action placement. */
-.settings-mobile-navigation {
-  display: none;
-}
 .workspace-settings-heading {
   margin: 0 0 18px;
 }
@@ -1971,24 +1984,6 @@ input[type="file"]::file-selector-button {
   grid-column: 1 / -1;
 }
 @media (max-width: 760px) {
-  .settings-layout > .settings-tabs {
-    display: none;
-  }
-  .settings-mobile-navigation {
-    display: block;
-    position: sticky;
-    top: calc(var(--control-height) + 21px);
-    z-index: 1;
-    background: var(--surface);
-    padding: 4px 0;
-    margin-bottom: 14px;
-  }
-  .settings-mobile-navigation .select-trigger {
-    font-weight: 500;
-  }
-  .settings-layout > [role="tabpanel"] {
-    min-height: 0;
-  }
   .settings-layout .resource-settings {
     display: grid;
     grid-template-columns: minmax(0, 1fr);
@@ -2315,7 +2310,6 @@ input[type="file"]::file-selector-button {
 }
 .changes-publish > input {
   width: 100%;
-  font-size: 12px;
 }
 .changes-actions {
   display: flex;
@@ -2465,7 +2459,6 @@ input[type="file"]::file-selector-button {
   border: 0;
   box-shadow: none;
   background: transparent;
-  font-size: 12px;
   padding-inline: 8px;
 }
 .files-filter input:focus {
@@ -2812,12 +2805,6 @@ input[type="file"]::file-selector-button {
   margin-bottom: 0;
 }
 
-@media (max-width: 760px) {
-  .files-filter input {
-    font-size: 16px;
-  }
-}
-
 /* Conversation and composer use the same scale as the work panels. */
 .conversation {
   background: #f9f9f9;
@@ -3133,7 +3120,7 @@ input[type="file"]::file-selector-button {
   min-height: 52px;
   max-height: 180px;
   padding: 6px 4px;
-  font-size: 14px;
+  font-size: var(--touch-input-font-size, 14px);
   line-height: 1.5;
   resize: none;
 }
@@ -3305,7 +3292,6 @@ input[type="file"]::file-selector-button {
     padding: 6px 7px;
   }
   .composer textarea {
-    font-size: 16px;
     min-height: 56px;
     padding-inline: 6px;
   }
@@ -3421,7 +3407,7 @@ input[type="file"]::file-selector-button {
   flex: 1;
   padding: 6px 0;
   min-height: 34px;
-  font-size: 12px;
+  font-size: var(--touch-input-font-size, 12px);
   color: #444444;
 }
 .sidebar .search input::placeholder {
@@ -3747,7 +3733,7 @@ input[type="file"]::file-selector-button {
   color: #4b4b4b;
   background: #fff;
   border-color: #b6b6b6;
-  font-size: 12px;
+  font-size: var(--touch-input-font-size, 12px);
 }
 .sidebar .chat-inline-rename .icon {
   color: #7d7d7d;
@@ -3797,7 +3783,6 @@ input[type="file"]::file-selector-button {
     min-height: 44px;
   }
   .sidebar .search input {
-    font-size: 16px;
     min-height: 42px;
   }
   .sidebar .search .icon {
@@ -3843,9 +3828,6 @@ input[type="file"]::file-selector-button {
   }
   .sidebar-action-menu > button {
     min-height: 44px;
-  }
-  .sidebar .chat-inline-rename input {
-    font-size: 16px;
   }
   .sidebar .chat-inline-rename .icon {
     min-height: 44px;
@@ -4003,7 +3985,7 @@ input[type="file"]::file-selector-button {
 .agent-custom-answer input {
   width: 100%;
   min-width: 0;
-  font-size: 13px;
+  font-size: var(--touch-input-font-size, 13px);
   line-height: 1.6;
 }
 .agent-custom-answer textarea {
@@ -4097,10 +4079,6 @@ input[type="file"]::file-selector-button {
   }
   .agent-option small {
     font-size: 12px;
-  }
-  .agent-custom-answer textarea,
-  .agent-custom-answer input {
-    font-size: 16px;
   }
   .agent-request-footer {
     padding: 12px;

@@ -1,3 +1,7 @@
+# Git commit attribution
+
+Never list Codex or any other AI agent as a Git co-author, including in `Co-authored-by` commit trailers.
+
 # Review before pushing
 
 For changes to Workspace, use an implementer and an independent code reviewer. When the change affects the interface, also assign an independent UI reviewer.

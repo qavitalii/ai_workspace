@@ -362,18 +362,21 @@ export function App() {
   }, []);
   useEffect(() => {
     const viewport = window.visualViewport;
-    function resize() {
-      if (viewport && viewport.scale === 1)
-        document.documentElement.style.setProperty(
-          "--app-height",
-          `${viewport.height}px`,
-        );
-    }
-    resize();
-    viewport?.addEventListener("resize", resize);
+    if (!viewport) return;
+    const style = document.documentElement.style;
+    const updateViewport = () => {
+      if (viewport.scale !== 1) return;
+      style.setProperty("--app-height", `${viewport.height}px`);
+      style.setProperty("--app-viewport-top", `${viewport.offsetTop}px`);
+    };
+    updateViewport();
+    viewport.addEventListener("resize", updateViewport);
+    viewport.addEventListener("scroll", updateViewport);
     return () => {
-      viewport?.removeEventListener("resize", resize);
-      document.documentElement.style.removeProperty("--app-height");
+      viewport.removeEventListener("resize", updateViewport);
+      viewport.removeEventListener("scroll", updateViewport);
+      style.removeProperty("--app-height");
+      style.removeProperty("--app-viewport-top");
     };
   }, []);
   useEffect(() => {
@@ -3111,19 +3114,6 @@ function SettingsForm({
   }
   return (
     <div className="settings-layout" ref={settingsLayoutRef}>
-      <div className="settings-mobile-navigation">
-        <Select
-          aria-label="Settings section"
-          value={section}
-          onChange={(e) => selectSection(e.target.value)}
-        >
-          {sections.map((item) => (
-            <option value={item.id} key={item.id}>
-              {item.label}
-            </option>
-          ))}
-        </Select>
-      </div>
       <div
         className="segmented settings-tabs"
         role="tablist"
