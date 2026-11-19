@@ -32,7 +32,7 @@ All eight Markdown guides were checked against current source behavior. All 32 l
 
 ## Earlier publication preparation
 
-The earlier review ran 17 default tests (40 skipped) and 55 database-enabled tests (2 skipped); these are historical counts, superseded by the full implementation run above. Shell syntax checks passed. Overview screenshots were inspected at desktop (1600 × 1080, including a presentation frame) and mobile (390 × 844) sizes; these older images predate working-folder controls. See [screenshot provenance](screenshots/README.md) for the newer workflow captures.
+The earlier review ran 17 default tests (40 skipped) and 55 database-enabled tests (2 skipped); these are historical counts, superseded by the full implementation run above. Shell syntax checks passed. The current desktop and mobile captures are listed in the [screenshot gallery](screenshots/README.md).
 
 At that earlier review, all 149 blobs reachable through local Git refs were scanned for common GitHub/OpenAI/AWS token patterns, private-key headers, and exact matches to then-current sensitive `.env` values. No matches were found. That scan was **not repeated for the latest working tree** and does not cover unknown token formats, remote-only refs, GitHub discussions/issues, or deleted remote content. `.env`, `.data/`, `.wikillm/`, backup keys and backups remain excluded from Git. Recheck the final publication revision rather than treating historical results as a current security audit.
 

@@ -10,7 +10,7 @@ import { WebSocketServer } from "ws";
 const accounts = [
   {
     id: "demo-codex",
-    name: "Codex",
+    name: "Studio Codex",
     provider: "codex",
     status: "ready",
     limits: {
@@ -20,7 +20,7 @@ const accounts = [
   },
   {
     id: "demo-claude",
-    name: "Claude",
+    name: "Studio Claude",
     provider: "claude",
     status: "ready",
     limits: {
@@ -176,11 +176,77 @@ const messages = [
   {
     id: "m2",
     role: "assistant",
+    provider: "codex",
     content:
       "The setup guide is ready to review.\n\n### Changes\n- Added a three-step checklist.\n- Separated setup from troubleshooting.\n- Fixed the deployment links.\n\nBuild and link checks passed. Open **Changes** to review the diff.",
     created_at: "2026-11-16T09:42:00Z",
   },
 ];
+const activity = [
+  { type: "tool", data: { item: { type: "file_change", path: "README.md" } } },
+  {
+    type: "tool",
+    data: { item: { type: "command_execution", command: "npm test" } },
+  },
+  {
+    type: "log",
+    data: {
+      text: "✓ Setup links resolve\n✓ Deployment links resolve\n\n2 checks passed",
+    },
+  },
+].map((event, index) => ({
+  ...event,
+  id: index + 1,
+  created_at: `2026-11-16T09:41:0${index}Z`,
+}));
+const localDiff = [
+  "diff --git a/README.md b/README.md",
+  "--- a/README.md",
+  "+++ b/README.md",
+  "@@ -1,5 +1,9 @@",
+  "-# Setup",
+  "+# Getting started",
+  " ",
+  "-Run the installation script.",
+  "+Set up your workspace in three steps:",
+  "+",
+  "+1. Connect your agent account.",
+  "+2. Choose a working folder.",
+  "+3. Start your first chat.",
+  " ",
+  " See the deployment guide for more options.",
+  "diff --git a/src/navigation.ts b/src/navigation.ts",
+  "--- a/src/navigation.ts",
+  "+++ b/src/navigation.ts",
+  "@@ -4,4 +4,4 @@",
+  " export const navigation = {",
+  '-  label: "Setup",',
+  '+  label: "Getting started",',
+  '   href: "/docs/start",',
+  " };",
+  "",
+].join("\n");
+const workingCopyReview = {
+  id: "demo-copy-review",
+  changes: [
+    {
+      path: "docs/navigation.md",
+      status: "modified",
+      conflict: true,
+      main: "# Navigation\n\nKeep the primary links visible on desktop.",
+      copy: "# Navigation\n\nCollapse primary links into a menu on phones.",
+    },
+  ],
+  excluded: [],
+};
+const sampleSkill = {
+  name: "project-review",
+  description:
+    "Review project changes and summarize the checks to run before publishing.",
+  hints: [],
+  fileCount: 2,
+  revision: "demo-skill",
+};
 const preview = await createServer({
   configFile: false,
   server: { host: "127.0.0.1", port: 4178, strictPort: true },
@@ -209,6 +275,22 @@ const preview = await createServer({
           if (await handlePreviewInteraction(req, res, path)) return;
           let data;
           if (
+            req.method === "POST" &&
+            path === "/api/workspaces/demo-copy/review"
+          )
+            data = workingCopyReview;
+          else if (
+            req.method === "POST" &&
+            path === "/api/chats/demo-chat/publication-review"
+          )
+            data = {
+              diff: localDiff,
+              pushDiff: "",
+              commits: "",
+              pushError: "",
+              review_token: "demo-review-only",
+            };
+          else if (
             req.method === "POST" &&
             /^\/api\/accounts\/demo-[^/]+\/models$/.test(path)
           ) {
@@ -266,7 +348,7 @@ const preview = await createServer({
               attachments: [],
               jobs: [],
               approvals: previewApprovals(path.split("/").at(-1)),
-              events: [],
+              events: path.endsWith("demo-chat") ? activity : [],
             };
           else if (/^\/api\/chats\/[^/]+\/context$/.test(path))
             data = {
@@ -393,9 +475,7 @@ const preview = await createServer({
               );
             return;
           } else if (/^\/api\/chats\/[^/]+\/diff$/.test(path))
-            data = {
-              diff: 'diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n@@ -1,5 +1,9 @@\n-# Setup\n+# Getting started\n \n-Run the installation script.\n+Set up your workspace in three steps:\n+\n+1. Connect your agent account.\n+2. Choose a working folder.\n+3. Start your first chat.\n \n See the deployment guide for more options.\ndiff --git a/src/navigation.ts b/src/navigation.ts\n--- a/src/navigation.ts\n+++ b/src/navigation.ts\n@@ -4,4 +4,4 @@\n export const navigation = {\n-  label: "Setup",\n+  label: "Getting started",\n   href: "/docs/start",\n };\n',
-            };
+            data = { diff: localDiff, untracked: [] };
           else if (/^\/api\/workspaces\/[^/]+\/deletion$/.test(path))
             data = { chats: [], attachments: 0 };
           else if (path === "/api/ssh-keys")
@@ -426,6 +506,9 @@ const preview = await createServer({
               inherited: path.includes("/chats/"),
               server_ids: ["demo-server"],
             };
+          else if (path === "/api/projects/demo-project/aws")
+            data = { settings: null, identity: null, pending: false };
+          else if (path === "/api/skills") data = [sampleSkill];
           else if (path === "/api/settings/models")
             data = {
               codex: { model: "", effort: "" },

@@ -14,7 +14,7 @@ A private, self-hosted web workspace for **Codex** and **Claude Code**. Work wit
 | Files, images, folders, and skills | Review diffs before commit, push, and PR | Persistent chats and event replay |
 | Per-chat models and reasoning | Password + authenticator sign-in | Self-host locally or on a VPS |
 
-Screenshots show the actual interface with fictional accounts, repositories, messages, and usage values. The overview images predate the latest folder controls; the new-chat and conflict-resolution images below show those additions. They are not evidence of live provider execution. [Screenshot details](docs/screenshots/README.md).
+Screenshots show the current interface with fictional accounts, repositories, messages, and usage values. [Desktop and mobile screenshot gallery](docs/screenshots/README.md).
 
 > **Status: initial release for local validation.** The application, Docker deployment, and automated tests can run now. Real subscription sign-in, model execution, and switching between your own accounts require verification with your accounts before unattended production use. Automatic account switching is disabled by default.
 
@@ -169,7 +169,7 @@ The sidebar labels each chat with its agent and model, and shows remaining limit
 
 ### A persistent conversation
 
-![A Codex conversation with model controls and file, diff, and terminal actions](docs/screenshots/conversation.jpg)
+![A Codex conversation with account switching, an execution log, and controls for files, changes, and terminal](docs/screenshots/conversation.jpg)
 
 ### On your phone
 
@@ -184,6 +184,8 @@ Keep your projects and conversations close, with a mobile layout for browsing ch
 ### Resolving conflicting changes
 
 ![Review with agent-assisted conflict resolution and explicit transfer controls](docs/screenshots/resolve-conflicts.jpg)
+
+See the gallery for [switching between Codex and Claude Code](docs/screenshots/ui-refresh/switch-agent-desktop.jpg), [reviewing a commit](docs/screenshots/ui-refresh/changes-desktop.jpg), [configuring AWS access](docs/screenshots/ui-refresh/project-aws-desktop.jpg), and [managing skills](docs/screenshots/ui-refresh/workspace-skills-desktop.jpg).
 
 ## Project information
 

@@ -1,16 +1,48 @@
 # Documentation screenshots
 
-These are browser captures of the actual React interface with fictional data. `workspace.jpg`, `conversation.jpg`, `mobile.jpg` and `mobile-showcase.jpg` are earlier overview captures from `ops/preview-docs.mjs`; they predate the working-folder controls and should not be used as a current control reference. `new-chat.jpg` and `resolve-conflicts.jpg` show the updated folder selection and agent-resolution controls, captured on 2026-11-16 in an isolated local test installation with synthetic files and a demo account. No inference task was run. Desktop captures include a decorative presentation frame from `ops/docs-frame.html`; the application inside it is rendered without style overrides. No real account, conversation, token, repository, or usage report is included. Example model names and assistant messages are illustrative, not provider verification results.
+These browser captures show the React interface as of 2026-11-19 using fictional accounts, conversations, repositories, files, and usage values. The desktop overview and conversation use a presentation frame. The mobile showcase places two 390 × 844 application views in device frames.
 
-The read-only preview fixture now includes main, worktree and personal folder records with chat-to-folder associations. It can display current project cards and the new-chat form, but it cannot create copies, perform reviews or queue resolution tasks. To refresh the interactive workflow screenshots, use a disposable test database and an isolated data directory as described in [development and verification](../../README.md#development-and-verification). Keep real profiles and project files out of that environment.
+| Overview | Capture |
+| --- | --- |
+| Workspace home | [Framed desktop](workspace.jpg) |
+| Conversation | [Framed desktop](conversation.jpg) · [Mobile](mobile.jpg) |
+| Workspace home and conversation | [Mobile showcase](mobile-showcase.jpg) |
+| Choosing a working copy | [Mobile](new-chat.jpg) |
+| Resolving conflicting changes | [Desktop](resolve-conflicts.jpg) |
 
-To refresh overview captures:
+| Screen | Desktop | Mobile |
+| --- | --- | --- |
+| Workspace home | [Desktop](ui-refresh/home-desktop.jpg) | [Mobile](ui-refresh/home-mobile.jpg) |
+| Sidebar and account limits | [Desktop](ui-refresh/sidebar-desktop.jpg) | [Mobile](ui-refresh/sidebar-mobile.jpg) |
+| Agent accounts | [Desktop](ui-refresh/accounts-compact-desktop.jpg) | [Mobile](ui-refresh/accounts-compact-mobile.jpg) |
+| New chat | [Desktop](ui-refresh/new-chat-compact-desktop.jpg) | [Mobile](ui-refresh/new-chat-compact-mobile.jpg) |
+| Conversation | [Desktop](ui-refresh/chat-desktop.jpg) | [Mobile](ui-refresh/chat-mobile.jpg) |
+| Empty chat | | [Mobile](ui-refresh/chat-empty-mobile.jpg) |
+| Agent questions | [Desktop](ui-refresh/agent-questions-desktop.jpg) | [Mobile](ui-refresh/agent-questions-mobile.jpg) |
+| Permission request | | [Mobile](ui-refresh/agent-permission-mobile.jpg) |
+| Switch between Codex and Claude Code | [Desktop](ui-refresh/switch-agent-desktop.jpg) | |
+| Execution log | [Desktop](ui-refresh/execution-log-desktop.jpg) | |
+| Chat settings | [Desktop](ui-refresh/chat-settings-desktop.jpg) | [Mobile](ui-refresh/chat-settings-mobile.jpg) |
+| Files | [Desktop](ui-refresh/files-desktop.jpg) | [Mobile](ui-refresh/files-mobile.jpg) |
+| Personal folder files | | [Mobile](ui-refresh/files-dialog-mobile.jpg) |
+| File preview | [Desktop](ui-refresh/file-preview-desktop.jpg) | [Mobile](ui-refresh/file-preview-mobile.jpg) |
+| Commit review | [Desktop](ui-refresh/changes-desktop.jpg) | [Mobile](ui-refresh/changes-mobile.jpg) |
+| Terminal | [Desktop](ui-refresh/terminal-desktop.jpg) | [Mobile](ui-refresh/terminal-mobile.jpg) |
+| Project server access and working folders | [Desktop](ui-refresh/project-sections-desktop.jpg) | [Mobile](ui-refresh/project-sections-mobile.jpg) |
+| Connected folders | [Desktop](ui-refresh/connected-folders-desktop.jpg) | [Mobile](ui-refresh/connected-folders-mobile.jpg) |
+| Project AWS access | [Desktop](ui-refresh/project-aws-desktop.jpg) | |
+| Workspace settings | [Desktop](ui-refresh/settings-desktop.jpg) | |
+| Model defaults | [Desktop](ui-refresh/workspace-models-desktop.jpg) | |
+| Resources | [Desktop](ui-refresh/workspace-resources-desktop.jpg) | |
+| Servers and SSH keys | | [Mobile](ui-refresh/workspace-ssh-mobile.jpg) |
+| Skills | [Desktop](ui-refresh/workspace-skills-desktop.jpg) | |
 
-1. Run `npm ci`, then `node ops/preview-docs.mjs`.
-2. Open `http://127.0.0.1:4178/__docs/frame` at 1600 × 1080. Expand **Studio website** in the sidebar and capture the full page as `workspace.jpg`. The decorative frame leaves a 48 px margin around the complete application viewport.
-3. Open **Getting started** and capture the full page as `conversation.jpg`. You can also open `/__docs/frame?view=chat` directly.
-4. Open `http://127.0.0.1:4178/?chat=demo-chat` directly at 390 × 844 and capture `mobile.jpg`. The full example conversation and composer must be visible.
-5. Open `http://127.0.0.1:4178/__docs/mobile` at 1440 × 1200 and capture the full page as `mobile-showcase.jpg`. It displays two real 390 × 844 application views inside decorative device frames from `ops/docs-mobile.html`. Both full screens and device edges must remain visible. This is the mobile image used in README; `mobile.jpg` remains an unframed reference.
-6. Review every image for clipped controls and sensitive data. Stop the preview with Ctrl+C.
+## Refresh the captures
 
-The preview binds to loopback only, rejects writes, and serves a small set of fixture routes. Other controls are intentionally not functional. It does not start the application server, connect to PostgreSQL, launch agents, or authenticate with providers. Never deploy this preview as the application.
+1. Run `npm ci`, then `node ops/preview-docs.mjs`. The preview serves fictional data on `http://127.0.0.1:4178` without connecting to the database or providers.
+2. Capture `/__docs/frame` at 1600 × 1080 with **Studio website** and **Account limits** expanded. Use `/__docs/frame?view=chat` for the framed conversation and `/__docs/mobile` at 1440 × 1200 for the two-phone showcase.
+3. Use `/`, `/?chat=demo-chat`, and `/?project=demo-project` for the gallery. Use 1440 × 1000 for desktop and 390 × 844 for mobile browser views. Open **Changes → Prepare commit review** for the publication example. In the project’s **Working folders**, open **Review changes** for **Mobile navigation** to capture the conflict.
+4. Restart with `PREVIEW_INTERACTIONS=1 node ops/preview-docs.mjs` for the question and permission examples. Capture the questions on both sizes before answering. The fixture shows a retry on the first answer submission and opens the permission request after the second.
+5. Check that the relevant controls are visible and that the images contain only demo data. Stop the preview with Ctrl+C.
+
+The preview displays simulated reviews, terminal output, and agent prompts. Publishing, transferring files, and provider execution require the application server. Use [provider verification](../provider-verification.md) to test live behavior.
