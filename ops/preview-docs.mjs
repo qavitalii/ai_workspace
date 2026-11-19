@@ -247,6 +247,7 @@ const sampleSkill = {
   fileCount: 2,
   revision: "demo-skill",
 };
+const updateCheck = { until: 0, checkedAt: Date.now() - 7 * 60_000 };
 const preview = await createServer({
   configFile: false,
   server: { host: "127.0.0.1", port: 4178, strictPort: true },
@@ -273,6 +274,37 @@ const preview = await createServer({
           }
           if (!path.startsWith("/api/")) return next();
           if (await handlePreviewInteraction(req, res, path)) return;
+          // Browser-update fixture: "Check now" pretends the host takes a few
+          // seconds, then reports that the installation is up to date.
+          if (path === "/api/updates" || path === "/api/updates/check") {
+            if (req.method === "POST" && path === "/api/updates/check") {
+              updateCheck.until = Date.now() + 4000;
+              res.statusCode = 202;
+              res.setHeader("Content-Type", "application/json");
+              res.end(JSON.stringify({ ok: true }));
+              return;
+            }
+            const checking = Date.now() < updateCheck.until;
+            if (!checking && updateCheck.until) {
+              updateCheck.checkedAt = updateCheck.until;
+              updateCheck.until = 0;
+            }
+            res.setHeader("Content-Type", "application/json");
+            res.end(
+              JSON.stringify({
+                installed: "v0.1.4",
+                updater: "ready",
+                phase: "idle",
+                available: null,
+                target: null,
+                checkedAt: updateCheck.checkedAt,
+                checkFailed: false,
+                checking,
+                message: null,
+              }),
+            );
+            return;
+          }
           let data;
           if (
             req.method === "POST" &&

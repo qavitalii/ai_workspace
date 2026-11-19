@@ -37,7 +37,8 @@ button {
   justify-content: center;
   gap: 8px;
 }
-button:disabled {
+button:disabled,
+button[aria-disabled="true"] {
   opacity: 0.4;
   cursor: not-allowed;
 }

@@ -14,6 +14,7 @@ import time
 ROOT = Path(".update-state")
 STATUS = ROOT / "status/status.json"
 REQUEST = ROOT / "requests/update.json"
+CHECK = ROOT / "requests/check"
 RECOVERY = ROOT / "recovery.json"
 TAG = re.compile(r"v(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})")
 COMMIT = re.compile(r"[a-f0-9]{40}")
@@ -101,6 +102,19 @@ def read_request():
     if not isinstance(data["commit"], str) or not COMMIT.fullmatch(data["commit"]):
         raise ValueError("Invalid release commit.")
     return data
+
+
+def take_check_request():
+    # The app asks for an immediate release check by creating this file. Its
+    # content is never read; unlinking does not follow symbolic links.
+    try:
+        CHECK.unlink()
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        print(f"Ignored an invalid release check request: {error}", flush=True)
+        return False
 
 
 def ready():
@@ -216,7 +230,7 @@ def tick():
         return
     if current["phase"] == "waiting":
         current.update(phase="idle", target=None)
-    if now() - (current["checkedAt"] or 0) >= CHECK_INTERVAL_MS:
+    if take_check_request() or now() - (current["checkedAt"] or 0) >= CHECK_INTERVAL_MS:
         try:
             current.update(available=latest(git("rev-parse", "HEAD")), checkFailed=False)
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
