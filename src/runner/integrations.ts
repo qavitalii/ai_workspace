@@ -132,8 +132,8 @@ export async function codexPluginHome(entries: ProjectIntegration[]) {
       timeout: 60000,
     });
   }
-  // Preserve other plugins already installed in the account, while letting
-  // this run's freshly installed plugin take precedence.
+  // /profile is fresh for every run, so this normally inherits nothing; it
+  // still lets this run's freshly installed plugin take precedence.
   async function inherit(source: string, target: string, depth: number) {
     const items = await readdir(source).catch((e: NodeJS.ErrnoException) => {
       if (e.code === "ENOENT") return [];

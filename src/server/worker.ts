@@ -385,16 +385,22 @@ export async function runJob(job: any) {
                 : " (read and write; changes persist on the server)"),
           )
           .join("\n");
-    runtime = await launch(chat.id, job.account_id, async (e) => {
-      try {
-        await handle(e);
-      } catch (err: any) {
-        await done(
-          "failed",
-          isOutputLimit(err) ? outputLimitMessage : err.message,
-        );
-      }
-    });
+    runtime = await launch(
+      chat.id,
+      job.account_id,
+      async (e) => {
+        try {
+          await handle(e);
+        } catch (err: any) {
+          await done(
+            "failed",
+            isOutputLimit(err) ? outputLimitMessage : err.message,
+          );
+        }
+      },
+      // Lets a chat started before per-chat sessions keep its native session.
+      { sessionId: native ? chat.session_id : null },
+    );
     if (finished) {
       await runtime.stop();
       return;
