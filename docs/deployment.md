@@ -280,7 +280,7 @@ The composer offers keyboard and touch suggestions: `/` for commands specific to
 
 Plan mode persists across turns. The composer shows **Plan mode** and **Switch to execution**; switching is blocked while a task is active. Planning questions are saved as pending requests and can be answered after reconnecting, including from a phone. Stopping or restarting expires pending requests. Claude may request explicit permission to exit planning during a run. Replies to secret questions are sent to the agent without being copied to the event log.
 
-The web interface does not provide every interactive terminal command. MCP/plugin management, native session forks, terminal themes and account-wide app mentions are not implemented here. Claude commands are discovered per chat and forwarded only when advertised; availability may change with CLI versions. Codex plan mode uses the experimental collaboration API of the pinned CLI version. See [Codex App Server](https://developers.openai.com/codex/app-server) and [Claude SDK skills and commands](https://code.claude.com/docs/en/agent-sdk/slash-commands).
+The web interface does not provide every interactive terminal command. Native session forks, terminal themes and account-wide app mentions are not implemented here. Claude commands are discovered per chat and forwarded only when advertised; availability may change with CLI versions. Codex plan mode uses the experimental collaboration API of the pinned CLI version. See [Codex App Server](https://developers.openai.com/codex/app-server) and [Claude SDK skills and commands](https://code.claude.com/docs/en/agent-sdk/slash-commands).
 
 
 ### AWS access and portable skills
@@ -353,3 +353,11 @@ SSH_DOCKER_TESTS=1 RUNNER_IMAGE=ai-workspace-runner:ssh-tests npm test
 ```
 
 The SSH tests create temporary keys, SSH targets and authentication helpers, verify SSH/SCP/SFTP and rejection of unassigned destinations, and clean them up. Add `INTEGRATION_TESTS=1` and the disposable `DATABASE_URL` to include actual runtime/terminal access and database/API tests. On Docker Desktop, set `DOCKER_HOST` as described in Contributing if necessary. These checks use synthetic credentials; they do not sign into Codex/Claude or touch real SSH servers.
+
+## Project MCP servers and plugins
+
+Open **Project settings → MCP servers & plugins**. Add an HTTPS Streamable HTTP endpoint, choose Codex, Claude, or both, and optionally supply a bearer token. Use an endpoint without credentials or query parameters. Workspace encrypts the token and excludes it from the settings response. Disable or remove an entry to change the next run in that project, including a new turn in an existing chat.
+
+For a Codex plugin, put the local marketplace catalog at `.agents/plugins/marketplace.json` in the working folder along with the plugin source. Enter its identifier, for example `docs@my-marketplace`. For a Claude plugin, put the native plugin in the working folder and enter its directory, for example `plugins/docs`. Each working copy needs the referenced files. Select trusted plugins because their tools and hooks execute with the agent's permissions. Existing projects start with an empty list.
+
+This release supports HTTPS MCP servers with optional bearer authentication and plugins supplied by the project. Interactive OAuth, stdio server configuration and marketplace browsing are outside this release.

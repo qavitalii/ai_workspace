@@ -9,7 +9,14 @@ export type RunState =
   | "interrupted"
   | "cancelled";
 export type AgentEvent = { type: string; [key: string]: any };
+export type ProjectIntegration = {
+  kind: "mcp" | "plugin";
+  name: string;
+  target: string;
+  token?: string;
+};
 export type RunInput = {
+  integrations?: ProjectIntegration[];
   provider: Provider;
   prompt: string;
   model?: string;

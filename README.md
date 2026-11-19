@@ -86,6 +86,8 @@ Use **Files only** for documents or files without Git, or connect a **GitHub pro
 
 Deleting a chat keeps its working files; deleting a non-main folder also removes its linked chats and original attachments after confirmation. Back up before upgrading or removing data. See the [user guide](docs/user-guide.md) for folder choices, account switching, SSH, AWS and skills.
 
+Project settings also let you connect HTTPS MCP servers and enable project plugins for Codex and Claude. [Integration setup](docs/deployment.md#project-mcp-servers-and-plugins)
+
 ## Operations
 
 Run commands from the cloned `ai_workspace` directory. For a VPS installed with `sudo`, prefix maintenance commands with `sudo` too.

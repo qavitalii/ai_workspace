@@ -1,3 +1,4 @@
+import { runIntegrations } from "./integrations.js";
 import { recoverAccountDeletions } from "./accounts.js";
 import { recoverFolderOperations } from "./folder-operations.js";
 import { saveUsage } from "./usage.js";
@@ -423,6 +424,7 @@ export async function runJob(job: any) {
       type: "start",
       input: {
         provider: chat.provider,
+        integrations: await runIntegrations(chat.project_id, chat.provider),
         prompt:
           (shortcut?.name === "plan"
             ? prompt

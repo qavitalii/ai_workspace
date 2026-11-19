@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS settings(key text PRIMARY KEY,value text NOT NULL);
 CREATE TABLE IF NOT EXISTS ssh_keys(id uuid PRIMARY KEY,name text NOT NULL,private_key text NOT NULL,public_key text NOT NULL,fingerprint text NOT NULL,created_at timestamptz NOT NULL DEFAULT now());
 CREATE TABLE IF NOT EXISTS ssh_servers(id uuid PRIMARY KEY,name text NOT NULL,alias text NOT NULL UNIQUE,host text NOT NULL,port int NOT NULL CHECK(port BETWEEN 1 AND 65535),username text NOT NULL,key_id uuid NOT NULL REFERENCES ssh_keys(id),host_keys jsonb NOT NULL DEFAULT '[]',last_checked_at timestamptz,last_check_ok boolean,last_check_message text);
 CREATE TABLE IF NOT EXISTS projects(id uuid PRIMARY KEY,name text NOT NULL,repo text NOT NULL,base_branch text NOT NULL DEFAULT 'main',created_at timestamptz NOT NULL DEFAULT now());
+CREATE TABLE IF NOT EXISTS project_integrations(id uuid PRIMARY KEY DEFAULT gen_random_uuid(), project_id uuid NOT NULL REFERENCES projects(id) ON DELETE CASCADE, kind text NOT NULL, name text NOT NULL, provider text NOT NULL, target text NOT NULL, secret text, enabled boolean NOT NULL DEFAULT true, UNIQUE(project_id,name));
 CREATE TABLE IF NOT EXISTS aws_connections(project_id uuid PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,settings jsonb NOT NULL,session text,identity text,generation uuid);
 CREATE TABLE IF NOT EXISTS imported_skills(
   project_id uuid REFERENCES projects(id) ON DELETE CASCADE,

@@ -1,3 +1,4 @@
+import { integrationRoutes } from "./integrations.js";
 import { GB, outputStorage, isOutputLimit } from "./output-storage.js";
 import { commandsFor, slashCommand } from "../commands.js";
 import { accountUsage } from "./usage.js";
@@ -175,6 +176,7 @@ export async function createApp() {
     if (code >= 500)
       app.log.error({ message: redact(e.message) }, "Request failed");
   });
+  integrationRoutes(app);
   folderRoutes(app);
   sshRoutes(app);
   awsRoutes(app);

@@ -1,3 +1,4 @@
+import { runIntegrations } from "../src/server/integrations";
 import { prepareAws } from "../src/server/aws";
 import { prepareSkills } from "../src/server/skills";
 import * as sshRuntime from "../src/server/ssh-runtime";
@@ -119,6 +120,48 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
       "INSERT INTO chats(id,project_id,workspace_id,title,provider,account_id,branch) VALUES($1,$2,$1,'Test','codex',$3,'workspace/test')",
       [chat, project, account],
     );
+  });
+
+  it("scopes enabled integrations to the project and provider and protects tokens", async () => {
+    const project = (
+      await db.query("SELECT project_id FROM chats WHERE id=$1", [chat])
+    ).rows[0].project_id;
+    const url = "/api/projects/" + project + "/integrations";
+    const payload = {
+      kind: "mcp",
+      provider: "codex",
+      name: "docs",
+      target: "https://example.test/mcp",
+      token: "test-secret",
+    };
+    expect(
+      (await app.inject({ method: "POST", url, headers, payload })).statusCode,
+    ).toBe(200);
+    const list = await app.inject({ url, headers });
+    expect(list.body).not.toContain("test-secret");
+    expect(
+      (
+        await db.query(
+          "SELECT secret FROM project_integrations WHERE project_id=$1",
+          [project],
+        )
+      ).rows[0].secret,
+    ).not.toBe("test-secret");
+    expect(await runIntegrations(project, "codex")).toMatchObject([
+      { token: "test-secret" },
+    ]);
+    expect(await runIntegrations(project, "claude")).toEqual([]);
+    expect(await runIntegrations(randomUUID(), "codex")).toEqual([]);
+    const entry = url + "/" + list.json()[0].id;
+    await app.inject({
+      method: "PATCH",
+      url: entry,
+      headers,
+      payload: { enabled: false },
+    });
+    expect(await runIntegrations(project, "codex")).toEqual([]);
+    await app.inject({ method: "DELETE", url: entry, headers });
+    expect((await app.inject({ url, headers })).json()).toEqual([]);
   });
 
   it("previews, scopes and round-trips imported skill files", async () => {

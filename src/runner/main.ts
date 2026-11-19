@@ -1,3 +1,8 @@
+import {
+  codexIntegrations,
+  codexPluginHome,
+  claudeIntegrations,
+} from "./integrations.js";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createInterface } from "node:readline";
 import { createServer } from "node:http";
@@ -22,6 +27,7 @@ const rpcPending = new Map<
   number,
   { resolve: (x: any) => void; reject: (e: any) => void; timer: NodeJS.Timeout }
 >();
+const mcpApprovals = new Map<string, unknown>();
 const rpcApprovals = new Map<string, unknown>();
 let sequence = 0;
 function send(value: unknown) {
@@ -47,6 +53,7 @@ function processChild(
   command: string,
   args: string[],
   onLine: (line: string) => void,
+  environment: Record<string, string> = {},
 ) {
   child = spawn(command, args, {
     cwd: "/workspace",
@@ -55,6 +62,7 @@ function processChild(
       HOME: "/profile",
       CODEX_HOME: "/profile/.codex",
       CLAUDE_CONFIG_DIR: "/profile/.claude",
+      ...environment,
     },
     stdio: "pipe",
   });
@@ -76,8 +84,14 @@ function processChild(
       });
   });
 }
-async function codex() {
+async function codex(entries: NonNullable<RunInput["integrations"]> = []) {
+  const integrations = codexIntegrations(entries);
   await mkdir("/profile/.codex", { recursive: true });
+  const home = await codexPluginHome(entries);
+  if (home) {
+    integrations.env.CODEX_HOME = home;
+    integrations.env.CODEX_SQLITE_HOME = "/profile/.codex";
+  }
   processChild(
     "codex",
     [
@@ -86,6 +100,7 @@ async function codex() {
       "stdio://",
       "-c",
       'cli_auth_credentials_store="file"',
+      ...integrations.args,
     ],
     (line) => {
       let m: any;
@@ -119,6 +134,29 @@ async function codex() {
             description: p.command || p.reason || "Allow file changes?",
             details: p,
           });
+        } else if (m.method === "mcpServer/elicitation/request") {
+          if (
+            p.mode === "form" &&
+            p.requestedSchema?.type === "object" &&
+            Object.keys(p.requestedSchema.properties ?? {}).length === 0
+          ) {
+            const id = String(m.id);
+            mcpApprovals.set(id, m.id);
+            emit({
+              type: "approval",
+              id,
+              description: String(p.serverName) + ": " + String(p.message),
+            });
+          } else {
+            send({
+              id: m.id,
+              result: { action: "decline", content: null, _meta: null },
+            });
+            emit({
+              type: "log",
+              text: "MCP server requested an interactive form or sign-in that Workspace cannot display.",
+            });
+          }
         } else if (m.method === "item/tool/requestUserInput") {
           const id = String(m.id);
           rpcQuestions.set(id, m.id);
@@ -138,6 +176,7 @@ async function codex() {
       if (m.method === "serverRequest/resolved") {
         rpcQuestions.delete(String(p.requestId));
         rpcApprovals.delete(String(p.requestId));
+        mcpApprovals.delete(String(p.requestId));
         emit({ type: "request_resolved", id: String(p.requestId) });
       }
       if (m.method === "item/completed" && p.item?.type === "plan")
@@ -179,6 +218,7 @@ async function codex() {
           });
       }
     },
+    integrations.env,
   );
   await rpc("initialize", {
     clientInfo: {
@@ -191,7 +231,7 @@ async function codex() {
   send({ method: "initialized" });
 }
 async function runCodex(input: RunInput) {
-  await codex();
+  await codex(input.integrations);
   const args: any = {
     cwd: "/workspace",
     approvalPolicy:
@@ -340,18 +380,15 @@ async function runClaude(input: RunInput) {
     args.push(
       "--permission-mode",
       input.mode === "plan" ? "plan" : "default",
-      "--mcp-config",
-      JSON.stringify({
-        mcpServers: {
-          workspace_permissions: {
-            command: "node",
-            args: ["/app/dist/node/runner/permissions.js"],
-          },
-        },
-      }),
       "--permission-prompt-tool",
       "mcp__workspace_permissions__approve",
     );
+  args.push(
+    ...(await claudeIntegrations(
+      input.integrations ?? [],
+      !input.autonomous || input.mode === "plan",
+    )),
+  );
   processChild("claude", args, (line) => {
     let m: any;
     try {
@@ -559,6 +596,18 @@ createInterface({ input: process.stdin }).on("line", async (line) => {
       else await runClaude(c.input);
     }
     if (c.type === "approve") {
+      const mcpId = mcpApprovals.get(c.id);
+      if (mcpId !== undefined) {
+        send({
+          id: mcpId,
+          result: {
+            action: c.allow ? "accept" : "decline",
+            content: c.allow ? {} : null,
+            _meta: null,
+          },
+        });
+        mcpApprovals.delete(c.id);
+      }
       const rid = rpcApprovals.get(c.id);
       if (rid !== undefined) {
         send({ id: rid, result: { decision: c.allow ? "accept" : "decline" } });

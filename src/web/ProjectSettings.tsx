@@ -1,3 +1,4 @@
+import { ProjectIntegrations } from "./ProjectIntegrations";
 import { AwsAccess } from "./AwsAccess";
 import { SkillsSettings } from "./SkillsSettings";
 import { SshAccess } from "./SshSettings";
@@ -112,6 +113,7 @@ export function ProjectSettings({
           </button>
         </div>
       </form>
+      <ProjectIntegrations key={project.id} projectId={project.id} />
       <details className="settings-disclosure">
         <summary>Server access</summary>
         <SshAccess embedded scope="projects" id={project.id} />
