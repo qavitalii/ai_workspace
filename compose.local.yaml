@@ -4,3 +4,5 @@ services:
       - "127.0.0.1:8080:80"
     environment:
       SITE_ADDRESS: ":80"
+    volumes:
+      - ./ops/Caddyfile:/etc/caddy/Caddyfile:ro

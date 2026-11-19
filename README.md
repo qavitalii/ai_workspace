@@ -52,7 +52,7 @@ Local access is bound to this computer only. Your computer and Docker must remai
 
 ## Deploy to a VPS — three commands
 
-Supported starting point: Ubuntu 24.04 or Debian 12, Git installed, root access through `sudo`, a domain pointing to the server, and inbound **TCP ports 80 and 443** open. Suggested starting resources: 4 vCPU, 8 GB RAM, and 40+ GB free disk, depending on your workloads.
+Supported starting point: Ubuntu 24.04 or Debian 12, Git installed, root access through `sudo`, a domain pointing to the server **or a static public IP address**, and inbound **TCP ports 80 and 443** open. Suggested starting resources: 4 vCPU, 8 GB RAM, and 40+ GB free disk, depending on your workloads. A 4 GB server can be a starting point for light workloads with **one concurrent task**; see the [deployment guide](docs/deployment.md#small-servers-4-gb-ram).
 
 ```bash
 git clone https://github.com/qavitalii/ai_workspace.git
@@ -60,7 +60,7 @@ cd ai_workspace
 sudo ./ops/install.sh --server
 ```
 
-If Docker is missing, the installer installs it using Docker's official installer. Enter your domain without `https://`, choose a password, and save the TOTP QR code. Caddy obtains and renews the HTTPS certificate. A root installation also schedules daily encrypted backups.
+If Docker is missing, the installer installs it using Docker's official installer. Enter your domain or public IPv4/IPv6 address without `https://`, a port or a path, choose a password, and save the TOTP QR code. Caddy obtains and renews the HTTPS certificate, including short-lived Let's Encrypt certificates for IP addresses. No domain purchase is required. Initial certificate issuance can take a few minutes after the services start. A root installation also schedules daily encrypted backups.
 
 **[Detailed deployment guide →](docs/deployment.md)** — prerequisites, DNS, Docker Desktop, installation, updates, backups, recovery, and troubleshooting.
 

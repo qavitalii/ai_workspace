@@ -58,15 +58,16 @@ services:
       timeout: 5s
       retries: 20
   caddy:
-    image: caddy:2-alpine
+    image: caddy:2.11.9-alpine
     restart: unless-stopped
     environment:
       SITE_ADDRESS: ${SITE_ADDRESS:?Run ops/install.sh first}
+      TLS_SERVER_NAME: ${TLS_SERVER_NAME:-}
     ports:
       - "${HTTP_BIND:-0.0.0.0}:80:80"
       - "${HTTPS_BIND:-0.0.0.0}:443:443"
     volumes:
-      - ./ops/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./ops/${CADDY_CONFIG:-Caddyfile}:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
       - caddy_config:/config
     networks:

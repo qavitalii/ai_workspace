@@ -1,0 +1,18 @@
+{
+	# Browsers omit SNI for IP URLs. Docker's private IP must not be used
+	# when selecting the certificate for the public address.
+	default_sni {$TLS_SERVER_NAME}
+}
+
+{$SITE_ADDRESS} {
+	tls {
+		issuer acme {
+			dir https://acme-v02.api.letsencrypt.org/directory
+			profile shortlived
+		}
+	}
+	encode zstd gzip
+	reverse_proxy server:3000 {
+		header_up X-Forwarded-For {remote_host}
+	}
+}

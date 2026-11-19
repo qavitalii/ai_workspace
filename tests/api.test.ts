@@ -3050,6 +3050,111 @@ esac
       info.mockRestore();
     }
   });
+  it.each(["https://8.8.8.8", "https://[2606:4700:4700::1111]"])(
+    "protects production login, sessions and origins at %s",
+    async (ipOrigin) => {
+      const previous = { origin: config.origin, production: config.production };
+      config.origin = ipOrigin;
+      config.production = true;
+      try {
+        const totp = new OTPAuth.TOTP({
+          secret: new OTPAuth.Secret({ size: 20 }),
+        });
+        await db.query(
+          "INSERT INTO owner(id,password_hash,totp_secret) VALUES(1,$1,$2)",
+          [
+            await argon2.hash("correct-long-password"),
+            seal(totp.secret.base32),
+          ],
+        );
+        const login = {
+          method: "POST" as const,
+          url: "/api/login",
+          remoteAddress: ipOrigin.includes("[")
+            ? "2001:db8::71"
+            : "198.51.100.71",
+          headers: { origin: ipOrigin },
+          payload: { password: "correct-long-password", code: totp.generate() },
+        };
+        const response = await app.inject(login);
+        expect(response.statusCode, response.body).toBe(200);
+        const setCookie = String(response.headers["set-cookie"]);
+        expect(setCookie).toContain("; Secure");
+        expect(setCookie).toContain("; HttpOnly");
+        expect(setCookie).toContain("; SameSite=Strict");
+        expect(setCookie).not.toMatch(/;\s*Domain=/i);
+        const cookie = setCookie.split(";")[0];
+        expect(
+          (
+            await app.inject({
+              url: "/api/me",
+              headers: { cookie, origin: ipOrigin },
+            })
+          ).statusCode,
+        ).toBe(200);
+        expect(
+          (
+            await app.inject({
+              url: "/api/me",
+              headers: { cookie: "session=forged", origin: ipOrigin },
+            })
+          ).statusCode,
+        ).toBe(401);
+        for (const wrongOrigin of [
+          "https://evil.test",
+          ipOrigin.replace("https:", "http:"),
+          ipOrigin + ":444",
+        ]) {
+          expect(
+            (
+              await app.inject({
+                url: "/api/me",
+                headers: { cookie, origin: wrongOrigin },
+              })
+            ).statusCode,
+          ).toBe(403);
+          await expect(
+            app.injectWS("/api/events", {
+              headers: { cookie, origin: wrongOrigin },
+            }),
+          ).rejects.toThrow("Unexpected server response: 403");
+        }
+        expect(
+          (
+            await app.inject({
+              method: "POST",
+              url: "/api/logout",
+              headers: { cookie },
+            })
+          ).statusCode,
+        ).toBe(403);
+        await expect(
+          app.injectWS("/api/events", { headers: { cookie } }),
+        ).rejects.toThrow("Unexpected server response: 403");
+        expect((await app.inject(login)).statusCode).toBe(401);
+        expect(
+          (
+            await app.inject({
+              method: "POST",
+              url: "/api/logout",
+              headers: { cookie, origin: ipOrigin },
+            })
+          ).statusCode,
+        ).toBe(200);
+        expect(
+          (
+            await app.inject({
+              url: "/api/me",
+              headers: { cookie, origin: ipOrigin },
+            })
+          ).statusCode,
+        ).toBe(401);
+      } finally {
+        Object.assign(config, previous);
+      }
+    },
+  );
+
   it("uses password and a non-replayable TOTP", async () => {
     const totp = new OTPAuth.TOTP({ secret: new OTPAuth.Secret({ size: 20 }) });
     await db.query(

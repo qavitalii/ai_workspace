@@ -25,11 +25,17 @@ compose=(docker compose)
 [[ "$mode" == '--local' ]] && compose+=(-f compose.yaml -f compose.local.yaml)
 if [[ ! -f .env ]]; then
   umask 077
+  caddy_config=Caddyfile; tls_server_name=localhost; bind_address=0.0.0.0
   if [[ "$mode" == '--local' ]]; then origin='http://localhost:8080'; address=':80'; environment=development
   else
-    read -rp 'Domain pointing to this server (e.g. agents.example.com): ' domain
-    [[ "$domain" =~ ^[A-Za-z0-9][A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]] || { echo 'Enter a domain name, without https:// or path.'; exit 1; }
-    origin="https://$domain"; address="$domain"; environment=production
+    read -rp 'Domain or public IP assigned to this server (without https://): ' server_host
+    server_settings=$(python3 ops/server-address.py "$server_host")
+    read -r tls_server_name address caddy_config <<< "$server_settings"
+    [[ "$address" == \[* ]] && bind_address='[::]'
+    origin="https://$address"; environment=production
+    if [[ "$caddy_config" == Caddyfile.ip ]]; then
+      echo "HTTPS will use Let's Encrypt IP certificates with automatic renewal. Keep ports 80 and 443 reachable."
+    fi
   fi
   cat > .env <<ENV
 POSTGRES_PASSWORD=$(openssl rand -hex 24)
@@ -37,6 +43,10 @@ ENCRYPTION_KEY=$(openssl rand -hex 32)
 DATA_ROOT=$(pwd)/.data
 APP_ORIGIN=$origin
 SITE_ADDRESS=$address
+CADDY_CONFIG=$caddy_config
+TLS_SERVER_NAME=$tls_server_name
+HTTP_BIND=$bind_address
+HTTPS_BIND=$bind_address
 NODE_ENV=$environment
 MAX_CONCURRENT=3
 MAX_FILE_MB=25
@@ -75,5 +85,8 @@ if [[ "$mode" == '--server' && "$EUID" == 0 ]]; then
   printf '17 3 * * * root cd %s && ./ops/backup.sh >> /var/log/ai-workspace-backup.log 2>&1\n' "$(pwd)" > /etc/cron.d/ai-workspace-backup
   echo 'Daily encrypted backups enabled at 03:17 server time. Copy .backup-key to a separate safe location.'
 fi
-printf '\nWorkspace is ready: %s\n' "$APP_ORIGIN"
+printf '\nWorkspace services started: %s\n' "$APP_ORIGIN"
+if [[ "$mode" == '--server' ]]; then
+  echo 'HTTPS certificate issuance can take a few minutes. If the address does not open, check: ./ops/compose.sh logs --tail=100 caddy'
+fi
 echo 'Next: sign in, connect GitHub, add agent accounts, create a chat.'

@@ -40,7 +40,7 @@ Open [http://localhost:8080](http://localhost:8080). Rerunning the installer doe
 - Ubuntu 24.04 or Debian 12, amd64 or arm64.
 - Suggested starting resources: 4 vCPU, 8 GB RAM, and 40+ GB SSD. Each agent runner is limited to 2 CPU, 2 GB RAM, and 256 PIDs. Large builds may require adjusting `src/server/runtime.ts`.
 - Git installed: `sudo apt-get update && sudo apt-get install -y git`.
-- A domain such as `agents.example.com` pointing to the VPS. Configure the A record and, if present, a valid AAAA record.
+- A domain such as `agents.example.com` pointing to the VPS, **or a static public IPv4/IPv6 address assigned to the VPS**. For a domain, configure the A record and, if present, a valid AAAA record. IP-only access needs no domain or DNS record.
 - Inbound TCP ports 80 and 443 open. Keep SSH available for administration. PostgreSQL has no published port.
 - A checkout path without spaces, for example `/opt/ai_workspace`.
 
@@ -50,9 +50,21 @@ cd ai_workspace
 sudo ./ops/install.sh --server
 ```
 
-Enter a domain without a scheme or path, set a password of at least 14 characters, and add TOTP to your authenticator. If Docker is missing, the installer uses the official `get.docker.com` installer. Install Docker yourself on operating systems other than the supported Ubuntu/Debian setup.
+Enter a domain or public IP without a scheme, port or path, set a password of at least 14 characters, and add TOTP to your authenticator. IPv6 can be entered bare or in square brackets; the installer formats the HTTPS URL correctly. If Docker is missing, the installer uses the official `get.docker.com` installer. Install Docker yourself on operating systems other than the supported Ubuntu/Debian setup.
 
 Caddy obtains and renews the HTTPS certificate. Incorrect DNS or a blocked firewall will prevent certificate issuance; inspect the Caddy logs if necessary.
+
+### Access without a domain
+
+The same `--server` command accepts your VPS's public IP and prints the resulting `https://IP` address (`https://[IPv6]` for IPv6). Private LAN addresses, loopback, shared carrier NAT addresses and reserved addresses are rejected. Use an IP you control, with TCP ports 80 and 443 routed to this VPS; IPv6 access also requires IPv6 connectivity on the client. For an IPv6 address the installer publishes Docker ports on `[::]`; Docker's userland proxy must support forwarding these IPv6 connections to the container's IPv4 network (the standard Docker bridge configuration does).
+
+For IP installations, the installer selects `ops/Caddyfile.ip`. It explicitly uses Let's Encrypt's `shortlived` ACME profile instead of Caddy's local certificate authority. [Let's Encrypt IP certificates](https://letsencrypt.org/2026/01/15/6day-and-ip-general-availability) last 160 hours; Caddy obtains and renews them automatically while running. The configuration also selects the public IP's certificate when a browser omits the TLS server name, as is usual for IP URLs behind Docker's port mapping. Certificate state is kept in the existing `caddy_data` volume. No separate certificate service or renewal cron job is needed.
+
+Keep Caddy running, its data volume intact, and ports 80/443 reachable for renewals. The installer reporting started services does not mean certificate issuance has finished. Open the printed address and check `./ops/compose.sh logs --tail=100 caddy` if HTTPS is not ready after a few minutes. Do not bypass browser certificate warnings or switch production to HTTP. Issuance and renewal on your public IP must be verified on the actual VPS.
+
+### Small servers (4 GB RAM)
+
+For light workloads, 4 GB RAM is a reasonable starting estimate, not a benchmark guarantee. Before starting agent tasks, set **Settings → Resources → Maximum concurrent tasks** to **1**. Each agent is currently limited to 2 GB; the OS, application and database need the remaining memory. A modest swap file can cushion occasional peaks but does not replace RAM. Large builds may need more memory and a higher per-agent limit. The standard installer default remains three tasks for larger servers.
 
 ## 3. Configuration
 
@@ -61,7 +73,10 @@ The installer creates `.env` with permissions `600`. Do not commit it or include
 | Variable | Purpose |
 |---|---|
 | `APP_ORIGIN` | Exact external origin, without a trailing slash, such as `https://agents.example.com` |
-| `SITE_ADDRESS` | Caddy domain; `:80` locally |
+| `SITE_ADDRESS` | Caddy domain or public IP (IPv6 in square brackets); `:80` locally |
+| `CADDY_CONFIG` | `Caddyfile` for domains/local use (default for existing installs); `Caddyfile.ip` for public IP HTTPS |
+| `TLS_SERVER_NAME` | Public IP without IPv6 brackets, used to select the IP certificate when the browser sends no TLS server name; set by the installer |
+| `HTTP_BIND`, `HTTPS_BIND` | Host interfaces for public ports, `0.0.0.0` by default or `[::]` for an IPv6 installation; the local override binds only `127.0.0.1:8080` |
 | `NODE_ENV` | `production` for an HTTPS VPS; `development` for local testing only |
 | `DATA_ROOT` | Absolute path on the Docker host; mounted at the same path inside the supervisor |
 | `POSTGRES_PASSWORD` | Random database password; changing `.env` alone does not update an existing database user |
@@ -75,9 +90,11 @@ The installer creates `.env` with permissions `600`. Do not commit it or include
 | `ENABLE_AUTO_HANDOFF` | `false` initially; see the provider verification guide |
 | `VAPID_*` | Web Push keys and contact address, generated during installation |
 
-Apply changes with `./ops/compose.sh up -d server caddy`. To change a domain, update `APP_ORIGIN`, `SITE_ADDRESS`, and DNS together. To migrate local mode to a server, also set `NODE_ENV=production`, change `.install-mode` to `--server`, and use the server Compose configuration without the local override.
+Apply changes with `./ops/compose.sh up -d server caddy`. To change a domain, update `APP_ORIGIN`, `SITE_ADDRESS`, and DNS together. When switching to IP access or changing the public IP, set `APP_ORIGIN=https://IP`, `SITE_ADDRESS=IP`, `CADDY_CONFIG=Caddyfile.ip`, and `TLS_SERVER_NAME=IP`. For IPv6, wrap the address in square brackets only in `APP_ORIGIN` and `SITE_ADDRESS`, and set `HTTP_BIND=[::]` and `HTTPS_BIND=[::]`; use `0.0.0.0` for IPv4. Switching back to a domain requires `CADDY_CONFIG=Caddyfile` and host bindings that accept the address families in its DNS records. Existing `.env` files are never overwritten by rerunning the installer. To migrate local mode to a server, also set `NODE_ENV=production`, change `.install-mode` to `--server`, and use the server Compose configuration without the local override. Sign in again at the new address; browser notification permissions/subscriptions belong to the old origin and need to be enabled again.
 
 The supervisor trusts forwarded client addresses only from the configured immediate proxy. Caddy overwrites `X-Forwarded-For` with its connecting client’s address, so login quotas are per client. An additional CDN/load balancer needs its own explicit trust configuration; do not enable blanket proxy trust.
+
+For IPv6 forwarded through Docker's userland proxy to an IPv4-only bridge, the connecting address seen by Caddy may be the shared bridge gateway. In that case multiple IPv6 users share one login/global rate-limit bucket, so one client can temporarily exhaust another client's quota. This does not bypass authentication. Before relying on IPv6-only access, verify source-address preservation and independent login quotas from two external clients on the actual VPS. If addresses collapse, use the public IPv4 address or configure and verify native IPv6 networking; do not trust incoming forwarded headers to work around it.
 
 For frontend/backend development outside Docker, use Node 22, your own PostgreSQL instance, `npm ci`, the variables from `.env.example`, and `npm run dev`. Docker is still required for agent containers. Set `APP_ORIGIN=http://localhost:5173` for Vite. Never use a production database for tests.
 
@@ -162,7 +179,7 @@ Backing up only `workspaces/` is insufficient for linked worktrees and future tr
 ./ops/restore.sh /absolute/path/workspace-backup.tar.gz.enc --replace-existing
 ```
 
-This explicitly replaces the installation's current data. The script retains the old `.env` and data directory for manual rollback; remove them only after verification. It preserves the current `DATA_ROOT` and the current database volume's password. Verify the domain, `APP_ORIGIN`, local/server mode, and interrupted jobs after restoration.
+This explicitly replaces the installation's current data. The script retains the old `.env` and data directory for manual rollback; remove them only after verification. It preserves the current `DATA_ROOT` and the current database volume's password. Verify the domain/IP, `APP_ORIGIN`, `SITE_ADDRESS`, `CADDY_CONFIG`, `TLS_SERVER_NAME`, local/server mode, and interrupted jobs after restoration. A different VPS IP requires updating these values as described above; Caddy will obtain a certificate for the new address.
 
 ## 7. Updates
 
@@ -182,7 +199,7 @@ Read project release notes before updating. Rebuild both server and runner: the 
 | Port 8080 is already allocated | Change the port in `compose.local.yaml` and `APP_ORIGIN` together |
 | `Origin not allowed` | Open the exact `APP_ORIGIN`; localhost and 127.0.0.1 are different origins |
 | TOTP is rejected | Correct clock on server/phone; the same code cannot be reused |
-| HTTPS does not work | DNS A/AAAA records, ports 80/443, `./ops/compose.sh logs caddy` |
+| HTTPS does not work | Correct domain/IP, DNS A/AAAA for domains, ports 80/443, `./ops/compose.sh logs caddy`; for IP access check `CADDY_CONFIG=Caddyfile.ip` and `TLS_SERVER_NAME` |
 | Runner image is missing | Run `./ops/compose.sh build runner-image` |
 | GitHub returns 403/404 | PAT repository access, organization approval, correct owner/repository |
 | A chat remains queued | Selected account is connected and idle, capacity is available, and no task, terminal or folder operation is using its working folder; also check writable connected folders |

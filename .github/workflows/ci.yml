@@ -28,4 +28,13 @@ jobs:
           INTEGRATION_TESTS: "1"
           DATABASE_URL: postgres://workspace:workspace@127.0.0.1:54329/workspace
       - run: for script in ops/*.sh; do bash -n "$script"; done
+      - name: Validate domain, IP and local proxy configurations offline
+        run: CADDY_TESTS=1 COMPOSE_TESTS=1 npx vitest run tests/deployment.test.ts
+      - name: Test IP HTTPS and WebSocket connections without a public CA
+        run: |
+          caddy_image=$(node --input-type=module -e 'import fs from "node:fs"; console.log(fs.readFileSync("compose.yaml", "utf8").match(/image: (caddy:[^\s]+)/)[1])')
+          proxy_container=$(docker create "$caddy_image")
+          trap 'docker rm "$proxy_container" >/dev/null' EXIT
+          docker cp "$proxy_container:/usr/bin/caddy" "$RUNNER_TEMP/workspace-test-caddy"
+          CADDY_BIN="$RUNNER_TEMP/workspace-test-caddy" CADDY_HTTPS_TESTS=1 npx vitest run tests/ip-https.test.ts
       - run: docker build --target server .
