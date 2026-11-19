@@ -168,7 +168,8 @@ A root VPS installation creates `/etc/cron.d/ai-workspace-backup`, scheduled for
 | `workspace-git/` | Shared Git history, branches and linked-worktree metadata |
 | `workspace-operations/` | Copy baselines, frozen reviews, resolution inputs and recovery journals/files |
 | `workspace-checkpoints/` | Previous main folders saved before transfers |
-| `uploads/`, `profiles/`, `shared/` | Original attachments, account state and default connected folders |
+| `uploads/`, `account-auth/`, `account-sessions/`, `shared/` | Original attachments, account sign-in files, per-chat native sessions and default connected folders |
+| `profiles/` | Legacy shared account profiles, read once for migration; removed with the account |
 
 Backing up only `workspaces/` is insufficient for linked worktrees and future transfers. Do not delete operation directories as temporary files: current baselines and unresolved reviews depend on them. Main-folder checkpoints and shared Git objects have no automatic retention cleanup. They can remain after a working copy is deleted. Restore the database and the entire data tree from the same backup; worktree links use stable container paths, so manage Git through the application rather than moving individual folders or repairing links on the host.
 
@@ -340,7 +341,7 @@ Select servers in **Project settings → SSH server access** or in a personal ch
 
 Stop queued/active tasks and close affected terminals before editing/removing connections or changing their assignments. Wait for connection checks to finish. Deleting a server removes Workspace assignments but keeps its saved key. A key cannot be deleted while a server references it. **Neither action removes public keys from remote `authorized_keys` files or revokes other copies of a key**; remove those remote entries yourself when retiring access. Already-started remote processes may continue after a chat stops.
 
-The agent receives an isolated authentication socket for its current run, never a private-key file. The helper holds assigned identities in memory with destination constraints tied to confirmed host keys and usernames. Configuration and public keys reside in a disposable Docker volume; private working files use memory-backed storage. Shared provider profiles, Git helpers and sign-in/model-inspection sessions do not receive these credentials. SSH helpers disable Docker output logging, and cleanup removes helpers and socket volumes after stop or supervisor recovery. No private keys or passphrases are placed in command arguments.
+The agent receives an isolated authentication socket for its current run, never a private-key file. The helper holds assigned identities in memory with destination constraints tied to confirmed host keys and usernames. Configuration and public keys reside in a disposable Docker volume; private working files use memory-backed storage. Per-run provider profiles, Git helpers and sign-in/model-inspection sessions do not receive these credentials. SSH helpers disable Docker output logging, and cleanup removes helpers and socket volumes after stop or supervisor recovery. No private keys or passphrases are placed in command arguments.
 
 Back up the database and `.env` using the existing encrypted backup procedure: the SSH key ciphertext is in the database and requires the original `ENCRYPTION_KEY`. Restoring that backup restores saved SSH access, so review assignments after recovery. Rebuild **both server and runner images** when upgrading to this feature; the older runner lacks the SSH helper. Existing installations start with no SSH keys or assignments. No provider-account login or remote access is required for migration.
 

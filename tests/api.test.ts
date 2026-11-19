@@ -30,6 +30,7 @@ import {
   readFile,
   writeFile,
   access,
+  readdir,
 } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -3590,7 +3591,9 @@ esac
       });
     try {
       await runJob(job);
-      expect(launch).toHaveBeenCalledWith(chat, other, expect.any(Function));
+      expect(launch).toHaveBeenCalledWith(chat, other, expect.any(Function), {
+        sessionId: null,
+      });
       expect(send.mock.calls[0][0].input).toMatchObject({
         provider: "claude",
         sessionId: undefined,
@@ -3834,12 +3837,86 @@ esac
     expect(received.id).toBe(second.id);
     socket.close();
   });
+  it.skipIf(process.env.DOCKER_TESTS !== "1")(
+    "gives each real run a fresh profile that keeps only sign-in and this chat's sessions",
+    async () => {
+      const session = randomUUID();
+      const store = path.join(data, "account-auth", account);
+      await mkdir(path.join(store, ".codex"), { recursive: true });
+      await writeFile(
+        path.join(store, ".codex", "auth.json"),
+        JSON.stringify({ tokens: { access_token: "seeded" } }),
+      );
+      const shell = async (chatId: string, command: string) => {
+        let output = "";
+        const run = await launch(chatId, account, (e) => {
+          if (e.type === "terminal") output += e.data;
+        });
+        try {
+          // The quotes keep the terminal's echo of the command from matching.
+          run.send({
+            type: "terminal",
+            data: command + "; echo; echo DO''NE\r",
+          });
+          await vi.waitFor(() => expect(output).toMatch(/^DONE\r?$/m), {
+            timeout: 15_000,
+          });
+        } finally {
+          await run.stop();
+        }
+        return output;
+      };
+      const first = await shell(
+        chat,
+        [
+          "cat /profile/.codex/auth.json",
+          "echo planted > /profile/.codex/config.toml",
+          "mkdir -p /profile/.claude/projects/-workspace/memory",
+          "echo hook > /profile/.claude/settings.json",
+          "echo memo > /profile/.claude/projects/-workspace/memory/MEMORY.md",
+          `echo history > /profile/.claude/projects/-workspace/${session}.jsonl`,
+          "echo planted > /profile/.bashrc",
+          `printf '{"tokens":{"access_token":"refreshed"}}' > /profile/.codex/auth.json`,
+        ].join(" && "),
+      );
+      expect(first).toContain('"seeded"');
+      const check = [
+        "cat /profile/.codex/auth.json; echo",
+        "for f in .codex/config.toml .claude/settings.json .bashrc .claude/projects/-workspace/memory; do test -e /profile/$f && echo FOUND:$f; done",
+        `cat /profile/.claude/projects/-workspace/${session}.jsonl 2>/dev/null`,
+        "touch /profile/.write-check && echo WRITA''BLE",
+      ].join("; ");
+      const second = await shell(chat, check);
+      expect(second).toContain('"refreshed"');
+      expect(second).not.toMatch(/^FOUND:\./m);
+      expect(second).toMatch(/^history\r?$/m);
+      expect(second).toMatch(/^WRITABLE\r?$/m);
+      const other = randomUUID();
+      await createWorkspace(null, "personal", "Other", db, other);
+      await db.query(
+        "INSERT INTO chats(id,workspace_id,title,provider,account_id,branch) VALUES($1,$1,'Other','codex',$2,'main')",
+        [other, account],
+      );
+      const third = await shell(other, check);
+      expect(third).toContain('"refreshed"');
+      expect(third).not.toMatch(/^history\r?$/m);
+      expect(third).not.toMatch(/^FOUND:\./m);
+      expect(await readdir(path.join(data, "run-profiles"))).toEqual([]);
+    },
+    60_000,
+  );
   it("removes an account and local credentials while keeping chats, files and history", async () => {
     await mkdir(path.join(data, "profiles", account), { recursive: true });
     await writeFile(
       path.join(data, "profiles", account, "auth"),
       "test credentials",
     );
+    for (const dir of ["account-auth", "account-sessions"]) {
+      await mkdir(path.join(data, dir, account, ".claude"), {
+        recursive: true,
+      });
+      await writeFile(path.join(data, dir, account, ".claude", "f"), "x");
+    }
     await mkdir(workspacePath(chat), { recursive: true });
     await writeFile(path.join(workspacePath(chat), "kept.txt"), "keep");
     await db.query(
@@ -3871,9 +3948,8 @@ esac
     expect(
       await readFile(path.join(workspacePath(chat), "kept.txt"), "utf8"),
     ).toBe("keep");
-    await expect(
-      access(path.join(data, "profiles", account)),
-    ).rejects.toThrow();
+    for (const dir of ["profiles", "account-auth", "account-sessions"])
+      await expect(access(path.join(data, dir, account))).rejects.toThrow();
   });
   it("blocks account removal during sign-in, inspections and queued work", async () => {
     for (const status of ["authenticating", "inspecting", "disconnecting"]) {

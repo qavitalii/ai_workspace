@@ -72,12 +72,17 @@ export async function disconnectAccount(id: string, start = launch) {
   } finally {
     clearTimeout(timer);
     await runtime?.stop();
+    // Credentials removed inside the run are only gone once copied back.
+    if (success && runtime && !((await runtime.profileSaved?.()) ?? true))
+      success = false;
     // Never schedule work with credentials whose state is uncertain after a failed logout.
     await db.query(
       "UPDATE accounts SET status=$2,limits=NULL,reset_at=NULL WHERE id=$1 AND status='disconnecting'",
       [id, success ? "disconnected" : "disconnect_failed"],
     );
   }
+  if (!success)
+    throw new Error("Sign-out could not be saved. Try Disconnect again.");
   return { ok: true };
 }
 
@@ -128,11 +133,12 @@ async function finishAccountDeletion(id: string) {
     const { rm } = await import("node:fs/promises");
     const { default: path } = await import("node:path");
     const { config } = await import("./config.js");
-    for (const dir of ["profiles", "auth-workspaces"])
-      await rm(path.join(config.data, dir, id), {
-        recursive: true,
-        force: true,
-      });
+    const { removeAccountProfiles } = await import("./profiles.js");
+    await removeAccountProfiles(id);
+    await rm(path.join(config.data, "auth-workspaces", id), {
+      recursive: true,
+      force: true,
+    });
     await transaction(async (c) => {
       await c.query("SELECT pg_advisory_xact_lock(417028)");
       await c.query(

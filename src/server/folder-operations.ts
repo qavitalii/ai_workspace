@@ -6,6 +6,7 @@ import { randomUUID } from "node:crypto";
 import { config } from "./config.js";
 import { db, transaction } from "./db.js";
 import { docker } from "./runtime.js";
+import { removeChatSessions } from "./profiles.js";
 import {
   workspaceBy,
   workspacePath,
@@ -464,6 +465,7 @@ async function cleanupDeleted(op: any) {
     await rm(path.join(config.data, "uploads", path.basename(file)), {
       force: true,
     });
+  await removeChatSessions(op.result.chats || []);
   for (const id of op.result.operations)
     if (id !== op.id)
       await rm(operationPath(id), { recursive: true, force: true });
@@ -514,9 +516,11 @@ export async function deleteWorkingFolder(id: string, name: string) {
     );
     await transaction(async (c) => {
       await c.query("SELECT pg_advisory_xact_lock(417028)");
-      await c.query("SELECT id FROM chats WHERE workspace_id=$1 FOR UPDATE", [
-        id,
-      ]);
+      const chatIds = (
+        await c.query("SELECT id FROM chats WHERE workspace_id=$1 FOR UPDATE", [
+          id,
+        ])
+      ).rows.map((r) => r.id);
       const uploads = (
         await c.query(
           "SELECT storage_name FROM attachments WHERE workspace_id=$1",
@@ -562,6 +566,7 @@ export async function deleteWorkingFolder(id: string, name: string) {
             uploads,
             operations,
             staging,
+            chats: chatIds,
             workspaceId: id,
             branch: folder!.branch,
             gitSource:

@@ -17,10 +17,15 @@ import { attachInput } from "./docker-attach.js";
 import { removeDockerResource } from "./docker-cleanup.js";
 import { cleanAwsCredentials, awsForRun } from "./aws.js";
 import { cleanSkillSnapshots, prepareSkills } from "./skills.js";
+import {
+  prepareProfile,
+  recoverRunProfiles,
+  removeSessionsExcept,
+  type ProfileRun,
+} from "./profiles.js";
 export const docker = new Docker();
 // IDs here identify persistent folders, not chats.
 export const workspace = workspacePath;
-export const profile = (id: string) => path.join(config.data, "profiles", id);
 async function writable(dir: string) {
   await mkdir(dir, { recursive: true, mode: 0o700 });
   await chmod(dir, 0o700);
@@ -32,11 +37,14 @@ export type Running = {
   awsWarning?: string;
   send: (c: RunnerCommand) => void;
   stop: () => Promise<void>;
+  /** After stop: whether the account's sign-in and session state was saved. */
+  profileSaved?: () => Promise<boolean>;
 };
 export async function launch(
   chatId: string | null,
   accountId: string | null,
   onEvent: (e: AgentEvent) => void | Promise<void>,
+  options: { sessionId?: string | null; signIn?: boolean } = {},
 ): Promise<Running> {
   const w = chatId ? await chatWorkspace(chatId) : null;
   const work = w
@@ -82,23 +90,35 @@ export async function launch(
       })),
     );
   }
+  // Fresh per run: only sign-in files and this chat's own sessions persist.
+  let profile: ProfileRun | null = null;
   if (accountId) {
-    await writable(profile(accountId));
-    mounts.push({
-      Type: "bind",
-      Source: profile(accountId),
-      Target: "/profile",
+    profile = await prepareProfile(accountId, chatId, {
+      session: options.sessionId,
+      signIn: options.signIn,
     });
+    mounts.push({ Type: "bind", Source: profile.dir, Target: "/profile" });
   }
-  const { access: aws, warning: awsWarning } =
-    w && !w.resolution_operation_id
-      ? await awsForRun(w.project_id)
-      : { access: null, warning: "" };
+  let aws: Awaited<ReturnType<typeof awsForRun>>["access"] = null;
+  let awsWarning = "";
   let skills: Awaited<ReturnType<typeof prepareSkills>> = null;
   let ssh: Awaited<ReturnType<typeof prepareSsh>> = null;
-  const cleanMounts = () =>
-    Promise.all([ssh?.stop(), skills?.stop(), aws?.stop()]);
+  let session: string | null = null;
+  let saved: Promise<boolean> | undefined;
+  // The profile is read back only when the container is known to be gone (or
+  // its processes have exited); otherwise startup recovery handles it later.
+  const cleanMounts = (gone = true) => {
+    if (!saved || gone)
+      saved = !profile
+        ? Promise.resolve(true)
+        : gone
+          ? profile.finish(session)
+          : Promise.resolve(false);
+    return Promise.all([ssh?.stop(), skills?.stop(), aws?.stop(), saved]);
+  };
   try {
+    if (w && !w.resolution_operation_id)
+      ({ access: aws, warning: awsWarning } = await awsForRun(w.project_id));
     if (w) skills = await prepareSkills(w.project_id);
     if (chatId) ssh = await prepareSsh(chatId);
   } catch (error) {
@@ -124,6 +144,7 @@ export async function launch(
         "ai.workspace.instance": config.data,
         "ai.workspace.chat": chatId || "",
         "ai.workspace.account": accountId || "",
+        "ai.workspace.profile": profile?.name || "",
       },
       Env: [
         "HOME=/profile",
@@ -165,8 +186,11 @@ export async function launch(
   try {
     stream = await attachInput(c);
   } catch (error) {
-    await c.remove({ force: true }).catch(() => {});
-    await cleanMounts();
+    const gone = await c.remove({ force: true }).then(
+      () => true,
+      () => false,
+    );
+    await cleanMounts(gone);
     throw error;
   }
   let stopped = false;
@@ -177,11 +201,13 @@ export async function launch(
     stopped = true;
     stream.destroy();
     stopping = (async () => {
+      let gone = false;
       try {
         await c.stop({ t: 5 }).catch(() => {});
         await removeDockerResource(() => c.remove({ force: true }));
+        gone = true;
       } finally {
-        await cleanMounts();
+        await cleanMounts(gone || exited);
       }
     })().catch((error) => {
       stopping = undefined;
@@ -190,6 +216,7 @@ export async function launch(
     return stopping;
   }
   const output = consumeRunnerOutput(stream, async (e) => {
+    if (e.type === "session" && typeof e.id === "string") session = e.id;
     if (!stopped) await onEvent(e);
   }).catch(async (error) => {
     if (stopped) return;
@@ -237,6 +264,7 @@ export async function launch(
     send(c) {
       if (!stopped) stream.write(JSON.stringify(c) + "\n");
     },
+    profileSaved: () => saved ?? Promise.resolve(!profile),
     async stop() {
       if (stopped) return stop();
       await stop();
@@ -246,6 +274,8 @@ export async function launch(
   };
 }
 export async function cleanOrphans() {
+  // Runs whose container survives removal keep their profile for a later start.
+  const live = new Set<string>();
   for (const c of await docker.listContainers({
     all: true,
     filters: JSON.stringify({
@@ -258,8 +288,18 @@ export async function cleanOrphans() {
     await docker
       .getContainer(c.Id)
       .remove({ force: true })
-      .catch(() => {});
+      .catch(() => {
+        const name = c.Labels?.["ai.workspace.profile"];
+        if (name) live.add(name);
+      });
   }
   await cleanSshVolumes();
-  await Promise.all([cleanSkillSnapshots(), cleanAwsCredentials()]);
+  await Promise.all([
+    cleanSkillSnapshots(),
+    cleanAwsCredentials(),
+    recoverRunProfiles(live),
+  ]);
+  await removeSessionsExcept(
+    new Set((await db.query("SELECT id FROM chats")).rows.map((r) => r.id)),
+  );
 }

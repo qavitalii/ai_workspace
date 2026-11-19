@@ -43,6 +43,7 @@ import {
   workspaceBy,
 } from "./workspaces.js";
 import { launch, type Running } from "./runtime.js";
+import { removeChatSessions } from "./profiles.js";
 import {
   github,
   initializeWorkspace,
@@ -424,45 +425,46 @@ export async function createApp() {
     });
     try {
       let early: any[] = [];
-      const runtime = await launch(null, id, (e) => {
-        const s = authRuns.get(id);
-        if (!s) {
-          early.push(e);
-          return;
-        }
-        s.events.push(e);
-        if (s.events.length > 500) s.events.shift();
-        if (e.type === "auth_complete") {
-          clearTimeout(s.timer);
-          setTimeout(() => {
-            if (authRuns.get(id) === s) authRuns.delete(id);
-          }, 60000).unref();
-          void s.runtime
-            .stop()
-            .then(() =>
-              db.query(
-                "UPDATE accounts SET status=$2,reset_at=NULL,model_catalog=NULL,models_updated_at=NULL WHERE id=$1 AND status='authenticating'",
-                [id, e.success ? "ready" : "disconnected"],
-              ),
-            )
-            .catch(() => {});
-        }
-        if (e.type === "failed" || e.type === "exit") {
-          clearTimeout(s.timer);
-          void s.runtime.stop();
-          void db.query(
-            "UPDATE accounts SET status='disconnected' WHERE id=$1 AND status='authenticating'",
-            [id],
+      // Wait for the profile copy-back before changing the account status.
+      // The first outcome wins; later events for the same run are ignored.
+      let finishing: Promise<void> | undefined;
+      const finish = (s: { runtime: Running }, success: boolean) =>
+        (finishing ??= (async () => {
+          await s.runtime.stop().catch(() => {});
+          const saved = (await s.runtime.profileSaved?.()) ?? true;
+          await db.query(
+            "UPDATE accounts SET status=$2,reset_at=NULL,model_catalog=NULL,models_updated_at=NULL WHERE id=$1 AND status='authenticating'",
+            [id, success && saved ? "ready" : "disconnected"],
           );
-        }
-      });
+        })());
+      const runtime = await launch(
+        null,
+        id,
+        (e) => {
+          const s = authRuns.get(id);
+          if (!s) {
+            early.push(e);
+            return;
+          }
+          s.events.push(e);
+          if (s.events.length > 500) s.events.shift();
+          if (e.type === "auth_complete") {
+            clearTimeout(s.timer);
+            setTimeout(() => {
+              if (authRuns.get(id) === s) authRuns.delete(id);
+            }, 60000).unref();
+            void finish(s, e.success).catch(() => {});
+          }
+          if (e.type === "failed" || e.type === "exit") {
+            clearTimeout(s.timer);
+            void finish(s, false).catch(() => {});
+          }
+        },
+        { signIn: true },
+      );
       const timer = setTimeout(() => {
-        void runtime.stop();
         authRuns.delete(id);
-        void db.query(
-          "UPDATE accounts SET status='disconnected' WHERE id=$1 AND status='authenticating'",
-          [id],
-        );
+        void finish({ runtime }, false).catch(() => {});
       }, 600000);
       authRuns.set(id, { runtime, events: early, timer });
       runtime.send({ type: "auth", provider: a.provider });
@@ -719,6 +721,10 @@ export async function createApp() {
       await c.query("DELETE FROM messages WHERE chat_id=$1", [id]);
       await c.query("DELETE FROM chats WHERE id=$1", [id]);
     });
+    // Native session transcripts are chat data; drop them with the chat.
+    await removeChatSessions([id]).catch((error) =>
+      console.error("Could not remove chat sessions", error),
+    );
     return { ok: true, cleanupPending: false };
   });
 
@@ -1522,7 +1528,9 @@ export async function createApp() {
       try {
         const phase = await updatePhase();
         if (phase === "waiting" || phase === "updating")
-          throw new Error("Workspace is preparing an update. Open the terminal after it restarts.");
+          throw new Error(
+            "Workspace is preparing an update. Open the terminal after it restarts.",
+          );
         const chat = await chatBy(id);
         await idle(id);
         if (terminals.has(id)) throw new Error("Terminal already open");
