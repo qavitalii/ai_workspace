@@ -106,22 +106,17 @@ export function updateRoutes(
     reply.header("Cache-Control", "no-store");
     const current = await status();
     const pending = await requestExists();
+    const waiting = pending && current?.phase !== "updating";
     return {
       installed: "v" + packageInfo.version,
       updater: !current ? "disabled" : online(current) ? "ready" : "offline",
-      phase:
-        pending && current?.phase !== "updating"
-          ? "waiting"
-          : (current?.phase ?? "idle"),
+      phase: waiting ? "waiting" : (current?.phase ?? "idle"),
       available: current?.available ?? null,
-      target: current?.target ?? null,
+      target: (waiting ? current?.available : current?.target) ?? null,
       checkedAt: current?.checkedAt ?? null,
       checkFailed: current?.checkFailed ?? false,
       checking: await requestExists("check"),
-      message:
-        pending && current?.phase !== "updating"
-          ? null
-          : (current?.message ?? null),
+      message: waiting ? null : (current?.message ?? null),
     };
   });
 
