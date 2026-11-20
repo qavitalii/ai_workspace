@@ -2,6 +2,12 @@
 
 Never list Codex or any other AI agent as a Git co-author, including in `Co-authored-by` commit trailers.
 
+# Branches and CI
+
+Start each new task in its own branch from up-to-date `main`. Use a separate worktree when the current checkout contains another task’s edits. Run the relevant local checks and complete the review below before pushing the branch and opening a pull request to `main`.
+
+GitHub Actions CI runs only on pushes to `main`, including commits added by merging a pull request. Record the local checks and their results in the pull request.
+
 # Review before pushing
 
 For changes to Workspace, use an implementer and an independent code reviewer. When the change affects the interface, also assign an independent UI reviewer.
