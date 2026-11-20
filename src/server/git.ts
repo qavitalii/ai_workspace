@@ -194,7 +194,12 @@ async function runGit(
         "Git output exceeds the review limit. Reduce the change size before publishing.",
       );
     if (result.StatusCode !== 0)
-      throw new Error(error || "Git operation failed or timed out");
+      throw Object.assign(
+        new Error(error || "Git operation failed or timed out"),
+        {
+          gitExitCode: result.StatusCode,
+        },
+      );
     return output;
   } finally {
     clearTimeout(timer);

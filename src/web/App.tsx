@@ -315,6 +315,7 @@ export function App() {
     [searchError, setSearchError] = useState(""),
     [streams, setStreams] = useState<Record<string, string>>({}),
     [liveLogs, setLiveLogs] = useState<any[]>([]),
+    [workspaceRevision, setWorkspaceRevision] = useState(0),
     [connected, setConnected] = useState(false);
   const updates = useWorkspaceUpdates(Boolean(me), modal === "settings");
   const install = useWorkspaceInstall();
@@ -516,6 +517,10 @@ export function App() {
           setStreams({});
           void loadDetail(chatId);
           void loadOverview();
+          return;
+        }
+        if (ev.type === "workspace-sync") {
+          setWorkspaceRevision((revision) => revision + 1);
           return;
         }
         if (BigInt(ev.id) <= BigInt(cursor)) return;
@@ -1684,7 +1689,20 @@ export function App() {
                     <Terminal chatId={chat.id} />
                   </Suspense>
                 ) : (
-                  <ChangesPanel key={chat.id} chatId={chat.id} />
+                  <ChangesPanel
+                    key={chat.id}
+                    chatId={chat.id}
+                    revision={workspaceRevision}
+                    syncFolder={
+                      project?.repo &&
+                      chat.initialized &&
+                      !overview.workspaces.find(
+                        (w: any) => w.id === chat.workspace_id,
+                      )?.resolution_operation_id
+                        ? chat.workspace_id
+                        : undefined
+                    }
+                  />
                 )}
               </aside>
             )}

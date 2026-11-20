@@ -39,6 +39,7 @@ import * as OTPAuth from "otpauth";
 import { disconnectAccount } from "../src/server/accounts";
 import * as runtimeModule from "../src/server/runtime";
 import * as gitModule from "../src/server/git";
+import * as githubSync from "../src/server/github-sync";
 import { outputStorage, GB } from "../src/server/output-storage";
 import { claim, active, runJob } from "../src/server/worker";
 import { concurrentTasks } from "../src/server/settings";
@@ -163,6 +164,55 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
     expect(await runIntegrations(project, "codex")).toEqual([]);
     await app.inject({ method: "DELETE", url: entry, headers });
     expect((await app.inject({ url, headers })).json()).toEqual([]);
+  });
+
+  it("authorizes GitHub sync and holds the folder lease until it finishes", async () => {
+    const url = `/api/workspaces/${chat}/sync`;
+    const lease = () =>
+      db.query("SELECT kind FROM workspace_leases WHERE workspace_id=$1", [
+        chat,
+      ]);
+    const result = {
+      status: "updated" as const,
+      sourceBranch: "main",
+      commit: "a".repeat(40),
+    };
+    const operation = vi
+      .spyOn(githubSync, "syncFromGithub")
+      .mockImplementation(async (id) => {
+        expect(id).toBe(chat);
+        expect((await lease()).rows).toEqual([{ kind: "GitHub sync" }]);
+        return result;
+      });
+    try {
+      expect((await app.inject({ method: "POST", url })).statusCode).toBe(403);
+      expect(
+        (await app.inject({ method: "POST", url, headers: { origin } }))
+          .statusCode,
+      ).toBe(401);
+      await acquireFolder(chat, "test terminal");
+      try {
+        expect(
+          (await app.inject({ method: "POST", url, headers })).statusCode,
+        ).toBe(409);
+        expect(operation).not.toHaveBeenCalled();
+      } finally {
+        await releaseFolder(chat);
+      }
+      const response = await app.inject({ method: "POST", url, headers });
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toEqual(result);
+      expect((await lease()).rows).toEqual([]);
+      operation.mockRejectedValueOnce(
+        Object.assign(new Error("Local changes"), { statusCode: 409 }),
+      );
+      const rejected = await app.inject({ method: "POST", url, headers });
+      expect(rejected.statusCode).toBe(409);
+      expect(rejected.json()).toEqual({ error: "Local changes" });
+      expect((await lease()).rows).toEqual([]);
+    } finally {
+      operation.mockRestore();
+    }
   });
 
   it("previews, scopes and round-trips imported skill files", async () => {

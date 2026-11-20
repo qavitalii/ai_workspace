@@ -1476,11 +1476,17 @@ export async function createApp() {
       if (id === chatId && socket.readyState === 1)
         socket.send(JSON.stringify({ type: "refresh" }));
     };
+    const workspaceSync = (id: string) => {
+      if (id === chatId && socket.readyState === 1)
+        socket.send(JSON.stringify({ type: "workspace-sync" }));
+    };
     bus.on("event", listener);
     bus.on("refresh", refresh);
+    bus.on("workspace-sync", workspaceSync);
     socket.on("close", () => {
       bus.off("event", listener);
       bus.off("refresh", refresh);
+      bus.off("workspace-sync", workspaceSync);
     });
     void (async () => {
       try {
