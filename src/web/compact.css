@@ -1860,6 +1860,55 @@ input[type="file"]::file-selector-button {
   line-height: 1.5;
   margin-top: 4px;
 }
+.modal.workspace-install-modal {
+  width: min(390px, calc(100% - 24px));
+}
+.workspace-install-modal > header {
+  margin-bottom: 10px;
+}
+.workspace-install-modal > header .icon {
+  min-width: var(--control-height);
+  min-height: var(--control-height);
+}
+.install-guide-intro {
+  margin: 0 0 12px;
+}
+.install-guide-steps {
+  display: grid;
+  margin: 0;
+  padding: 0 12px;
+  list-style: none;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--canvas);
+}
+.install-guide-steps li {
+  display: grid;
+  grid-template-columns: 32px minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  padding: 10px 0;
+  font-size: 13px;
+  line-height: 1.45;
+}
+.install-guide-steps li + li {
+  border-top: 1px solid var(--line);
+}
+.install-guide-icon {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--accent);
+  background: var(--surface);
+}
+.install-guide-steps small {
+  display: block;
+  margin-top: 3px;
+  color: var(--muted);
+}
 .settings-layout .resources-heading {
   align-items: baseline;
   gap: 12px;

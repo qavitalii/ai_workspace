@@ -13,6 +13,7 @@ import { ProviderIcon } from "./ProviderIcon";
 import { modelLabel, effortLabel } from "../usage";
 import { SidebarNavigation } from "./Sidebar";
 import { WorkspaceHome } from "./WorkspaceHome";
+import { useWorkspaceInstall, WorkspaceInstallGuide } from "./WorkspaceInstall";
 import { AgentPermission } from "./AgentPermission";
 import { AgentQuestions } from "./AgentQuestions";
 import { GithubTokenHelp } from "./GithubTokenHelp";
@@ -308,6 +309,16 @@ export function App() {
     [liveLogs, setLiveLogs] = useState<any[]>([]),
     [connected, setConnected] = useState(false);
   const updates = useWorkspaceUpdates(Boolean(me), modal === "settings");
+  const install = useWorkspaceInstall();
+  const settingsButton = useRef<HTMLButtonElement>(null);
+  const installFromMenu = useRef(false);
+  useEffect(() => {
+    if (!mobile) installFromMenu.current = false;
+    if (installFromMenu.current && !install.showMenuEntry && !install.guide) {
+      installFromMenu.current = false;
+      settingsButton.current?.focus();
+    }
+  }, [mobile, install.showMenuEntry, install.guide]);
   const updateAvailable =
     updates.status?.updater === "ready" &&
     !updates.connectionLost &&
@@ -875,7 +886,20 @@ export function App() {
               {overview.accounts.length}
             </span>
           </button>
+          {mobile && install.showMenuEntry && (
+            <button
+              aria-disabled={install.prompting || undefined}
+              onClick={() => {
+                installFromMenu.current = true;
+                void install.open();
+              }}
+            >
+              <Download size={17} aria-hidden="true" />
+              Install Workspace
+            </button>
+          )}
           <button
+            ref={settingsButton}
             onClick={() => {
               setSettingsStart(updateAvailable ? "updates" : "models");
               setModal("settings");
@@ -2041,6 +2065,7 @@ export function App() {
         >
           <SettingsForm
             initialSection={settingsStart}
+            install={install}
             updates={updates}
             accounts={overview.accounts}
             defaults={overview.modelDefaults}
@@ -2053,6 +2078,18 @@ export function App() {
               setEditingProject(p);
               setModal("project-settings");
             }}
+          />
+        </Modal>
+      )}
+      {install.guide && (
+        <Modal
+          title="Install Workspace"
+          className="workspace-install-modal"
+          onClose={install.closeGuide}
+        >
+          <WorkspaceInstallGuide
+            platform={install.guide}
+            onClose={install.closeGuide}
           />
         </Modal>
       )}
@@ -3058,6 +3095,7 @@ function ChatSettings({ chat, me, onSave, onError }: any) {
 }
 function SettingsForm({
   initialSection,
+  install,
   updates,
   me,
   projects,
@@ -3070,8 +3108,19 @@ function SettingsForm({
 }: any) {
   const [saved, setSaved] = useState(false),
     [enabling, setEnabling] = useState(false),
-    [section, setSection] = useState(initialSection);
+    [selectedSection, setSection] = useState(initialSection);
+  const section =
+    selectedSection === "app" && !install.available
+      ? "models"
+      : selectedSection;
   const settingsLayoutRef = useRef<HTMLDivElement>(null);
+  const installButton = useRef<HTMLButtonElement>(null);
+  const hadInstallGuide = useRef(false);
+  useEffect(() => {
+    if (hadInstallGuide.current && !install.guide)
+      installButton.current?.focus();
+    hadInstallGuide.current = Boolean(install.guide);
+  }, [install.guide]);
   const sections = [
     { id: "models", label: "Models" },
     { id: "connections", label: "Connections" },
@@ -3080,6 +3129,7 @@ function SettingsForm({
     { id: "resources", label: "Resources" },
     { id: "updates", label: "Updates" },
     { id: "notifications", label: "Notifications" },
+    ...(install.available ? [{ id: "app", label: "App" }] : []),
   ];
   function selectSection(next: string) {
     setSection(next);
@@ -3321,6 +3371,33 @@ function SettingsForm({
                 Notifications enabled.
               </p>
             )}
+          </section>
+        </div>
+      )}
+      {section === "app" && (
+        <div
+          role="tabpanel"
+          id="settings-panel-app"
+          aria-labelledby="settings-tab-app"
+        >
+          <header className="workspace-settings-heading">
+            <h3>Workspace app</h3>
+            <p className="muted">Open Workspace from your Home Screen.</p>
+          </header>
+          <section
+            className="workspace-settings-card"
+            aria-label="App installation"
+          >
+            <button
+              type="button"
+              className="secondary"
+              ref={installButton}
+              onClick={install.open}
+              aria-disabled={install.prompting || undefined}
+            >
+              <Download size={16} aria-hidden="true" />
+              Install Workspace
+            </button>
           </section>
         </div>
       )}
