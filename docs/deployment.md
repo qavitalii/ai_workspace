@@ -190,7 +190,7 @@ This explicitly replaces the installation's current data. The script retains the
 
 ### From the browser on a Linux VPS
 
-Open **Settings → Updates** to see the installed version and any available release. Select **Update to v…** to schedule it. Finish running tasks, respond to pending approvals, and close open terminals. Queued tasks resume after the update. The host updater builds both images, creates an encrypted backup, and restarts Workspace. The browser reconnects and displays the result.
+Open **Update available** from the Workspace menu or go to **Settings → Updates**. Select **Install v…** to schedule the release. Finish running tasks and sign-ins, respond to pending approvals, and close open terminals. Queued tasks resume after the update. The host updater builds both images, creates an encrypted backup, and restarts Workspace. The update entry in the menu shows progress and opens the status. Once Workspace reconnects and reports that the update is installed, select **Reload Workspace** to load the new version. The page returns to **Updates** and shows the installed version.
 
 New root-managed Linux VPS installations with systemd enable browser updates during setup. For an existing VPS, run this once from the installation directory:
 

@@ -125,7 +125,10 @@ describe("browser update API", () => {
       expect(
         JSON.parse(readFileSync(path.join(requests, "update.json"), "utf8")),
       ).toEqual(release);
-      expect((await get()).json().phase).toBe("waiting");
+      expect((await get()).json()).toMatchObject({
+        phase: "waiting",
+        target: release,
+      });
 
       save("waiting");
       expect(

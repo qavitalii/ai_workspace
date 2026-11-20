@@ -3,7 +3,11 @@ import { AccountSwitcher } from "./AccountSwitcher";
 import { ActivityLog } from "./ActivityLog";
 import { SshSettings, SshAccess } from "./SshSettings";
 import { SkillsSettings } from "./SkillsSettings";
-import { UpdateSettings, useWorkspaceUpdates } from "./UpdateSettings";
+import {
+  UpdateSettings,
+  updateReturnKey,
+  useWorkspaceUpdates,
+} from "./UpdateSettings";
 import { RemovalConfirmation } from "./FolderActions";
 import { Select } from "./Select";
 import { ChatModelPicker } from "./ChatModelPicker";
@@ -65,6 +69,7 @@ import {
   ArrowRightLeft,
   LoaderCircle,
   Download,
+  ArrowDownToLine,
   FileText,
   Image as ImageIcon,
   Activity,
@@ -273,6 +278,7 @@ function Login({ onLogin }: { onLogin: () => void }) {
   );
 }
 export function App() {
+  const returnToUpdates = history.state?.[updateReturnKey] === true;
   const [me, setMe] = useState<any>(null),
     [loading, setLoading] = useState(true),
     [overview, setOverview] = useState<any>({
@@ -291,8 +297,10 @@ export function App() {
     [viewingWorkspace, setViewingWorkspace] = useState<any>(null),
     [newProjectId, setNewProjectId] = useState<string | null>(null),
     [detail, setDetail] = useState<any>(null),
-    [modal, setModal] = useState(""),
-    [settingsStart, setSettingsStart] = useState("models"),
+    [modal, setModal] = useState(returnToUpdates ? "settings" : ""),
+    [settingsStart, setSettingsStart] = useState(
+      returnToUpdates ? "updates" : "models",
+    ),
     [editingChat, setEditingChat] = useState<any>(null),
     [chatActionBusy, setChatActionBusy] = useState(false),
     [editingProject, setEditingProject] = useState<any>(null),
@@ -319,12 +327,6 @@ export function App() {
       settingsButton.current?.focus();
     }
   }, [mobile, install.showMenuEntry, install.guide]);
-  const updateAvailable =
-    updates.status?.updater === "ready" &&
-    !updates.connectionLost &&
-    Boolean(updates.status.available) &&
-    !updates.status.checkFailed &&
-    !["waiting", "updating"].includes(updates.status.phase);
   const [text, setText] = useState(""),
     [drafts, setDrafts] = useState<any[]>([]),
     [sending, setSending] = useState(false),
@@ -475,6 +477,10 @@ export function App() {
     }
   }
   useEffect(() => {
+    if (history.state?.[updateReturnKey]) {
+      const { [updateReturnKey]: _returnToUpdates, ...state } = history.state;
+      history.replaceState(state, "");
+    }
     void refresh();
   }, []);
   useEffect(() => {
@@ -898,20 +904,26 @@ export function App() {
               Install Workspace
             </button>
           )}
+          {updates.shortcut && (
+            <button
+              onClick={() => {
+                setSettingsStart("updates");
+                setModal("settings");
+              }}
+            >
+              <ArrowDownToLine size={17} aria-hidden="true" />
+              {updates.shortcut}
+            </button>
+          )}
           <button
             ref={settingsButton}
             onClick={() => {
-              setSettingsStart(updateAvailable ? "updates" : "models");
+              setSettingsStart("models");
               setModal("settings");
             }}
           >
             <Settings size={17} />
             Settings
-            {updateAvailable && (
-              <span className="count" title="Workspace update available">
-                Update
-              </span>
-            )}
           </button>
           <div className="owner">
             <span className="avatar">Y</span>

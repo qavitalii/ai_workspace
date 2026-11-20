@@ -1793,6 +1793,26 @@ input[type="file"]::file-selector-button {
   gap: 8px;
   margin-top: 14px;
 }
+.workspace-update-status {
+  display: grid;
+  gap: 5px;
+}
+.workspace-update-status:focus-visible {
+  outline: 2px solid #959595;
+  outline-offset: 4px;
+  border-radius: 4px;
+}
+.workspace-update-status strong {
+  font-size: 13px;
+  font-weight: 600;
+}
+.workspace-update-status p {
+  margin: 0;
+  line-height: 1.5;
+}
+.workspace-update-actions {
+  flex-wrap: wrap;
+}
 .settings-layout .provider-defaults-grid {
   gap: 12px;
 }
