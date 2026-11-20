@@ -18,6 +18,7 @@ import websocket from "@fastify/websocket";
 import rateLimit from "@fastify/rate-limit";
 import serveStatic from "@fastify/static";
 import { inspectWorkspace } from "./files.js";
+import { rasterImageFormat, rasterMime } from "../raster-image.js";
 import { acquireWorkspace, releaseWorkspace } from "./leases.js";
 import { randomUUID } from "node:crypto";
 import { createReadStream, createWriteStream } from "node:fs";
@@ -132,6 +133,32 @@ async function idle(id: string, connection: Pick<typeof db, "query"> = db) {
 export async function createApp() {
   const resources = createResourceMonitor();
   const terminalCleanups = new Set<() => Promise<void>>();
+  const inlineImageQueue: Array<() => void> = [];
+  let inlineImageReads = 0;
+  async function reserveInlineImageRead() {
+    // Inline images load automatically. Limit concurrent Docker reads and
+    // keep the slot until the response has handed off its buffered file.
+    if (inlineImageReads >= 2) {
+      if (inlineImageQueue.length >= 24)
+        throw Object.assign(
+          new Error("Too many images are opening. Try again shortly."),
+          {
+            statusCode: 503,
+          },
+        );
+      await new Promise<void>((resolve) => inlineImageQueue.push(resolve));
+    } else {
+      inlineImageReads++;
+    }
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const next = inlineImageQueue.shift();
+      if (next) next();
+      else inlineImageReads--;
+    };
+  }
   const app = Fastify({
     logger: {
       level: "info",
@@ -1235,20 +1262,53 @@ export async function createApp() {
   app.get("/api/chats/:id/file", async (req, reply) => {
     const id = idOf(req);
     await chatBy(id);
-    const p = z
-      .string()
-      .min(1)
-      .max(1000)
-      .parse((req.query as any).path);
-    const data = await inspectWorkspace(id, p, "file");
-    reply
-      .header("Cache-Control", "no-store")
-      .header(
-        "Content-Disposition",
-        "attachment; filename*=UTF-8''" + encodeURIComponent(path.basename(p)),
-      )
-      .type("application/octet-stream");
-    return reply.send(data);
+    const file = z
+      .object({
+        path: z.string().min(1).max(1000),
+        inline: z.literal("1").optional(),
+      })
+      .parse(req.query);
+    const release = file.inline ? await reserveInlineImageRead() : undefined;
+    try {
+      if (reply.raw.destroyed) {
+        release?.();
+        return;
+      }
+      const data = await inspectWorkspace(id, file.path, "file");
+      let mime = "application/octet-stream";
+      if (file.inline) {
+        const format = rasterImageFormat(data);
+        if (!format)
+          throw Object.assign(
+            new Error("This file cannot be displayed as an image."),
+            {
+              statusCode: 415,
+            },
+          );
+        mime = rasterMime[format];
+      }
+      if (release) {
+        if (reply.raw.destroyed) {
+          release();
+          return;
+        }
+        reply.raw.once("finish", release);
+        reply.raw.once("close", release);
+      }
+      return reply
+        .header("Cache-Control", "no-store")
+        .header(
+          "Content-Disposition",
+          (file.inline ? "inline" : "attachment") +
+            "; filename*=UTF-8''" +
+            encodeURIComponent(path.basename(file.path)),
+        )
+        .type(mime)
+        .send(data);
+    } catch (error) {
+      release?.();
+      throw error;
+    }
   });
   app.get("/api/chats/:id/diff", async (req) => {
     const chat = await chatBy(idOf(req));

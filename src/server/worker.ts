@@ -104,11 +104,13 @@ export async function runJob(job: any) {
   const chat = (
     await db.query("SELECT * FROM chats WHERE id=$1", [job.chat_id])
   ).rows[0];
+  const generatedImages = new Set<string>();
   async function done(state: string, error?: string) {
     if (finished) return;
     finished = true;
     await runtime?.stop();
     try {
+      const replyId = randomUUID();
       if (text) {
         // Final answers replace their persisted streaming fragments, preserving
         // content while freeing the duplicated event payload and row overhead.
@@ -128,7 +130,7 @@ export async function runJob(job: any) {
           );
           await c.query(
             "INSERT INTO messages(id,chat_id,role,content,provider) VALUES($1,$2,$3,$4,$5)",
-            [randomUUID(), chat.id, "assistant", text, chat.provider],
+            [replyId, chat.id, "assistant", text, chat.provider],
           );
           await c.query("UPDATE output_storage SET limit_bytes=$1 WHERE id=1", [
             budget.limit_bytes,
@@ -145,6 +147,28 @@ export async function runJob(job: any) {
         chat.id,
         summaryFrom(history, state),
       ]);
+      let links = "";
+      let imageNumber = 0;
+      for (const name of generatedImages) {
+        const href = `/api/chats/${chat.id}/file?path=${encodeURIComponent(name)}`;
+        const number = generatedImages.size > 1 ? ` ${++imageNumber}` : "";
+        const format = name.slice(name.lastIndexOf(".") + 1).toUpperCase();
+        const link = `\n\n[Download generated image${number} (${format})](${href})`;
+        // Validated names, IDs and labels are ASCII.
+        if (textBytes + links.length + link.length > MAX_RESPONSE_BYTES) break;
+        links += link;
+      }
+      if (links) {
+        try {
+          await db.query(
+            "INSERT INTO messages(id,chat_id,role,content,provider) VALUES($1,$2,$3,$4,$5) ON CONFLICT (id) DO UPDATE SET content=EXCLUDED.content",
+            [replyId, chat.id, "assistant", text + links, chat.provider],
+          );
+        } catch (err) {
+          // Files remain available in the working folder if chat output is full.
+          if (!isOutputLimit(err)) throw err;
+        }
+      }
     } catch (err: any) {
       state = "failed";
       error = isOutputLimit(err)
@@ -210,6 +234,14 @@ export async function runJob(job: any) {
   }
   async function handle(e: AgentEvent) {
     if (finished) return;
+    if (e.type === "generated_image") {
+      if (
+        typeof e.name === "string" &&
+        /^generated-image-[0-9a-f-]{36}\.(png|jpg|webp|gif)$/.test(e.name)
+      )
+        generatedImages.add(e.name);
+      return;
+    }
     if (e.type === "github_sync") {
       const runner = runtime;
       if (!runner || typeof e.id !== "string" || !/^[0-9a-f-]{36}$/i.test(e.id))
@@ -362,7 +394,10 @@ export async function runJob(job: any) {
     }
     if (e.type !== "delta") await event(chat.id, job.id, e.type, e);
     if (e.type === "completed") {
-      if (!text) text = fragment;
+      if (!text) {
+        text = fragment;
+        textBytes = fragmentBytes;
+      }
       await done("completed");
     }
     if (e.type === "failed" || e.type === "exit")

@@ -1,12 +1,17 @@
 import { buildQuestionAnswers } from "../src/question-answers";
 import { it, expect } from "vitest";
 import { spawn, execFileSync } from "node:child_process";
-import { createInterface } from "node:readline";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
+import { tmpdir } from "node:os";
+import { chmod, mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { consumeRunnerOutput } from "../src/server/runner-output";
 import type { RunInput } from "../src/shared";
 
-async function run(input: RunInput | { type: "usage"; provider: "codex" }) {
+async function run(
+  input: RunInput | { type: "usage"; provider: "codex" },
+  outputFolder?: string,
+) {
   const name = "workspace-protocol-" + randomUUID();
   const proc = spawn(
     "docker",
@@ -20,6 +25,7 @@ async function run(input: RunInput | { type: "usage"; provider: "codex" }) {
       name,
       "-v",
       `${path.resolve("tests/fixtures")}:/fixtures:ro`,
+      ...(outputFolder ? ["-v", `${outputFolder}:/workspace`] : []),
       "--entrypoint",
       "/bin/sh",
       process.env.RUNNER_IMAGE || "ai-workspace-runner:0.1.0",
@@ -45,8 +51,17 @@ async function run(input: RunInput | { type: "usage"; provider: "codex" }) {
         clearTimeout(timer);
         reject(new Error("Early exit: " + stderr));
       });
-      createInterface({ input: proc.stdout }).on("line", (line) => {
-        const e = JSON.parse(line);
+      // The Docker CLI gives us demultiplexed stdout. Frame each chunk so the
+      // test exercises the same event size check as the server.
+      async function* frames() {
+        for await (const chunk of proc.stdout) {
+          const header = Buffer.alloc(8);
+          header[0] = 1;
+          header.writeUInt32BE(chunk.length, 4);
+          yield Buffer.concat([header, chunk]);
+        }
+      }
+      void consumeRunnerOutput(frames(), (e) => {
         events.push(e);
         if (e.type === "question")
           proc.stdin.write(
@@ -84,6 +99,9 @@ async function run(input: RunInput | { type: "usage"; provider: "codex" }) {
           clearTimeout(timer);
           reject(new Error(JSON.stringify(events)));
         }
+      }).catch((error) => {
+        clearTimeout(timer);
+        reject(error);
       });
       proc.stdin.write(
         JSON.stringify("type" in input ? input : { type: "start", input }) +
@@ -98,6 +116,48 @@ async function run(input: RunInput | { type: "usage"; provider: "codex" }) {
     proc.kill();
   }
 }
+
+it.skipIf(process.env.DOCKER_TESTS !== "1")(
+  "saves large inline, file-backed, and MCP images before the job completes",
+  async () => {
+    const mount = await mkdtemp(path.join(tmpdir(), "workspace-images-"));
+    try {
+      await chmod(mount, 0o777);
+      const events = await run(
+        {
+          provider: "codex",
+          prompt: "Generate a large image",
+          autonomous: true,
+          attachments: [],
+        },
+        mount,
+      );
+      const names = events
+        .filter((e) => e.type === "generated_image")
+        .map((e) => e.name);
+      expect(names).toHaveLength(3);
+      expect(await readdir(mount)).toEqual([...names].sort());
+      const bytes = await Promise.all(
+        names.map((name) => readFile(path.join(mount, name))),
+      );
+      expect(bytes[0].length).toBeGreaterThan(1024 ** 2);
+      expect(bytes[0].subarray(0, 8)).toEqual(
+        Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+      );
+      expect(bytes[1].equals(bytes[0]) && bytes[2].equals(bytes[0])).toBe(true);
+      expect(events.filter((e) => e.type === "warning")).toHaveLength(1);
+      expect(
+        events.some(
+          (e) => e.type === "delta" && e.text === "Image generation complete.",
+        ),
+      ).toBe(true);
+      expect(events.at(-1)?.type).toBe("completed");
+    } finally {
+      await rm(mount, { recursive: true, force: true });
+    }
+  },
+  30000,
+);
 it.skipIf(process.env.DOCKER_TESTS !== "1")(
   "bridges native plans, questions, execution mode, compaction and review without inference",
   async () => {

@@ -1,6 +1,7 @@
 import { ChangesPanel } from "./ChangesPanel";
 import { AccountSwitcher } from "./AccountSwitcher";
 import { ActivityLog } from "./ActivityLog";
+import { ChatMarkdown } from "./ChatMarkdown";
 import { SshSettings, SshAccess } from "./SshSettings";
 import { SkillsSettings } from "./SkillsSettings";
 import {
@@ -75,8 +76,6 @@ import {
   Activity,
   CircleHelp,
 } from "lucide-react";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
 import { api, upload, socketUrl } from "./api";
 import { ServerSettings } from "./ServerSettings";
 import { ProjectWorkspaces } from "./ProjectWorkspaces";
@@ -177,30 +176,6 @@ function Field({ label, children }: { label: string; children: ReactNode }) {
       <span>{label}</span>
       {children}
     </label>
-  );
-}
-function Markdown({ text }: { text: string }) {
-  return (
-    <div className="markdown">
-      <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
-        components={{
-          a: ({ children, ...p }) => (
-            <a {...p} target="_blank" rel="noopener noreferrer">
-              {children}
-            </a>
-          ),
-          img: ({ src, alt }) =>
-            src?.startsWith("/api/") ? (
-              <img src={src} alt={alt} />
-            ) : (
-              <span>[Image: {alt}]</span>
-            ),
-        }}
-      >
-        {text}
-      </ReactMarkdown>
-    </div>
   );
 }
 function Login({ onLogin }: { onLogin: () => void }) {
@@ -1294,7 +1269,10 @@ export function App() {
                           })}
                         </time>
                       </div>
-                      <Markdown text={m.content} />
+                      <ChatMarkdown
+                        text={m.content}
+                        chatId={m.role === "assistant" ? chat.id : undefined}
+                      />
                       <div className="message-files">
                         {detail.attachments
                           .filter((f: any) => f.message_id === m.id)
@@ -1326,7 +1304,8 @@ export function App() {
                           <LoaderCircle size={13} className="spin" />
                         )}
                       </div>
-                      <Markdown
+                      <ChatMarkdown
+                        chatId={chat.id}
                         text={
                           streams[job.id] ||
                           (job.state === "waiting_approval"

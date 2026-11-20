@@ -11,6 +11,7 @@ import {
 } from "../src/server/folders";
 import { copyFolderUpload } from "../src/server/folder-routes";
 import { inspectDirectory } from "../src/server/files";
+import * as workspaceFiles from "../src/server/files";
 import {
   beforeAll,
   afterAll,
@@ -1350,6 +1351,61 @@ esac
     await runJob(job);
     return { job, runtime, emit };
   }
+  it("appends deduplicated image download links to the saved chat reply", async () => {
+    const { job, emit } = await fakeJob();
+    try {
+      const first = `generated-image-${randomUUID()}.png`;
+      const second = `generated-image-${randomUUID()}.webp`;
+      await emit({ type: "generated_image", name: first });
+      await emit({ type: "generated_image", name: first });
+      await emit({ type: "generated_image", name: "../private.png" });
+      await emit({ type: "delta", text: "Ready." });
+      await emit({ type: "generated_image", name: second });
+      await emit({ type: "completed" });
+      const response = await app.inject({ url: `/api/chats/${chat}`, headers });
+      expect(response.statusCode).toBe(200);
+      const saved = response
+        .json()
+        .messages.find((m: any) => m.role === "assistant");
+      expect(saved.content).toBe(
+        `Ready.\n\n[Download generated image 1 (PNG)](/api/chats/${chat}/file?path=${first})` +
+          `\n\n[Download generated image 2 (WEBP)](/api/chats/${chat}/file?path=${second})`,
+      );
+      expect(
+        (await db.query("SELECT state FROM jobs WHERE id=$1", [job.id])).rows[0]
+          .state,
+      ).toBe("completed");
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
+  it("keeps the job completed if its optional image links exceed the output budget", async () => {
+    const { job, emit } = await fakeJob();
+    try {
+      await emit({ type: "delta", text: "Ready." });
+      const { usedBytes } = await outputStorage();
+      await db.query("UPDATE output_storage SET limit_bytes=$1 WHERE id=1", [
+        usedBytes + 350,
+      ]);
+      for (let i = 0; i < 8; i++)
+        await emit({
+          type: "generated_image",
+          name: `generated-image-${randomUUID()}.png`,
+        });
+      await emit({ type: "completed" });
+      const saved = (
+        await app.inject({ url: `/api/chats/${chat}`, headers })
+      ).json();
+      expect(
+        saved.messages.find((m: any) => m.role === "assistant").content,
+      ).toBe("Ready.");
+      expect(saved.jobs.find((j: any) => j.id === job.id).state).toBe(
+        "completed",
+      );
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
   it("stores complete correlated approval details for reload and rejects blind approval", async () => {
     const { job, runtime, emit } = await fakeJob();
     try {
@@ -2726,6 +2782,97 @@ esac
     );
     expect((await create()).json().workspace_id).toBe(w.id);
   });
+  it("limits the number of simultaneous inline image reads", async () => {
+    let activeReads = 0;
+    let peakReads = 0;
+    const source = vi
+      .spyOn(workspaceFiles, "inspectWorkspace")
+      .mockImplementation(async (_chat, relative) => {
+        peakReads = Math.max(peakReads, ++activeReads);
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        activeReads--;
+        return relative === "fake.png"
+          ? Buffer.from("not an image")
+          : Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+      });
+    try {
+      const responses = await Promise.all(
+        ["one.png", "fake.png", "two.png", "three.png", "four.png"].map(
+          (file) =>
+            app.inject({
+              url: `/api/chats/${chat}/file?path=${file}&inline=1`,
+              headers,
+            }),
+        ),
+      );
+      expect(peakReads).toBe(2);
+      expect(responses.map((response) => response.statusCode)).toEqual([
+        200, 415, 200, 200, 200,
+      ]);
+    } finally {
+      source.mockRestore();
+    }
+  });
+
+  it.skipIf(process.env.DOCKER_TESTS !== "1")(
+    "opens authentic raster files inline and preserves the normal download route",
+    async () => {
+      const name = "render.png";
+      const png = Buffer.from(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aKZQAAAAASUVORK5CYII=",
+        "base64",
+      );
+      const folder = workspacePath(chat);
+      await mkdir(folder, { recursive: true });
+      await writeFile(path.join(folder, name), png);
+      await writeFile(
+        path.join(folder, "fake.png"),
+        "<html><script>console.log(1)</script></html>",
+      );
+      await writeFile(
+        path.join(folder, "vector.svg"),
+        '<svg xmlns="http://www.w3.org/2000/svg"/>',
+      );
+      const file = (relative: string) =>
+        `/api/chats/${chat}/file?path=${encodeURIComponent(relative)}`;
+      const inline = await app.inject({
+        url: file(name) + "&inline=1",
+        headers,
+      });
+      expect(inline.statusCode).toBe(200);
+      expect(inline.headers).toMatchObject({
+        "content-type": "image/png",
+        "content-disposition": "inline; filename*=UTF-8''render.png",
+        "x-content-type-options": "nosniff",
+        "cache-control": "no-store",
+      });
+      expect(inline.rawPayload.equals(png)).toBe(true);
+      const download = await app.inject({ url: file(name), headers });
+      expect(download.statusCode).toBe(200);
+      expect(download.headers).toMatchObject({
+        "content-type": "application/octet-stream",
+        "content-disposition": "attachment; filename*=UTF-8''render.png",
+      });
+      expect(download.rawPayload.equals(png)).toBe(true);
+      expect(
+        (await app.inject({ url: file(name) + "&inline=1" })).statusCode,
+      ).toBe(401);
+      for (const invalid of ["fake.png", "vector.svg"])
+        expect(
+          (await app.inject({ url: file(invalid) + "&inline=1", headers }))
+            .statusCode,
+        ).toBe(415);
+      expect(
+        (
+          await app.inject({
+            url: file("../render.png") + "&inline=1",
+            headers,
+          })
+        ).statusCode,
+      ).toBe(400);
+    },
+    30000,
+  );
   it.skipIf(process.env.DOCKER_TESTS !== "1")(
     "shares uploaded files through both chats and preserves originals on deletion",
     async () => {
