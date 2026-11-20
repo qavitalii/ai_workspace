@@ -4,12 +4,14 @@ import {
   CheckCircle2,
   GitCompareArrows,
   Plus,
+  RefreshCw,
   Trash2,
   X,
 } from "lucide-react";
 import { useState } from "react";
 import { Select } from "./Select";
 import { api } from "./api";
+import { githubSyncMessage, type GithubSyncResult } from "../shared";
 export function RemovalConfirmation({
   name,
   description,
@@ -62,6 +64,7 @@ export function FolderActions({
   workspace: w,
   onUpdated,
   onOpenChat,
+  syncBranch,
   compact = false,
 }: any) {
   const [review, setReview] = useState<any>(null),
@@ -70,6 +73,7 @@ export function FolderActions({
     [deletion, setDeletion] = useState<any>(null),
     [choices, setChoices] = useState<Record<string, "main" | "copy">>({}),
     [busy, setBusy] = useState(false),
+    [syncing, setSyncing] = useState(false),
     [error, setError] = useState(""),
     [notice, setNotice] = useState("");
   async function run(fn: () => Promise<void>) {
@@ -103,6 +107,36 @@ export function FolderActions({
   return (
     <div className="working-copy-actions">
       <div className="folder-action-buttons">
+        {syncBranch && (
+          <button
+            className={compact ? "text-button" : "secondary"}
+            disabled={busy}
+            title={`Sync from ${syncBranch}`}
+            onClick={() =>
+              run(async () => {
+                setDeletion(null);
+                setSyncing(true);
+                try {
+                  const result = await api<GithubSyncResult>(
+                    `/workspaces/${w.id}/sync`,
+                    {},
+                  );
+                  if (result.status === "updated") setReview(null);
+                  setNotice(githubSyncMessage(result));
+                } finally {
+                  setSyncing(false);
+                }
+              })
+            }
+          >
+            <RefreshCw
+              size={16}
+              aria-hidden="true"
+              className={syncing ? "spin" : undefined}
+            />
+            {syncing ? "Syncing…" : "Sync from GitHub"}
+          </button>
+        )}
         {w.kind === "copy" && (
           <button
             className={compact ? "text-button" : "secondary"}
@@ -110,7 +144,11 @@ export function FolderActions({
             onClick={review ? () => setReview(null) : refresh}
           >
             <GitCompareArrows size={16} />
-            {busy ? "Working…" : review ? "Hide review" : "Review changes"}
+            {busy && !syncing
+              ? "Working…"
+              : review
+                ? "Hide review"
+                : "Review changes"}
           </button>
         )}
         {w.kind !== "main" && (

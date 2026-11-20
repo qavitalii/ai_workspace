@@ -22,10 +22,17 @@ const packageServer = {
 };
 export const packageToolName = (serverName: string) =>
   "mcp__" + serverName + "__install";
+const githubServerName = "workspace_github";
+export const githubSyncToolName = `mcp__${githubServerName}__sync_from_github`;
+const githubServer = (port: number) => ({
+  command: "/usr/local/bin/node",
+  args: ["/app/dist/node/runner/github-sync-tool.js", String(port)],
+});
 
 export function codexIntegrations(
   entries: ProjectIntegration[],
   packageServerName?: string,
+  githubSyncPort?: number,
 ) {
   const args: string[] = [];
   const env: Record<string, string> = {};
@@ -40,6 +47,18 @@ export function codexIntegrations(
       server + '.enabled_tools=["install"]',
       "-c",
       server + '.tools.install.approval_mode="approve"',
+      "-c",
+      server + ".tool_timeout_sec=300",
+    );
+  }
+  if (githubSyncPort) {
+    const server = "mcp_servers." + githubServerName;
+    const { command, args: toolArgs } = githubServer(githubSyncPort);
+    args.push(
+      "-c",
+      server + ".command=" + JSON.stringify(command),
+      "-c",
+      server + ".args=" + JSON.stringify(toolArgs),
       "-c",
       server + ".tool_timeout_sec=300",
     );
@@ -65,6 +84,7 @@ export async function claudeIntegrations(
   approvalBridge: boolean,
   root = "/workspace",
   packageServerName?: string,
+  githubSyncPort?: number,
 ) {
   const args: string[] = [];
   const servers: Record<string, unknown> = {};
@@ -77,6 +97,7 @@ export async function claudeIntegrations(
     servers[packageServerName] = packageServer;
     args.push("--allowedTools", packageToolName(packageServerName));
   }
+  if (githubSyncPort) servers[githubServerName] = githubServer(githubSyncPort);
   for (const entry of entries) {
     if (entry.kind === "plugin") {
       const dir = await realpath(path.join(root, entry.target));

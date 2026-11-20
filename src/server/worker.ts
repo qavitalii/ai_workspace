@@ -9,6 +9,7 @@ import { db, transaction } from "./db.js";
 import { launch, cleanOrphans, type Running } from "./runtime.js";
 import { chatServers } from "./ssh-runtime.js";
 import { initializeWorkspace, git } from "./git.js";
+import { syncFromGithub } from "./github-sync.js";
 import { config } from "./config.js";
 import { concurrentTasks, modelDefaults } from "./settings.js";
 import { updatePhase } from "./updates.js";
@@ -17,7 +18,7 @@ import { isOutputLimit, outputLimitMessage } from "./output-storage.js";
 import { MAX_RESPONSE_BYTES } from "./runner-output.js";
 import { redact } from "./security.js";
 import { event, notify, bus } from "./events.js";
-import type { AgentEvent } from "../shared.js";
+import { githubSyncMessage, type AgentEvent } from "../shared.js";
 import { packageNames } from "../runner/package-request.js";
 export const active = new Map<string, Running>();
 let ticking = false,
@@ -94,6 +95,7 @@ export async function claim() {
   });
 }
 export async function runJob(job: any) {
+  let syncWorkspaceId: string | undefined;
   let runtime: Running | undefined,
     finished = false,
     text = "",
@@ -208,6 +210,47 @@ export async function runJob(job: any) {
   }
   async function handle(e: AgentEvent) {
     if (finished) return;
+    if (e.type === "github_sync") {
+      const runner = runtime;
+      if (!runner || typeof e.id !== "string" || !/^[0-9a-f-]{36}$/i.test(e.id))
+        return;
+      let ok = false;
+      let message = "GitHub sync is unavailable in this session.";
+      if (syncWorkspaceId && runner.withPausedWorkspace) {
+        try {
+          const result = await syncFromGithub(syncWorkspaceId, (operation) =>
+            runner.withPausedWorkspace!(async () => {
+              const current = (
+                await db.query(
+                  "SELECT state,cancel_requested FROM jobs WHERE id=$1",
+                  [job.id],
+                )
+              ).rows[0];
+              if (
+                finished ||
+                current?.state !== "running" ||
+                current.cancel_requested
+              )
+                throw Object.assign(
+                  new Error("This task is no longer running."),
+                  { statusCode: 409 },
+                );
+              return operation();
+            }),
+          );
+          message = githubSyncMessage(result);
+          ok = true;
+          if (result.status === "updated") bus.emit("workspace-sync", chat.id);
+        } catch (error: any) {
+          message =
+            error.statusCode === 409
+              ? error.message
+              : "Workspace could not sync this folder. Check the folder’s Sync from GitHub action.";
+        }
+      }
+      runner.send({ type: "github_sync_result", id: e.id, message, ok });
+      return;
+    }
     const fragment =
       e.type === "delta"
         ? redact(String(e.text || ""))
@@ -400,6 +443,19 @@ export async function runJob(job: any) {
         "\n\nThe Workspace owner approved the plan. Continue in execution mode. Request permission for actions as usual.\n\nApproved plan:\n" +
         approvedPlan;
     const workingFolder = await chatWorkspace(chat.id);
+    if (
+      workingFolder.project_id &&
+      chat.mode !== "plan" &&
+      !shortcut &&
+      !workingFolder.resolution_operation_id
+    ) {
+      const project = (
+        await db.query("SELECT repo FROM projects WHERE id=$1", [
+          workingFolder.project_id,
+        ])
+      ).rows[0];
+      if (project?.repo) syncWorkspaceId = workingFolder.id;
+    }
     const servers = await chatServers(chat.id);
     if (servers.length)
       prompt +=
@@ -499,6 +555,7 @@ export async function runJob(job: any) {
       type: "start",
       input: {
         provider: chat.provider,
+        githubSync: !!syncWorkspaceId,
         integrations: await runIntegrations(chat.project_id, chat.provider),
         prompt:
           (shortcut?.name === "plan"

@@ -63,7 +63,7 @@ export function ProjectSettings({
             <h3>GitHub access</h3>
             <p className="muted">
               {project.github_configured
-                ? "A token is saved for this project only. Leave the field empty to keep it."
+                ? "All chats and agents in this project share the saved GitHub access for Workspace actions. Leave the field empty to keep it."
                 : "No token is saved. Public repositories can be read without one; private access and publishing need a token."}
             </p>
             {!removeToken && (

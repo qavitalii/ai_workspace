@@ -76,6 +76,7 @@ All `/api/*` routes except `/login` and `/health` require an HttpOnly session co
 | `POST /api/projects`, `PATCH /api/projects/:id` | Connect a GitHub URL/`owner/repository`, or create a files-only project with `name` and empty/omitted `repo`; rename and manage project-specific tokens |
 | `GET /api/projects/:id/workspaces`, `POST /api/projects/:id/main-workspace` | List persistent folders; explicitly choose the main folder (`workspace_id`, or null for a fresh main folder) |
 | `POST /api/workspaces/:id/initialize` | Prepare the selected folder under an exclusive lease |
+| `POST /api/workspaces/:id/sync` | Sync the selected Git folder from its project’s GitHub base branch under an exclusive lease |
 | `GET/POST /api/workspaces/:id/files`, `GET /api/workspaces/:id/file` | Browse, upload and download working files independently of any chat |
 | `GET /api/workspaces/:id/attachments`, `POST /api/workspaces/:id/attachments/:attachmentId/save` | Original attachment library and explicit copy into working files |
 | `POST /api/accounts` | Create a Codex or Claude account record |

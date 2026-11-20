@@ -38,6 +38,7 @@ export type Running = {
   awsWarning?: string;
   send: (c: RunnerCommand) => void;
   stop: () => Promise<void>;
+  withPausedWorkspace?: <T>(operation: () => Promise<T>) => Promise<T>;
   /** After stop: whether the account's sign-in and session state was saved. */
   profileSaved?: () => Promise<boolean>;
 };
@@ -241,6 +242,44 @@ export async function launch(
   let stopped = false;
   let exited = false;
   let stopping: Promise<void> | undefined;
+  let pausedWork: Promise<unknown> | undefined;
+  let containerPaused = false;
+  async function withPausedWorkspace<T>(operation: () => Promise<T>) {
+    if (stopped || exited || pausedWork)
+      throw Object.assign(
+        new Error("The agent is no longer available to sync this folder."),
+        { statusCode: 409 },
+      );
+    const pending = (async () => {
+      await c.pause().catch(async (error) => {
+        containerPaused = !!(await c.inspect().catch(() => null))?.State.Paused;
+        throw error;
+      });
+      containerPaused = true;
+      try {
+        return await operation();
+      } finally {
+        await c.unpause().catch(() => c.unpause());
+        containerPaused = false;
+      }
+    })();
+    pausedWork = pending;
+    try {
+      return await pending;
+    } finally {
+      pausedWork = undefined;
+      if (containerPaused && !stopped)
+        void stop()
+          .finally(() =>
+            onEvent({
+              type: "failed",
+              error:
+                "Could not resume the agent after GitHub sync. Check the working folder before retrying.",
+            }),
+          )
+          .catch(() => {});
+    }
+  }
   function stop() {
     if (stopping) return stopping;
     stopped = true;
@@ -248,6 +287,9 @@ export async function launch(
     stopping = (async () => {
       let gone = false;
       try {
+        await pausedWork?.catch(() => {});
+        // Recover if the first unpause failed while the container was stopping.
+        if (containerPaused) await c.unpause().catch(() => {});
         await c.stop({ t: 5 }).catch(() => {});
         await removeDockerResource(() => c.remove({ force: true }));
         gone = true;
@@ -312,6 +354,7 @@ export async function launch(
     id: c.id,
     aws: !!aws,
     awsWarning,
+    withPausedWorkspace,
     send(c) {
       if (!stopped) stream.write(JSON.stringify(c) + "\n");
     },

@@ -3,7 +3,9 @@ import {
   codexPluginHome,
   claudeIntegrations,
   packageToolName,
+  githubSyncToolName,
 } from "./integrations.js";
+import { githubSyncBridge } from "./github-sync-bridge.js";
 import { drainPackageAudit } from "./package-audit.js";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createInterface } from "node:readline";
@@ -23,6 +25,7 @@ import { quotaError, type RunInput, type RunnerCommand } from "../shared.js";
 import { claudeSubscriptionUsage } from "../usage.js";
 const emit = (data: unknown) =>
   process.stdout.write(JSON.stringify(data) + "\n");
+const githubSync = githubSyncBridge((id) => emit({ type: "github_sync", id }));
 function flushPackageAudit() {
   if (process.env.WORKSPACE_SYSTEM_PACKAGES === "1")
     for (const packages of drainPackageAudit())
@@ -106,8 +109,13 @@ function processChild(
 async function codex(
   entries: NonNullable<RunInput["integrations"]> = [],
   packageServerName?: string,
+  githubSyncPort?: number,
 ) {
-  const integrations = codexIntegrations(entries, packageServerName);
+  const integrations = codexIntegrations(
+    entries,
+    packageServerName,
+    githubSyncPort,
+  );
   await mkdir("/profile/.codex", { recursive: true });
   const home = await codexPluginHome(entries);
   if (home) {
@@ -263,16 +271,19 @@ function packageServerFor(input: RunInput) {
     return "workspace_packages_" + randomBytes(8).toString("hex");
 }
 function executionPrompt(input: RunInput, packageServerName?: string) {
-  return packageServerName
-    ? input.prompt +
-        "\n\nIf this task needs a system package, call " +
-        packageToolName(packageServerName) +
-        " with its Debian package name, for example ffmpeg. The tool is the same installer as workspace-install and avoids shell permission prompts. Installed packages last only for this run."
-    : input.prompt;
+  let prompt = input.prompt;
+  if (packageServerName)
+    prompt +=
+      "\n\nIf this task needs a system package, call " +
+      packageToolName(packageServerName) +
+      " with its Debian package name, for example ffmpeg. The tool is the same installer as workspace-install and avoids shell permission prompts. Installed packages last only for this run.";
+  if (input.githubSync)
+    prompt += `\n\nWhen the user asks to update this working folder from GitHub, call ${githubSyncToolName} before editing files. It uses the project’s saved GitHub access and stops for local edits or conflicts. Report blocked syncs without resetting or stashing changes.`;
+  return prompt;
 }
-async function runCodex(input: RunInput) {
+async function runCodex(input: RunInput, githubSyncPort?: number) {
   const packageServerName = packageServerFor(input);
-  await codex(input.integrations, packageServerName);
+  await codex(input.integrations, packageServerName, githubSyncPort);
   const args: any = {
     cwd: "/workspace",
     approvalPolicy:
@@ -359,7 +370,7 @@ async function readClaudePlan(directory: string) {
     // The native session can still supply the plan if the file was unavailable.
   }
 }
-async function runClaude(input: RunInput) {
+async function runClaude(input: RunInput, githubSyncPort?: number) {
   const packageServerName = packageServerFor(input);
   const plansDirectory =
     input.mode === "plan"
@@ -471,6 +482,7 @@ async function runClaude(input: RunInput) {
       !input.autonomous || input.mode === "plan",
       "/workspace",
       packageServerName,
+      githubSyncPort,
     )),
   );
   processChild("claude", args, (line) => {
@@ -678,9 +690,14 @@ createInterface({ input: process.stdin }).on("line", async (line) => {
       compacting = false;
       await mkdir("/profile/.codex", { recursive: true });
       await mkdir("/profile/.claude", { recursive: true });
-      if (c.input.provider === "codex") await runCodex(c.input);
-      else await runClaude(c.input);
+      const githubSyncPort = c.input.githubSync
+        ? await githubSync.start()
+        : undefined;
+      if (c.input.provider === "codex") await runCodex(c.input, githubSyncPort);
+      else await runClaude(c.input, githubSyncPort);
     }
+    if (c.type === "github_sync_result")
+      githubSync.reply(c.id, c.message, c.ok);
     if (c.type === "approve") {
       const mcpId = mcpApprovals.get(c.id);
       if (mcpId !== undefined) {

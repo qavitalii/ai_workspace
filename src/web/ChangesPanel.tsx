@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Check,
   ChevronRight,
@@ -10,8 +10,17 @@ import {
 } from "lucide-react";
 import { api } from "./api";
 import { parseDiff } from "./diff";
+import { githubSyncMessage, type GithubSyncResult } from "../shared";
 
-export function ChangesPanel({ chatId }: { chatId: string }) {
+export function ChangesPanel({
+  chatId,
+  syncFolder,
+  revision: workspaceRevision,
+}: {
+  chatId: string;
+  syncFolder?: string;
+  revision: number;
+}) {
   const [review, setReview] = useState<{
     diff: string;
     pushDiff: string;
@@ -38,8 +47,10 @@ export function ChangesPanel({ chatId }: { chatId: string }) {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
   const [publishing, setPublishing] = useState(false);
+  const [syncing, setSyncing] = useState(false);
   const [revision, setRevision] = useState(0);
   const [raw, setRaw] = useState(false);
+  const reviewRequest = useRef(0);
   const files = useMemo(() => parseDiff(diff), [diff]);
   const fileCount = new Set(files.map((file) => file.path)).size;
   const added = files.reduce((total, f) => total + f.added, 0);
@@ -63,9 +74,11 @@ export function ChangesPanel({ chatId }: { chatId: string }) {
       });
     return () => {
       live = false;
+      reviewRequest.current++;
     };
-  }, [chatId, revision]);
+  }, [chatId, revision, workspaceRevision]);
   async function prepareReview() {
+    const request = ++reviewRequest.current;
     setLoading(true);
     setError("");
     setReview(null);
@@ -74,12 +87,13 @@ export function ChangesPanel({ chatId }: { chatId: string }) {
       const prepared = await api(`/chats/${chatId}/publication-review`, {
         target: view,
       });
+      if (request !== reviewRequest.current) return;
       setReview(prepared);
       setReviewTarget(view);
     } catch (e: any) {
-      setError(e.message);
+      if (request === reviewRequest.current) setError(e.message);
     } finally {
-      setLoading(false);
+      if (request === reviewRequest.current) setLoading(false);
     }
   }
   async function publish(action: string) {
@@ -113,7 +127,25 @@ export function ChangesPanel({ chatId }: { chatId: string }) {
       setPublishing(false);
     }
   }
-  const disabled = publishing || loading || !review;
+  async function sync() {
+    if (!syncFolder || syncing || publishing || loading) return;
+    setSyncing(true);
+    setResult("");
+    setError("");
+    try {
+      const result = await api<GithubSyncResult>(
+        `/workspaces/${syncFolder}/sync`,
+        {},
+      );
+      setResult(githubSyncMessage(result));
+      if (result.status === "updated") setRevision((value) => value + 1);
+    } catch (error: any) {
+      setError(error.message);
+    } finally {
+      setSyncing(false);
+    }
+  }
+  const disabled = publishing || syncing || loading || !review;
   return (
     <section className="changes-panel" aria-label="Code changes">
       <div className="changes-tools">
@@ -132,6 +164,20 @@ export function ChangesPanel({ chatId }: { chatId: string }) {
           Outgoing commits
         </button>
       </div>
+      {syncFolder && (
+        <button
+          className="secondary"
+          disabled={loading || publishing || syncing}
+          onClick={() => void sync()}
+        >
+          <RefreshCw
+            size={16}
+            className={syncing ? "spin" : undefined}
+            aria-hidden="true"
+          />
+          {syncing ? "Syncing…" : "Sync from GitHub"}
+        </button>
+      )}
       <p className="settings-section-note">
         {review && (view === "commit" || reviewTarget === "push")
           ? "Review the prepared changes below before publishing. Later edits require a new review."
@@ -141,7 +187,7 @@ export function ChangesPanel({ chatId }: { chatId: string }) {
       </p>
       <button
         className="secondary"
-        disabled={loading || publishing}
+        disabled={loading || publishing || syncing}
         onClick={() => void prepareReview()}
       >
         {loading

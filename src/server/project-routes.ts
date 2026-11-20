@@ -17,6 +17,7 @@ import { config } from "./config.js";
 import { db, transaction } from "./db.js";
 import { acquireFolder, releaseFolder } from "./leases.js";
 import { initializeFolder } from "./git.js";
+import { syncFromGithub } from "./github-sync.js";
 import { inspectDirectory } from "./files.js";
 import { uploadPath, copyFolderUpload } from "./folder-routes.js";
 import {
@@ -143,6 +144,15 @@ export function projectRoutes(app: FastifyInstance) {
       return await workspaceBy(w.id);
     } finally {
       await releaseFolder(w.id);
+    }
+  });
+  app.post("/api/workspaces/:id/sync", async (req) => {
+    const id = z.uuid().parse((req.params as any).id);
+    await acquireFolder(id, "GitHub sync");
+    try {
+      return await syncFromGithub(id);
+    } finally {
+      await releaseFolder(id);
     }
   });
   app.get("/api/workspaces/:id/files", async (req) => {

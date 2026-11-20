@@ -15,8 +15,19 @@ export type ProjectIntegration = {
   target: string;
   token?: string;
 };
+export type GithubSyncResult = {
+  status: "current" | "updated";
+  sourceBranch: string;
+  commit: string;
+};
+export function githubSyncMessage(result: GithubSyncResult) {
+  return result.status === "updated"
+    ? `Synced from GitHub (${result.sourceBranch}) to ${result.commit.slice(0, 8)}.`
+    : `This folder already includes GitHub’s ${result.sourceBranch} branch.`;
+}
 export type RunInput = {
   integrations?: ProjectIntegration[];
+  githubSync?: boolean;
   provider: Provider;
   prompt: string;
   model?: string;
@@ -29,6 +40,7 @@ export type RunInput = {
 };
 export type RunnerCommand =
   | { type: "start"; input: RunInput }
+  | { type: "github_sync_result"; id: string; message: string; ok: boolean }
   | { type: "approve"; id: string; allow: boolean }
   | {
       type: "answer";

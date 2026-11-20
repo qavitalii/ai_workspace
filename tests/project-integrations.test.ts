@@ -44,6 +44,11 @@ describe("project integrations", () => {
       'mcp_servers.workspace_packages_a85f14.enabled_tools=["install"]',
     );
     expect(packages.args.join(" ")).not.toContain("mcp_servers.ws_docs.tools");
+    const github = codexIntegrations([], undefined, 43210);
+    expect(github.args).toContain(
+      'mcp_servers.workspace_github.args=["/app/dist/node/runner/github-sync-tool.js","43210"]',
+    );
+    expect(github.env).toEqual({});
   });
 
   it("keeps Claude's permission bridge alongside project servers and confines plugin paths", async () => {
@@ -63,6 +68,7 @@ describe("project integrations", () => {
         true,
         root,
         "workspace_packages_a85f14",
+        43210,
       );
       config = args[args.indexOf("--mcp-config") + 1];
       expect(args).toContain(path.join(root, plugin.target));
@@ -86,6 +92,10 @@ describe("project integrations", () => {
         workspace_packages_a85f14: {
           command: "/usr/local/bin/node",
           args: ["/app/dist/node/runner/package-tools.js"],
+        },
+        workspace_github: {
+          command: "/usr/local/bin/node",
+          args: ["/app/dist/node/runner/github-sync-tool.js", "43210"],
         },
       });
       await symlink(path.dirname(root), path.join(root, "outside"));

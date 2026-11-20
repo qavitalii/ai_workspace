@@ -120,7 +120,7 @@ On Linux VPS deployments, metrics describe the runtime host and the filesystem c
 
 Open [Create a fine-grained GitHub token](https://github.com/settings/personal-access-tokens/new), or go to GitHub Settings → Developer settings → Personal access tokens → Fine-grained tokens. Choose a name and expiration, select the repository owner, then **Only select repositories**. Select only the required repositories. Grant `Contents` and `Pull requests` read/write permissions. Click **Generate token** and paste the value into the project’s **Access token** field. GitHub only shows the value at creation. Organization-owned repositories may require administrator approval.
 
-Each project has its own token. Supply it when connecting a repository, or use the project settings button / Settings → Connections to replace or remove it. There is no global token for new projects. Upgrading copies a previously saved global token into existing projects; it never applies it to newly created projects. Each token is encrypted in the database. It is not stored in Git remote URLs or provided to agent containers. Read-only Git inspection and commits run without GitHub credentials. Publishing exports a bundle into a fresh trusted repository before pushing with credentials.
+Set the token once per project. All its chats and agents use the same saved access for Workspace Git actions. Supply it when connecting a repository, or use Project settings → GitHub access to replace or remove it. Upgrading copies a previously saved global token into existing projects. Each token is encrypted in the database and stays out of Git remote URLs and agent containers. Workspace performs authenticated GitHub operations in a trusted helper. Shell Git commands in the agent’s terminal use their own authentication.
 
 For Codex, use Copy code and enter the device code on OpenAI's page. For Claude, open the URL shown by the official CLI and supply the browser code if requested. Never enter OpenAI or Anthropic account passwords into Workspace. Account sign-in is blocked while that account is executing a task.
 
@@ -302,6 +302,8 @@ Workspace keeps each `SKILL.md` and its supporting files together. Each library 
 Select imported skills through `$`; importing does not register them for automatic discovery by the native CLI. Descriptions come from the YAML frontmatter at the beginning of `SKILL.md`, including folded (`>`) and literal (`|`) multiline text. Invalid frontmatter is rejected with an import error.
 
 ### Reviewing and publishing Git changes
+
+Choose **Sync from GitHub** on an initialized project folder or in the chat’s **Changes** panel. Sync updates that folder from the project’s base branch, such as `main`. It can combine compatible committed changes and stops if tracked edits, untracked files, or conflicting commits need attention. Ignored files are kept, including when GitHub adds a colliding path. For a sync during an execution-mode chat, ask the agent to update its working folder from GitHub. Codex and Claude Code can use the same project access through the built-in sync tool. Sync only changes the selected local folder.
 
 The Changes panel opens a local, read-only preview without contacting GitHub or reserving the folder. It remains available while a task is running, so the displayed files may change. New files are listed separately. Choose **Prepare commit review** when the folder is idle to inspect the complete proposed commit, including new files, then enter a message and select **Commit**. Preparing a commit review does not require GitHub access.
 
