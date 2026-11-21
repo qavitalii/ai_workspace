@@ -4,7 +4,7 @@ Never list Codex or any other AI agent as a Git co-author, including in `Co-auth
 
 # Branches and CI
 
-Start each new task in its own branch from up-to-date `main`. Use a separate worktree when the current checkout contains another task’s edits. Run the relevant local checks and complete the review below before pushing the branch and opening a pull request to `main`.
+Start each new task in its own branch from up-to-date `main`. Write the entire branch name as a short kebab-case phrase that describes the task, such as `image-previews` or `main-only-ci`. Use a separate worktree when the current checkout contains another task’s edits. Run the relevant local checks and complete the review below before pushing the branch and opening a pull request to `main`.
 
 GitHub Actions CI runs only on pushes to `main`, including commits added by merging a pull request. Record the local checks and their results in the pull request.
 

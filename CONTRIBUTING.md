@@ -8,7 +8,7 @@ Read the [architecture](docs/architecture.md) and [deployment guide](docs/deploy
 
 ## Branches and CI
 
-Start each task in its own branch from up-to-date `main`. Run the relevant checks locally, complete the review described in [AGENTS.md](AGENTS.md), then push the branch and open a pull request to `main`. Include the results in the pull request description.
+Start each task in its own branch from up-to-date `main`. Write the entire branch name as a short kebab-case phrase that describes the task, such as `image-previews` or `main-only-ci`. Run the relevant checks locally, complete the review described in [AGENTS.md](AGENTS.md), then push the branch and open a pull request to `main`. Include the results in the pull request description.
 
 GitHub Actions runs **Checks** only on pushes to `main`, including pushes created by merging a pull request.
 
