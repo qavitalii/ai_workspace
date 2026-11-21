@@ -22,6 +22,12 @@ mv "$DATA_ROOT" "$DATA_ROOT.before-restore-$(date +%s)"
 mkdir -p "$DATA_ROOT"; chmod 700 "$DATA_ROOT"
 tar -xzf "$work/data.tar.gz" -C "$DATA_ROOT"
 ./ops/compose.sh up -d --wait db
-./ops/compose.sh exec -T db pg_restore -U workspace -d workspace --clean --if-exists --no-owner < "$work/database.dump"
+# Archives from before project packages cannot remove the newer table's foreign keys.
+# Commit the cleanup and restore together, only after pg_restore has emitted all SQL.
+{
+  printf 'BEGIN;\nDROP TABLE IF EXISTS public.project_packages;\n'
+  ./ops/compose.sh exec -T db pg_restore --clean --if-exists --no-owner --file=- < "$work/database.dump" &&
+    printf '\nCOMMIT;\n'
+} | ./ops/compose.sh exec -T db psql -X -q -v ON_ERROR_STOP=1 -U workspace -d workspace
 ./ops/compose.sh up -d --wait server caddy
 echo 'Restored. Inspect interrupted jobs before continuing. Remove retained pre-restore files only after verification.'

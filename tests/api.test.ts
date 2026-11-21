@@ -1,3 +1,4 @@
+import type { InjectOptions } from "fastify";
 import { runIntegrations } from "../src/server/integrations";
 import { prepareAws } from "../src/server/aws";
 import { prepareSkills } from "../src/server/skills";
@@ -96,7 +97,7 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
   beforeEach(async () => {
     config.maxConcurrent = 3;
     await db.query(
-      "TRUNCATE ssh_links,ssh_servers,ssh_keys,workspaces,workspace_leases,publications,push_subscriptions,approvals,events,jobs,attachments,messages,chats,accounts,projects,sessions,owner,settings CASCADE",
+      "TRUNCATE ssh_links,ssh_servers,ssh_keys,workspaces,workspace_leases,publications,push_subscriptions,approvals,events,jobs,attachments,messages,project_packages,chats,accounts,projects,sessions,owner,settings CASCADE",
     );
     await db.query("UPDATE output_storage SET limit_bytes=$1 WHERE id=1", [GB]);
     await db.query("INSERT INTO sessions VALUES($1,now()+interval '1 hour')", [
@@ -123,6 +124,315 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
       "INSERT INTO chats(id,project_id,workspace_id,title,provider,account_id,branch) VALUES($1,$2,$1,'Test','codex',$3,'workspace/test')",
       [chat, project, account],
     );
+  });
+
+  describe("project Debian packages", () => {
+    let project: string, url: string;
+
+    beforeEach(async () => {
+      const { rows } = await db.query<{ project_id: string }>(
+        "SELECT project_id FROM chats WHERE id=$1",
+        [chat],
+      );
+      project = rows[0].project_id;
+      url = `/api/projects/${project}/packages`;
+    });
+
+    function request(options: InjectOptions) {
+      return app.inject({ ...options, remoteAddress: "192.0.2.40" });
+    }
+
+    async function list() {
+      const response = await request({ url, headers });
+      expect(response.statusCode).toBe(200);
+      return response.json<import("../src/shared").ProjectPackages>();
+    }
+
+    function add(name: string) {
+      return request({ method: "POST", url, headers, payload: { name } });
+    }
+
+    async function withRunningJob<T>(
+      run: (emit: Parameters<typeof launch>[2], jobId: string) => Promise<T>,
+    ) {
+      const message = await request({
+        method: "POST",
+        url: `/api/chats/${chat}/messages`,
+        headers,
+        payload: { content: "Install project tools", client_id: randomUUID() },
+      });
+      expect(message.statusCode).toBe(200);
+      const job = await claim();
+      expect(job?.chat_id).toBe(chat);
+      let emit!: Parameters<typeof launch>[2];
+      const initialize = vi
+        .spyOn(gitModule, "initializeWorkspace")
+        .mockResolvedValue();
+      const runner = vi
+        .spyOn(runtimeModule, "launch")
+        .mockImplementation(async (_chat, _account, handler) => {
+          emit = handler;
+          return {
+            id: "packages-runtime",
+            send: vi.fn(),
+            stop: async () => {},
+          };
+        });
+      try {
+        await runJob(job);
+        return await run(emit, job.id);
+      } finally {
+        runner.mockRestore();
+        initialize.mockRestore();
+        active.delete(job.id);
+      }
+    }
+
+    function emitInstallRequests(...requests: string[][]) {
+      return withRunningJob(async (emit, jobId) => {
+        for (const packages of requests)
+          await emit({ type: "packages_installed", packages });
+        await emit({ type: "completed" });
+        const { rows } = await db.query("SELECT state FROM jobs WHERE id=$1", [
+          jobId,
+        ]);
+        expect(rows[0].state).toBe("completed");
+        return (
+          await db.query(
+            "SELECT type,data FROM events WHERE job_id=$1 AND type IN ('log','packages_installed') ORDER BY id",
+            [jobId],
+          )
+        ).rows;
+      });
+    }
+
+    it("remembers an installed package when the chat output limit blocks logging", async () => {
+      await withRunningJob(async (emit, jobId) => {
+        await db.query(
+          "UPDATE output_storage SET limit_bytes=used_bytes WHERE id=1",
+        );
+        await emit({ type: "packages_installed", packages: ["curl"] });
+        const { rows } = await db.query(
+          "SELECT state,error FROM jobs WHERE id=$1",
+          [jobId],
+        );
+        expect(rows[0]).toMatchObject({
+          state: "failed",
+          error: expect.stringContaining("output limit reached"),
+        });
+      });
+      expect((await list()).packages).toMatchObject([
+        { name: "curl", source: "agent", source_chat_id: chat },
+      ]);
+    });
+
+    it("groups requests, upserts successes, and keeps packages when the source chat is deleted", async () => {
+      expect(await list()).toEqual({ auto_packages: true, packages: [] });
+      expect((await add("git")).statusCode).toBe(200);
+      const [manual] = (await list()).packages;
+
+      const firstEvents = await emitInstallRequests(["jq", "jq", "ffmpeg"]);
+      const installedRequest = firstEvents.find(
+        ({ type }) => type === "packages_installed",
+      )?.data;
+      expect(installedRequest).toEqual({
+        packages: ["jq", "ffmpeg"],
+        request_id: expect.any(String),
+      });
+      const first = (await list()).packages;
+      const jq = first.find(({ name }) => name === "jq");
+      expect(jq).toMatchObject({
+        source: "agent",
+        source_chat_id: chat,
+        source_chat_title: "Test",
+        request_id: installedRequest.request_id,
+        added_at: expect.any(String),
+      });
+      expect(first.find(({ name }) => name === "ffmpeg")).toMatchObject({
+        request_id: installedRequest.request_id,
+        added_at: jq?.added_at,
+      });
+
+      await db.query(
+        "UPDATE project_packages SET failures=3,disabled=true WHERE project_id=$1 AND name IN ('jq','git')",
+        [project],
+      );
+      await emitInstallRequests(["jq", "git", "unzip"]);
+      const second = (await list()).packages;
+      expect(second).toHaveLength(4);
+      expect(second.find(({ name }) => name === "jq")).toEqual(jq);
+      expect(second.find(({ name }) => name === "git")).toEqual(manual);
+      expect(second.find(({ name }) => name === "unzip")?.request_id).not.toBe(
+        installedRequest.request_id,
+      );
+
+      const otherProject = randomUUID();
+      await db.query(
+        "INSERT INTO projects(id,name,repo) VALUES($1,'Other','')",
+        [otherProject],
+      );
+      const otherUrl = `/api/projects/${otherProject}/packages`;
+      expect((await request({ url: otherUrl, headers })).json()).toEqual({
+        auto_packages: true,
+        packages: [],
+      });
+      expect(
+        (
+          await request({
+            method: "DELETE",
+            url: `${otherUrl}/requests/${installedRequest.request_id}`,
+            headers,
+          })
+        ).statusCode,
+      ).toBe(200);
+      expect((await list()).packages).toHaveLength(4);
+      expect(
+        (
+          await request({
+            method: "DELETE",
+            url: `/api/chats/${chat}`,
+            headers,
+          })
+        ).statusCode,
+      ).toBe(200);
+      expect((await list()).packages.find(({ name }) => name === "jq")).toEqual(
+        {
+          ...jq,
+          source_chat_id: null,
+          source_chat_title: null,
+        },
+      );
+      expect(
+        (
+          await request({
+            method: "DELETE",
+            url: `${url}/requests/${installedRequest.request_id}`,
+            headers,
+          })
+        ).statusCode,
+      ).toBe(200);
+      expect((await list()).packages.map(({ name }) => name).sort()).toEqual([
+        "git",
+        "unzip",
+      ]);
+      expect(
+        (await request({ method: "DELETE", url: `${url}/git`, headers }))
+          .statusCode,
+      ).toBe(200);
+      expect((await list()).packages.map(({ name }) => name)).toEqual([
+        "unzip",
+      ]);
+    });
+
+    it("requires the owner, validates input and keeps manual adds available with remembering off", async () => {
+      expect((await request({ url })).statusCode).toBe(401);
+      expect(
+        (
+          await request({
+            method: "POST",
+            url,
+            headers: { origin },
+            payload: { name: "jq" },
+          })
+        ).statusCode,
+      ).toBe(401);
+      expect(
+        (
+          await request({
+            method: "PATCH",
+            url,
+            headers: { cookie: headers.cookie },
+            payload: { auto_packages: false },
+          })
+        ).statusCode,
+      ).toBe(403);
+      expect(
+        (
+          await request({
+            url: `/api/projects/${randomUUID()}/packages`,
+            headers,
+          })
+        ).statusCode,
+      ).toBe(404);
+      expect((await add("jq=1.0")).statusCode).toBe(400);
+      expect(
+        (
+          await request({
+            method: "PATCH",
+            url,
+            headers,
+            payload: { auto_packages: "false" },
+          })
+        ).statusCode,
+      ).toBe(400);
+      const toggle = (auto_packages: boolean) =>
+        request({
+          method: "PATCH",
+          url,
+          headers,
+          payload: { auto_packages },
+        });
+      expect((await toggle(false)).json()).toEqual({ auto_packages: false });
+      expect((await add("libstdc++6")).statusCode).toBe(200);
+      expect(await emitInstallRequests(["ffmpeg"])).toContainEqual({
+        type: "log",
+        data: {
+          text: "Debian packages not remembered because automatic remembering is off: ffmpeg",
+        },
+      });
+      expect(await list()).toMatchObject({
+        auto_packages: false,
+        packages: [
+          { name: "libstdc++6", source: "owner", source_chat_id: null },
+        ],
+      });
+      expect(
+        (
+          await request({
+            method: "DELETE",
+            url: `${url}/${encodeURIComponent("libstdc++6")}`,
+            headers,
+          })
+        ).statusCode,
+      ).toBe(200);
+      expect((await toggle(true)).json()).toEqual({ auto_packages: true });
+      await emitInstallRequests(["ffmpeg"]);
+      expect((await list()).packages).toMatchObject([
+        { name: "ffmpeg", source: "agent", source_chat_id: chat },
+      ]);
+    });
+
+    it("fills the remaining slots, explains skipped names and serializes concurrent additions", async () => {
+      await db.query(
+        `INSERT INTO project_packages(project_id,name,source,request_id)
+         SELECT $1,'fixture-' || i,'owner',$2 FROM generate_series(1,254) AS fixture(i)`,
+        [project, randomUUID()],
+      );
+      expect(
+        await emitInstallRequests(["fixture-1", "jq", "ffmpeg", "unzip"]),
+      ).toContainEqual({
+        type: "log",
+        data: {
+          text: "Debian packages not remembered because the project limit of 256 packages was reached: unzip",
+        },
+      });
+      const { packages } = await list();
+      expect(packages).toHaveLength(256);
+      expect(packages.filter(({ source }) => source === "agent")).toMatchObject(
+        [{ name: "ffmpeg" }, { name: "jq" }],
+      );
+      expect((await add("jq")).statusCode).toBe(200);
+      expect((await add("unzip")).statusCode).toBe(409);
+      expect(
+        (await request({ method: "DELETE", url: `${url}/jq`, headers }))
+          .statusCode,
+      ).toBe(200);
+      const replies = await Promise.all([add("git"), add("unzip")]);
+      expect(replies.map(({ statusCode }) => statusCode).sort()).toEqual([
+        200, 409,
+      ]);
+      expect((await list()).packages).toHaveLength(256);
+    });
   });
 
   it("scopes enabled integrations to the project and provider and protects tokens", async () => {

@@ -20,6 +20,7 @@ import { redact } from "./security.js";
 import { event, notify, bus } from "./events.js";
 import { githubSyncMessage, type AgentEvent } from "../shared.js";
 import { packageNames } from "../runner/package-request.js";
+import { rememberProjectPackages } from "./project-packages.js";
 export const active = new Map<string, Running>();
 let ticking = false,
   shutting = false;
@@ -334,12 +335,36 @@ export async function runJob(job: any) {
     if (e.type === "limits") await saveUsage(job.account_id, e.limits);
     if (e.type === "packages_installed") {
       const packages = packageNames(e.packages);
-      if (packages) {
-        await event(chat.id, job.id, e.type, { packages });
-        await event(chat.id, job.id, "log", {
-          text: "Debian packages ready for this run: " + packages.join(", "),
-        });
+      if (!packages) return;
+      const requestId = randomUUID();
+      let notRemembered: string | undefined;
+      if (chat.project_id) {
+        // Remember the completed install even if the chat has no room for logs.
+        try {
+          const { skipped, reason } = await rememberProjectPackages(
+            chat.project_id,
+            chat.id,
+            requestId,
+            packages,
+          );
+          if (skipped.length)
+            notRemembered = `Debian packages not remembered because ${reason}: ${skipped.join(", ")}`;
+        } catch (error) {
+          console.error("Could not remember project packages", error);
+          notRemembered =
+            "Workspace could not remember these Debian packages: " +
+            packages.join(", ");
+        }
       }
+      await event(chat.id, job.id, e.type, {
+        packages,
+        request_id: requestId,
+      });
+      await event(chat.id, job.id, "log", {
+        text: "Debian packages ready for this run: " + packages.join(", "),
+      });
+      if (notRemembered)
+        await event(chat.id, job.id, "log", { text: notRemembered });
       return;
     }
     if (e.type === "model" && typeof e.model === "string")

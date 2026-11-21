@@ -41,12 +41,25 @@ ALTER TABLE projects ADD COLUMN IF NOT EXISTS github_token text;
 UPDATE projects SET github_token=COALESCE((SELECT value FROM settings WHERE key='github_token'),'') WHERE github_token IS NULL;
 ALTER TABLE projects ALTER COLUMN github_token SET DEFAULT '';
 ALTER TABLE projects ALTER COLUMN github_token SET NOT NULL;
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS auto_packages boolean NOT NULL DEFAULT true;
 CREATE TABLE IF NOT EXISTS accounts(id uuid PRIMARY KEY,provider text NOT NULL CHECK(provider IN ('codex','claude')),name text NOT NULL,status text NOT NULL DEFAULT 'disconnected',priority int NOT NULL DEFAULT 0,reset_at timestamptz,limits jsonb,created_at timestamptz NOT NULL DEFAULT now());
 ALTER TABLE accounts ADD COLUMN IF NOT EXISTS limits_updated_at timestamptz;
 ALTER TABLE accounts ADD COLUMN IF NOT EXISTS model_catalog jsonb;
 ALTER TABLE accounts ADD COLUMN IF NOT EXISTS models_updated_at timestamptz;
 CREATE TABLE IF NOT EXISTS chats(id uuid PRIMARY KEY,project_id uuid NOT NULL REFERENCES projects(id),title text NOT NULL,provider text NOT NULL CHECK(provider IN ('codex','claude')),account_id uuid REFERENCES accounts(id),model text NOT NULL DEFAULT '',effort text NOT NULL DEFAULT '',autonomous boolean NOT NULL DEFAULT false,handoff text NOT NULL DEFAULT 'manual' CHECK(handoff IN ('manual','auto')),session_id text,session_account uuid,summary text NOT NULL DEFAULT '',branch text NOT NULL,initialized boolean NOT NULL DEFAULT false,created_at timestamptz NOT NULL DEFAULT now());
 ALTER TABLE chats ALTER COLUMN project_id DROP NOT NULL;
+CREATE TABLE IF NOT EXISTS project_packages(
+  project_id uuid NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  name text NOT NULL,
+  source text NOT NULL CHECK(source IN ('agent','owner')),
+  source_chat_id uuid REFERENCES chats(id) ON DELETE SET NULL,
+  request_id uuid NOT NULL,
+  added_at timestamptz NOT NULL DEFAULT now(),
+  failures integer NOT NULL DEFAULT 0,
+  disabled boolean NOT NULL DEFAULT false,
+  PRIMARY KEY(project_id,name)
+);
+CREATE INDEX IF NOT EXISTS project_packages_source_chat ON project_packages(source_chat_id) WHERE source_chat_id IS NOT NULL;
 CREATE TABLE IF NOT EXISTS ssh_links(id uuid PRIMARY KEY,server_id uuid NOT NULL REFERENCES ssh_servers(id) ON DELETE CASCADE,project_id uuid REFERENCES projects(id) ON DELETE CASCADE,chat_id uuid REFERENCES chats(id) ON DELETE CASCADE,CHECK((project_id IS NULL) <> (chat_id IS NULL)));
 CREATE UNIQUE INDEX IF NOT EXISTS ssh_link_project ON ssh_links(project_id,server_id) WHERE project_id IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS ssh_link_chat ON ssh_links(chat_id,server_id) WHERE chat_id IS NOT NULL;
