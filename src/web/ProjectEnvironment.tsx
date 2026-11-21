@@ -1,6 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { ProjectEnvironmentInfo } from "../shared";
 import { api } from "./api";
+import { ProjectSystemPackages } from "./ProjectSystemPackages";
 import { Metric, resourceBytes } from "./ResourceMetric";
 
 export function ProjectEnvironment({ projectId }: { projectId: string }) {
@@ -12,6 +13,7 @@ export function ProjectEnvironment({ projectId }: { projectId: string }) {
     >
       <summary>Environment</summary>
       {open && <EnvironmentDetails projectId={projectId} />}
+      <ProjectSystemPackages projectId={projectId} open={open} />
     </details>
   );
 }

@@ -39,11 +39,12 @@ These browser captures show the React interface as of 2026-11-19 using fictional
 
 ## Project tools
 
-These Chromium captures use fictional usage data and show the project environment and server resource settings.
+These Chromium captures use fictional usage and package data and show the project environment and server resource settings.
 
 | Screen | Desktop | Mobile |
 | --- | --- | --- |
 | Project environment | [Usage](project-tools/project-tools-desktop.png) | [Over the limit](project-tools/project-tools-over-budget-mobile.png) |
+| System packages | [Desktop](system-packages/system-packages-desktop.png) | [Mobile](system-packages/system-packages-mobile.png) |
 | Workspace resource settings | [Limit setting](project-tools/server-tools-limit-desktop.png) | [Saved limit](project-tools/server-tools-limit-mobile.png) |
 
 ## Refresh the captures
