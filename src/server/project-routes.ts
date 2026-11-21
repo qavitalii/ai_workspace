@@ -26,6 +26,7 @@ import {
   setAutoPackages,
 } from "./project-packages.js";
 import { packageNames } from "../runner/package-request.js";
+import { clearProjectEnv, projectEnvironment } from "./project-env.js";
 import { uploadPath, copyFolderUpload } from "./folder-routes.js";
 import {
   workspaceBy,
@@ -72,6 +73,24 @@ export function projectRoutes(app: FastifyInstance) {
       .extend({ requestId: z.uuid() })
       .parse(req.params);
     return removeProjectPackages(id, { requestId });
+  });
+  app.get("/api/projects/:id/environment", async (req) => {
+    const id = z
+      .uuid()
+      .parse((req.params as any).id)
+      .toLowerCase();
+    const { refresh } = z
+      .object({ refresh: z.literal("1").optional() })
+      .parse(req.query);
+    return projectEnvironment(id, refresh === "1");
+  });
+  app.post("/api/projects/:id/environment/clear", async (req) => {
+    const id = z
+      .uuid()
+      .parse((req.params as any).id)
+      .toLowerCase();
+    await clearProjectEnv(id);
+    return projectEnvironment(id);
   });
   app.post("/api/workspaces/:id/copies", async (req) =>
     createCopy(

@@ -42,6 +42,8 @@ UPDATE projects SET github_token=COALESCE((SELECT value FROM settings WHERE key=
 ALTER TABLE projects ALTER COLUMN github_token SET DEFAULT '';
 ALTER TABLE projects ALTER COLUMN github_token SET NOT NULL;
 ALTER TABLE projects ADD COLUMN IF NOT EXISTS auto_packages boolean NOT NULL DEFAULT true;
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS env_size_bytes bigint;
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS env_measured_at timestamptz;
 CREATE TABLE IF NOT EXISTS accounts(id uuid PRIMARY KEY,provider text NOT NULL CHECK(provider IN ('codex','claude')),name text NOT NULL,status text NOT NULL DEFAULT 'disconnected',priority int NOT NULL DEFAULT 0,reset_at timestamptz,limits jsonb,created_at timestamptz NOT NULL DEFAULT now());
 ALTER TABLE accounts ADD COLUMN IF NOT EXISTS limits_updated_at timestamptz;
 ALTER TABLE accounts ADD COLUMN IF NOT EXISTS model_catalog jsonb;

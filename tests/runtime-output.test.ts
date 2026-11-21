@@ -1,12 +1,13 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Duplex } from "node:stream";
-import { mkdtemp, rm } from "node:fs/promises";
+import { access, mkdtemp, rm, stat } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import { config } from "../src/server/config";
 import { db } from "../src/server/db";
 import { docker, launch, type Running } from "../src/server/runtime";
 import * as settings from "../src/server/settings";
+import * as projectEnvironment from "../src/server/project-env";
 
 function frame(value: unknown) {
   const body = Buffer.from(JSON.stringify(value) + "\n");
@@ -87,6 +88,14 @@ describe("runtime output lifecycle with an isolated Docker fixture", () => {
       expect(options.Entrypoint).toBeUndefined();
       expect(options.Cmd).toBeUndefined();
       expect(options.HostConfig?.CapAdd).toBeUndefined();
+      expect(options.HostConfig?.Mounts?.some((m) => m.Target === "/env")).toBe(
+        false,
+      );
+      await expect(
+        access(path.join(root, "project-env")),
+      ).rejects.toMatchObject({
+        code: "ENOENT",
+      });
       expect(onEvent).toHaveBeenCalledWith({
         type: "warning",
         message: expect.stringContaining("./ops/compose.sh build runner-image"),
@@ -95,6 +104,142 @@ describe("runtime output lifecycle with an isolated Docker fixture", () => {
       await running.stop();
     }
   });
+  it.each([
+    [null, undefined],
+    ["fixture-project", undefined],
+    ["custom-runner-project", "/opt/toolchain/bin:/usr/bin:/bin"],
+  ])(
+    "limits the environment to project agents (project %s)",
+    async (projectId, imagePath) => {
+      const { create } = await fixture();
+      const measure = vi
+        .spyOn(projectEnvironment, "measureProjectEnv")
+        .mockResolvedValue(0);
+      const folder = { id: "fixture-folder", project_id: projectId };
+      vi.spyOn(db, "query").mockImplementation(async (query) => ({
+        rows: String(query).includes("SELECT w.* FROM workspaces w JOIN chats")
+          ? [folder]
+          : [],
+      }));
+      const inspect = vi.fn().mockResolvedValue({
+        Id: "sha256:project-runner",
+        Config: {
+          Env: imagePath ? ["PATH=" + imagePath] : undefined,
+          Labels: { "ai.workspace.runner.package-installer": "1" },
+        },
+      });
+      vi.spyOn(docker, "getImage").mockReturnValue({ inspect } as any);
+      for (const projectEnv of [
+        undefined,
+        "read-only",
+        "read-write",
+      ] as const) {
+        const run = await launch("fixture-chat", null, vi.fn(), { projectEnv });
+        try {
+          const options = create.mock.lastCall![0];
+          const mount = options.HostConfig?.Mounts?.find(
+            (m) => m.Target === "/env",
+          );
+          if (!projectId || !projectEnv) {
+            expect(mount).toBeUndefined();
+            expect(options.Env).not.toEqual(
+              expect.arrayContaining([expect.stringMatching(/^PATH=/)]),
+            );
+            await expect(
+              access(path.join(root, "project-env")),
+            ).rejects.toMatchObject({ code: "ENOENT" });
+            continue;
+          }
+          expect(options.Image).toBe("sha256:project-runner");
+          expect(measure).toHaveBeenLastCalledWith(projectId, {
+            fresh: projectEnv === "read-write",
+            image: "sha256:project-runner",
+          });
+          expect(options.Entrypoint).toBeUndefined();
+          expect(options.HostConfig?.CapAdd).toBeUndefined();
+          const source = path.join(root, "project-env", projectId);
+          expect(mount).toEqual({
+            Type: "bind",
+            Source: source,
+            Target: "/env",
+            ReadOnly: projectEnv === "read-only",
+          });
+          const directory = await stat(source);
+          expect(directory.mode & 0o777).toBe(0o700);
+          if (process.getuid?.() === 0)
+            expect([directory.uid, directory.gid]).toEqual([1000, 1000]);
+          const projectPath =
+            (imagePath ??
+              "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin") +
+            ":/env/bin:/env/npm-global/bin:/env/python/bin:/env/cargo/bin:/env/go/bin";
+          expect(options.Env).toEqual(
+            expect.arrayContaining([
+              "PATH=" + projectPath,
+              "WORKSPACE_PROJECT_TOOL_PATH=" + projectPath,
+              "NPM_CONFIG_PREFIX=/env/npm-global",
+              "NPM_CONFIG_CACHE=/env/cache/npm",
+              "PYTHONUSERBASE=/env/python",
+              "PIP_CACHE_DIR=/env/cache/pip",
+              "PIP_BREAK_SYSTEM_PACKAGES=1",
+              "UV_CACHE_DIR=/env/cache/uv",
+              "UV_TOOL_DIR=/env/uv",
+              "UV_TOOL_BIN_DIR=/env/bin",
+              "PIPX_HOME=/env/pipx",
+              "PIPX_BIN_DIR=/env/bin",
+              "CARGO_HOME=/env/cargo",
+              "GOPATH=/env/go",
+              "GOMODCACHE=/env/go/pkg/mod",
+              "PLAYWRIGHT_BROWSERS_PATH=/env/ms-playwright",
+              "XDG_CACHE_HOME=/env/cache",
+            ]),
+          );
+          expect(options.Env).not.toEqual(
+            expect.arrayContaining([expect.stringMatching(/^PIP_USER=/)]),
+          );
+        } finally {
+          await run.stop();
+        }
+      }
+    },
+  );
+  it.each([
+    [2 * 1024 ** 3, "Project tools exceed the 1 GiB limit"],
+    [null, "Could not measure project tools"],
+  ])(
+    "keeps project tools read-only with a warning (%s bytes)",
+    async (bytes, message) => {
+      const { create } = await fixture();
+      const folder = { id: "fixture-folder", project_id: "fixture-project" };
+      vi.spyOn(db, "query").mockImplementation(async (query) => ({
+        rows: String(query).includes("SELECT w.* FROM workspaces w JOIN chats")
+          ? [folder]
+          : [],
+      }));
+      vi.spyOn(docker, "getImage").mockReturnValue({
+        inspect: vi.fn().mockResolvedValue({ Id: "sha256:project-runner" }),
+      } as any);
+      vi.spyOn(settings, "projectEnvLimitGib").mockResolvedValue(1);
+      const measure = vi.spyOn(projectEnvironment, "measureProjectEnv");
+      if (bytes === null) measure.mockRejectedValue(new Error("du failed"));
+      else measure.mockResolvedValue(bytes);
+      const onEvent = vi.fn();
+      const run = await launch("fixture-chat", null, onEvent, {
+        projectEnv: "read-write",
+      });
+      try {
+        expect(create.mock.lastCall![0].HostConfig?.Mounts).toContainEqual(
+          expect.objectContaining({ Target: "/env", ReadOnly: true }),
+        );
+        expect(run.projectEnvWarning).toContain(message);
+        expect(onEvent).toHaveBeenCalledWith({
+          type: "warning",
+          message: run.projectEnvWarning,
+        });
+      } finally {
+        await run.stop();
+      }
+    },
+  );
   it("uses the installer entrypoint only on the exact compatible image and never retries startup", async () => {
     const { container, create } = await fixture();
     const inspect = vi.fn().mockResolvedValue({

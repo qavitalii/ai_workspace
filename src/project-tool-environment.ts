@@ -1,0 +1,17 @@
+export const projectToolEnvironment = {
+  NPM_CONFIG_PREFIX: "/env/npm-global",
+  NPM_CONFIG_CACHE: "/env/cache/npm",
+  PYTHONUSERBASE: "/env/python",
+  PIP_CACHE_DIR: "/env/cache/pip",
+  PIP_BREAK_SYSTEM_PACKAGES: "1",
+  UV_CACHE_DIR: "/env/cache/uv",
+  UV_TOOL_DIR: "/env/uv",
+  UV_TOOL_BIN_DIR: "/env/bin",
+  PIPX_HOME: "/env/pipx",
+  PIPX_BIN_DIR: "/env/bin",
+  CARGO_HOME: "/env/cargo",
+  GOPATH: "/env/go",
+  GOMODCACHE: "/env/go/pkg/mod",
+  PLAYWRIGHT_BROWSERS_PATH: "/env/ms-playwright",
+  XDG_CACHE_HOME: "/env/cache",
+};

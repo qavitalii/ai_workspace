@@ -1,6 +1,7 @@
 import { runIntegrations } from "./integrations.js";
 import { recoverAccountDeletions } from "./accounts.js";
 import { recoverFolderOperations } from "./folder-operations.js";
+import { recoverClearedProjectEnvs } from "./project-env.js";
 import { saveUsage } from "./usage.js";
 import { slashCommand } from "../commands.js";
 import { foldersBusy, chatFolders } from "./folders.js";
@@ -37,6 +38,9 @@ export function summaryFrom(
 }
 export async function recover() {
   await cleanOrphans();
+  await recoverClearedProjectEnvs().catch(() =>
+    console.warn("Could not finish removing previously cleared project tools."),
+  );
   await recoverFolderOperations();
   await recoverAccountDeletions();
   await db.query("DELETE FROM workspace_leases");
@@ -584,6 +588,10 @@ export async function runJob(job: any) {
         // Lets a chat started before per-chat sessions keep its native session.
         sessionId: native ? chat.session_id : null,
         installPackages: chat.mode !== "plan" && !shortcut,
+        projectEnv:
+          chat.mode === "plan" || (shortcut && shortcut.name !== "plan")
+            ? "read-only"
+            : "read-write",
       },
     );
     if (finished) {
@@ -616,6 +624,7 @@ export async function runJob(job: any) {
       input: {
         provider: chat.provider,
         githubSync: !!syncWorkspaceId,
+        projectEnvWarning: runtime.projectEnvWarning,
         integrations: await runIntegrations(chat.project_id, chat.provider),
         prompt:
           (shortcut?.name === "plan"

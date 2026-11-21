@@ -28,11 +28,15 @@ import path from "node:path";
 import { z } from "zod";
 import { db, transaction } from "./db.js";
 import { authRoutes, authenticated } from "./auth.js";
-import { config } from "./config.js";
+import { config, validProjectEnvLimitGib } from "./config.js";
 import { bus, event } from "./events.js";
 import { safeName, seal, redact } from "./security.js";
 import { normalizeGithubRepo } from "../shared.js";
-import { concurrentTasks, modelDefaults } from "./settings.js";
+import {
+  concurrentTasks,
+  modelDefaults,
+  projectEnvLimitGib,
+} from "./settings.js";
 import { createResourceMonitor } from "./resources.js";
 import { updatePhase, updateRoutes } from "./updates.js";
 import { disconnectAccount, deleteAccount } from "./accounts.js";
@@ -254,18 +258,21 @@ export async function createApp() {
     ).rows;
   });
   app.get("/api/system", async () => {
-    const [metrics, maximum, jobs, output] = await Promise.all([
-      resources.read(),
-      concurrentTasks(),
-      db.query(
-        "SELECT count(*) FILTER (WHERE state IN ('running','waiting_approval'))::int running, count(*) FILTER (WHERE state='queued')::int queued, count(*) FILTER (WHERE state='waiting_account')::int waiting_accounts FROM jobs",
-      ),
-      outputStorage(),
-    ]);
+    const [metrics, maximum, jobs, output, environmentLimit] =
+      await Promise.all([
+        resources.read(),
+        concurrentTasks(),
+        db.query(
+          "SELECT count(*) FILTER (WHERE state IN ('running','waiting_approval'))::int running, count(*) FILTER (WHERE state='queued')::int queued, count(*) FILTER (WHERE state='waiting_account')::int waiting_accounts FROM jobs",
+        ),
+        outputStorage(),
+        projectEnvLimitGib(),
+      ]);
     return {
       output,
       resources: metrics,
       maxConcurrent: maximum,
+      projectEnvLimitGib: environmentLimit,
       running: jobs.rows[0].running,
       queued: jobs.rows[0].queued,
       waitingAccounts: jobs.rows[0].waiting_accounts,
@@ -311,6 +318,18 @@ export async function createApp() {
       );
     });
     return { maxConcurrent };
+  });
+  app.post("/api/settings/environment", async (req) => {
+    const { projectEnvLimitGib } = z
+      .object({
+        projectEnvLimitGib: z.number().refine(validProjectEnvLimitGib),
+      })
+      .parse(req.body);
+    await db.query(
+      "INSERT INTO settings(key,value) VALUES('project_env_limit_gib',$1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+      [String(projectEnvLimitGib)],
+    );
+    return { projectEnvLimitGib };
   });
   projectRoutes(app);
   app.post("/api/projects", async (req) => {
@@ -1630,12 +1649,28 @@ export async function createApp() {
         leased = true;
         if (closed) return;
         await initializeWorkspace(chat);
-        runtime = await launch(id, null, (e) => {
-          if (closed) return;
-          if (e.type === "failed") disconnect(e.error || "Terminal failed.");
-          else if (e.type === "exit" || e.type === "interrupted") disconnect();
-          else if (socket.readyState === 1) socket.send(JSON.stringify(e));
-        });
+        runtime = await launch(
+          id,
+          null,
+          (e) => {
+            if (closed) return;
+            if (e.type === "failed") disconnect(e.error || "Terminal failed.");
+            else if (e.type === "exit" || e.type === "interrupted")
+              disconnect();
+            else if (socket.readyState === 1)
+              socket.send(
+                JSON.stringify(
+                  e.type === "warning"
+                    ? {
+                        type: "terminal",
+                        data: "\r\nWarning: " + e.message + "\r\n",
+                      }
+                    : e,
+                ),
+              );
+          },
+          { projectEnv: "read-write" },
+        );
         if (closed) return;
         terminals.set(id, runtime);
         runtime.send({ type: "terminal", data: "" });

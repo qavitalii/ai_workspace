@@ -1,5 +1,5 @@
 import { db } from "./db.js";
-import { config } from "./config.js";
+import { config, validProjectEnvLimitGib } from "./config.js";
 
 export async function concurrentTasks(
   queryable: Pick<typeof db, "query"> = db,
@@ -12,6 +12,16 @@ export async function concurrentTasks(
   const value = row ? Number(row.value) : config.maxConcurrent;
   if (!Number.isSafeInteger(value) || value < 1)
     throw new Error("Invalid concurrency setting");
+  return value;
+}
+
+export async function projectEnvLimitGib() {
+  const { rows } = await db.query(
+    "SELECT value FROM settings WHERE key='project_env_limit_gib'",
+  );
+  const value = rows[0] ? Number(rows[0].value) : config.projectEnvLimitGib;
+  if (!validProjectEnvLimitGib(value))
+    throw new Error("Invalid project environment limit");
   return value;
 }
 

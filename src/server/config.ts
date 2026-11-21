@@ -1,4 +1,12 @@
 import path from "node:path";
+
+export const GiB = 1024 ** 3;
+
+export function validProjectEnvLimitGib(value: number) {
+  const bytes = Math.round(value * GiB);
+  return Number.isSafeInteger(bytes) && bytes > 0;
+}
+
 export const config = {
   database:
     process.env.DATABASE_URL ||
@@ -12,12 +20,15 @@ export const config = {
   key: process.env.ENCRYPTION_KEY || "",
   image: process.env.RUNNER_IMAGE || "ai-workspace-runner:0.1.0",
   outputLimitGb: Number(process.env.OUTPUT_LIMIT_GB || 1),
+  projectEnvLimitGib: Number(process.env.PROJECT_ENV_LIMIT_GIB ?? 8),
   maxConcurrent: Number(process.env.MAX_CONCURRENT || 3),
   maxFile: Number(process.env.MAX_FILE_MB || 25) * 1024 * 1024,
   maxAttachments: Number(process.env.MAX_ATTACHMENTS || 10),
   autoHandoff: process.env.ENABLE_AUTO_HANDOFF === "true",
 };
 export function validateConfig() {
+  if (!validProjectEnvLimitGib(config.projectEnvLimitGib))
+    throw new Error("PROJECT_ENV_LIMIT_GIB must be a positive size in GiB.");
   if (
     !Number.isFinite(config.outputLimitGb) ||
     config.outputLimitGb < 0.01 ||

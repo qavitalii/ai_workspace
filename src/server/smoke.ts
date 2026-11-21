@@ -37,14 +37,14 @@ try {
     const r = await launch(id, null, (e) => {
       if (e.type === "terminal") {
         text += e.data;
-        if (text.includes("WORKSPACE_SMOKE_OK_" + i)) resolve();
+        if (text.split(/\r?\n/).includes("WORKSPACE_SMOKE_OK_" + i)) resolve();
       }
       if (e.type === "failed") reject(new Error(e.error));
     });
     runners.push(r);
     r.send({
       type: "terminal",
-      data: `printf 'workspace-${i}' > /workspace/probe.txt; test ! -S /var/run/docker.sock && printf '\\nWORKSPACE_SMOKE_OK_${i}\\n'\r`,
+      data: `printf 'workspace-${i}' > /workspace/probe.txt && test ! -S /var/run/docker.sock && printf '\\nWORKSPACE_SMOKE_''OK_${i}\\n'\r`,
     });
     await Promise.race([
       ready,
