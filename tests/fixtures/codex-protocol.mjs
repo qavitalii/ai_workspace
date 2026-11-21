@@ -2,7 +2,60 @@
 // Deterministic App Server peer: validates requests without credentials or inference.
 import { createInterface } from "node:readline";
 import assert from "node:assert/strict";
+import { mkdirSync, symlinkSync, writeFileSync } from "node:fs";
+import path from "node:path";
+import { largeImage } from "./large-image.mjs";
 const send = (m) => process.stdout.write(JSON.stringify(m) + "\n");
+function imageNotifications() {
+  const bytes = largeImage();
+  assert.ok(bytes.length > 1024 ** 2);
+  const base64 = bytes.toString("base64");
+  const complete = (item) =>
+    send({ method: "item/completed", params: { item } });
+  const generation = { type: "imageGeneration", status: "completed" };
+  send({
+    method: "item/started",
+    params: {
+      item: { ...generation, id: "inline", status: "generating", result: "" },
+    },
+  });
+  complete({ ...generation, id: "inline", result: base64 });
+  const directory = path.join(
+    process.env.CODEX_HOME,
+    "generated_images",
+    "thread-test",
+  );
+  mkdirSync(directory, { recursive: true });
+  const savedPath = path.join(directory, "ig_fixture.png");
+  writeFileSync(savedPath, bytes);
+  complete({ ...generation, id: "file", fileId: "file-fixture", savedPath });
+  const outside = "/tmp/fixture-private-image.png";
+  const symlink = path.join(directory, "ig_outside.png");
+  writeFileSync(outside, bytes);
+  symlinkSync(outside, symlink);
+  complete({
+    ...generation,
+    id: "unsafe",
+    fileId: "file-outside",
+    savedPath: symlink,
+  });
+  complete({
+    type: "mcpToolCall",
+    id: "mcp-image",
+    status: "completed",
+    server: "fixture",
+    tool: "generate",
+    arguments: {},
+    result: {
+      content: [{ type: "image", mimeType: "image/png", data: base64 }],
+      structuredContent: { duplicateImage: base64 },
+    },
+  });
+  send({
+    method: "item/agentMessage/delta",
+    params: { delta: "Image generation complete." },
+  });
+}
 let sandbox;
 createInterface({ input: process.stdin }).on("line", (line) => {
   try {
@@ -67,6 +120,12 @@ createInterface({ input: process.stdin }).on("line", (line) => {
       } else {
         assert.equal(p.collaborationMode.mode, "default");
         send({ id: m.id, result: {} });
+        if (
+          p.input.some((part) =>
+            part.text?.startsWith("Generate a large image"),
+          )
+        )
+          imageNotifications();
         send({
           method: "turn/completed",
           params: { turn: { status: "completed" } },

@@ -9,6 +9,7 @@ export type RunState =
   | "interrupted"
   | "cancelled";
 export type AgentEvent = { type: string; [key: string]: any };
+export const MAX_WORKSPACE_FILE_BYTES = 100 * 1024 ** 2;
 export type ProjectIntegration = {
   kind: "mcp" | "plugin";
   name: string;

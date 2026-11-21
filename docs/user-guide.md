@@ -38,6 +38,12 @@ Chat and project settings include **Folders**: upload files or directories, conn
 
 Choose a model and reasoning effort before the first message or from the composer. Type `/` for Workspace commands, `@` for files/folders, and `$` for workspace skills. These are supported Workspace features, not a claim of complete parity with every native CLI command or plugin.
 
+### Generated images in chat
+
+When Codex returns image data or an accessible image file, Workspace saves it to the working folder. The chat shows a preview when an assistant message links to an available PNG, JPEG, WebP, or GIF in that folder. Select the preview to open the original in a new tab. Use **Download** under the image to save the original file. The files are also available in **Files**.
+
+[Desktop example](screenshots/ui-refresh/chat-image-preview-desktop.png) · [Mobile example](screenshots/ui-refresh/chat-image-preview-mobile.png)
+
 ### System tools for agent tasks
 
 Agent tasks and chat terminals include C and C++ build tools (`gcc`, `g++`, `make`, `pkg-config`), the SQLite, PostgreSQL and MySQL-compatible clients (`sqlite3`, `psql`, `mysql`), and `rsync`, `zip`, `xz`, `file`, `less` and `tree`.

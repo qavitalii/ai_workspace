@@ -7,6 +7,7 @@ import {
 } from "./integrations.js";
 import { githubSyncBridge } from "./github-sync-bridge.js";
 import { drainPackageAudit } from "./package-audit.js";
+import { codexImageItem } from "./generated-images.js";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createInterface } from "node:readline";
 import { createServer } from "node:http";
@@ -110,6 +111,7 @@ async function codex(
   entries: NonNullable<RunInput["integrations"]> = [],
   packageServerName?: string,
   githubSyncPort?: number,
+  saveImages = false,
 ) {
   const integrations = codexIntegrations(
     entries,
@@ -224,10 +226,21 @@ async function codex(
         emit({ type: "delta", text: p.delta });
       if (m.method === "item/commandExecution/outputDelta")
         emit({ type: "log", text: p.delta });
-      if (m.method === "item/completed")
-        emit({ type: "checkpoint", item: p.item });
-      if (m.method === "item/started" && p.item?.type !== "agentMessage")
-        emit({ type: "tool", item: p.item });
+      if (
+        m.method === "item/completed" ||
+        (m.method === "item/started" && p.item?.type !== "agentMessage")
+      ) {
+        const completed = m.method === "item/completed";
+        const item = codexImageItem(
+          p.item,
+          completed,
+          saveImages
+            ? { home: home || "/profile/.codex", threadId }
+            : undefined,
+          emit,
+        );
+        emit({ type: completed ? "checkpoint" : "tool", item });
+      }
       if (m.method === "account/rateLimits/updated")
         emit({ type: "limits", limits: p.rateLimits });
       if (m.method === "account/login/completed")
@@ -283,7 +296,12 @@ function executionPrompt(input: RunInput, packageServerName?: string) {
 }
 async function runCodex(input: RunInput, githubSyncPort?: number) {
   const packageServerName = packageServerFor(input);
-  await codex(input.integrations, packageServerName, githubSyncPort);
+  await codex(
+    input.integrations,
+    packageServerName,
+    githubSyncPort,
+    input.mode !== "plan" && (!input.operation || input.operation === "native"),
+  );
   const args: any = {
     cwd: "/workspace",
     approvalPolicy:
