@@ -1,4 +1,17 @@
 export type Provider = "codex" | "claude";
+export type ProjectPackages = {
+  auto_packages: boolean;
+  packages: {
+    name: string;
+    source: "agent" | "owner";
+    source_chat_id: string | null;
+    source_chat_title: string | null;
+    request_id: string;
+    added_at: string;
+    failures: number;
+    disabled: boolean;
+  }[];
+};
 export type RunState =
   | "queued"
   | "running"

@@ -19,6 +19,13 @@ import { acquireFolder, releaseFolder } from "./leases.js";
 import { initializeFolder } from "./git.js";
 import { syncFromGithub } from "./github-sync.js";
 import { inspectDirectory } from "./files.js";
+import {
+  addProjectPackage,
+  listProjectPackages,
+  removeProjectPackages,
+  setAutoPackages,
+} from "./project-packages.js";
+import { packageNames } from "../runner/package-request.js";
 import { uploadPath, copyFolderUpload } from "./folder-routes.js";
 import {
   workspaceBy,
@@ -36,7 +43,36 @@ export function workspaceUploadPath(input: string) {
     );
   return relative;
 }
+
+const projectParams = z.object({ id: z.uuid() });
+const packageName = z.string().refine((name) => packageNames([name]) !== null);
+
 export function projectRoutes(app: FastifyInstance) {
+  app.get("/api/projects/:id/packages", async (req) =>
+    listProjectPackages(projectParams.parse(req.params).id),
+  );
+  app.post("/api/projects/:id/packages", async (req) => {
+    const { name } = z.object({ name: packageName }).parse(req.body);
+    return addProjectPackage(projectParams.parse(req.params).id, name);
+  });
+  app.patch("/api/projects/:id/packages", async (req) => {
+    const { auto_packages } = z
+      .object({ auto_packages: z.boolean() })
+      .parse(req.body);
+    return setAutoPackages(projectParams.parse(req.params).id, auto_packages);
+  });
+  app.delete("/api/projects/:id/packages/:name", async (req) => {
+    const { id, name } = projectParams
+      .extend({ name: packageName })
+      .parse(req.params);
+    return removeProjectPackages(id, { name });
+  });
+  app.delete("/api/projects/:id/packages/requests/:requestId", async (req) => {
+    const { id, requestId } = projectParams
+      .extend({ requestId: z.uuid() })
+      .parse(req.params);
+    return removeProjectPackages(id, { requestId });
+  });
   app.post("/api/workspaces/:id/copies", async (req) =>
     createCopy(
       z.uuid().parse((req.params as any).id),
