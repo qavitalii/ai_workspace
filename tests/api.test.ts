@@ -22,7 +22,7 @@ import {
   expect,
   vi,
 } from "vitest";
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { once } from "node:events";
 import WebSocket from "ws";
 import {
@@ -33,6 +33,7 @@ import {
   writeFile,
   access,
   readdir,
+  symlink,
 } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -59,6 +60,8 @@ import { createApp } from "../src/server/app";
 import { docker, launch, type Running } from "../src/server/runtime";
 import { initializeWorkspace, projectToken } from "../src/server/git";
 import { hash, seal, unseal } from "../src/server/security";
+import { projectToolEnvironment } from "../src/project-tool-environment";
+import { measureProjectEnv } from "../src/server/project-env";
 const enabled = process.env.INTEGRATION_TESTS === "1";
 describe.skipIf(!enabled)("PostgreSQL API integration", () => {
   let app: Awaited<ReturnType<typeof createApp>>,
@@ -68,7 +71,7 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
   const token = "test-session-token",
     origin = "http://localhost:5173";
   const headers = { origin, cookie: "session=" + token };
-  async function openTerminal() {
+  async function openTerminal(chatId = chat) {
     // Exercise the real close handshake: injectWS uses paired in-memory streams
     // whose server-side close may wait for the WebSocket timeout.
     if (!app.server.listening) await app.listen({ host: "127.0.0.1", port: 0 });
@@ -76,7 +79,7 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
     if (!address || typeof address === "string")
       throw new Error("No test port");
     const socket = new WebSocket(
-      `ws://127.0.0.1:${address.port}/api/chats/${chat}/terminal`,
+      `ws://127.0.0.1:${address.port}/api/chats/${chatId}/terminal`,
       { headers },
     );
     await once(socket, "open");
@@ -96,6 +99,7 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
   });
   beforeEach(async () => {
     config.maxConcurrent = 3;
+    config.projectEnvLimitGib = 8;
     await db.query(
       "TRUNCATE ssh_links,ssh_servers,ssh_keys,workspaces,workspace_leases,publications,push_subscriptions,approvals,events,jobs,attachments,messages,project_packages,chats,accounts,projects,sessions,owner,settings CASCADE",
     );
@@ -4103,6 +4107,7 @@ esac
       expect(launch).toHaveBeenCalledWith(chat, other, expect.any(Function), {
         sessionId: null,
         installPackages: true,
+        projectEnv: "read-write",
       });
       expect(send.mock.calls[0][0].input).toMatchObject({
         provider: "claude",
@@ -4183,6 +4188,7 @@ esac
           {
             sessionId: null,
             installPackages: false,
+            projectEnv: "read-only",
           },
         );
         expect(runners[0].mock.calls[0][0].input.mode).toBe("plan");
@@ -4255,6 +4261,7 @@ esac
           {
             sessionId: "existing-claude-plan-session",
             installPackages: true,
+            projectEnv: "read-write",
           },
         );
         expect(runners[1].mock.calls[0][0].input).toMatchObject({
@@ -4562,6 +4569,482 @@ esac
       expect(third).not.toMatch(/^history\r?$/m);
       expect(third).not.toMatch(/^FOUND:\./m);
       expect(await readdir(path.join(data, "run-profiles"))).toEqual([]);
+    },
+    60_000,
+  );
+  it.skipIf(process.env.DOCKER_TESTS !== "1")(
+    "mounts one project tool directory across run modes and working copies",
+    async () => {
+      const { project_id: project } = await chatWorkspace(chat);
+      const otherProject = randomUUID();
+      await db.query(
+        "INSERT INTO projects(id,name,repo) VALUES($1,'Other','test/other')",
+        [otherProject],
+      );
+      async function addChat(projectId: string | null, kind: "copy" | "main") {
+        const folder = await createWorkspace(projectId, kind, kind, db);
+        await db.query(
+          "INSERT INTO chats(id,project_id,workspace_id,title,provider,branch) VALUES($1,$2,$1,$3,'codex',$4)",
+          [folder.id, projectId, kind, folder.branch],
+        );
+        return folder.id;
+      }
+
+      const copy = await addChat(project, "copy");
+      const other = await addChat(otherProject, "main");
+      async function shell(
+        chatId: string,
+        mode: "read-only" | "read-write",
+        command: string,
+      ) {
+        const run = await launch(chatId, account, () => {}, {
+          projectEnv: mode,
+          installPackages: mode === "read-write",
+        });
+        try {
+          const container = docker.getContainer(run.id);
+          const { Mounts } = await container.inspect();
+          const exec = await container.exec({
+            User: "1000:1000",
+            Cmd: ["/bin/bash", "-lec", command],
+            AttachStdout: true,
+            AttachStderr: true,
+            Tty: true,
+          });
+          const stream = await exec.start({ hijack: true, stdin: false });
+          let output = "";
+          for await (const chunk of stream) output += chunk.toString();
+          expect((await exec.inspect()).ExitCode, output).toBe(0);
+          return Mounts.find((mount) => mount.Destination === "/env");
+        } finally {
+          await run.stop();
+        }
+      }
+
+      const first = await shell(
+        chat,
+        "read-write",
+        String.raw`
+          test "$PATH" = "$WORKSPACE_PROJECT_TOOL_PATH"
+          test "$NPM_CONFIG_PREFIX" = /env/npm-global
+          mkdir -p /env/bin
+          printf '#!/bin/sh\nprintf "runner marker"\n' > /env/bin/workspace-env-probe
+          chmod +x /env/bin/workspace-env-probe
+        `,
+      );
+      expect(first).toMatchObject({ Type: "bind", RW: true });
+      const plan = await shell(
+        copy,
+        "read-only",
+        'test "$(workspace-env-probe)" = "runner marker" && ! touch /env/plan-probe',
+      );
+      expect(plan).toMatchObject({ Source: first?.Source, RW: false });
+      const separate = await shell(
+        other,
+        "read-only",
+        "! command -v workspace-env-probe",
+      );
+      expect(separate).toMatchObject({ Type: "bind", RW: false });
+      expect(separate?.Source).not.toBe(first?.Source);
+      expect(
+        await readFile(
+          path.join(
+            data,
+            "project-env",
+            project!,
+            "bin",
+            "workspace-env-probe",
+          ),
+          "utf8",
+        ),
+      ).toContain("runner marker");
+    },
+    60_000,
+  );
+  it("validates and persists the project environment limit", async () => {
+    const url = "/api/settings/environment";
+    const system = async () =>
+      (await app.inject({ url: "/api/system", headers })).json();
+    expect((await system()).projectEnvLimitGib).toBe(8);
+    const save = (projectEnvLimitGib: unknown) =>
+      app.inject({
+        method: "POST",
+        url,
+        headers,
+        payload: { projectEnvLimitGib },
+      });
+    for (const invalid of [0, -1, "8", null, Number.MAX_SAFE_INTEGER])
+      expect((await save(invalid)).statusCode).toBe(400);
+    const updated = await save(0.5);
+    expect(updated.statusCode).toBe(200);
+    expect(updated.json()).toEqual({ projectEnvLimitGib: 0.5 });
+    config.projectEnvLimitGib = 4;
+    expect((await system()).projectEnvLimitGib).toBe(0.5);
+    expect(
+      await app.inject({
+        method: "POST",
+        url,
+        headers: { origin },
+        payload: { projectEnvLimitGib: 8 },
+      }),
+    ).toMatchObject({ statusCode: 401 });
+  });
+  it("reports project tool usage and clears only an idle project's tool directory", async () => {
+    const project = (await chatWorkspace(chat)).project_id!;
+    const otherProject = randomUUID();
+    await db.query(
+      "INSERT INTO projects(id,name,repo) VALUES($1,'Another project','')",
+      [otherProject],
+    );
+    const env = path.join(data, "project-env", project);
+    const otherEnv = path.join(data, "project-env", otherProject);
+    await mkdir(env, { recursive: true });
+    await mkdir(otherEnv, { recursive: true });
+    await writeFile(path.join(env, "tool"), "Installed tool");
+    await writeFile(path.join(otherEnv, "tool"), "Other project's tool");
+    await symlink(otherEnv, path.join(env, "other-env"));
+    await db.query(
+      "UPDATE projects SET env_size_bytes=$2,env_measured_at=now() WHERE id=$1",
+      [project, 9 * 1024 ** 3],
+    );
+
+    const url = "/api/projects/" + project.toUpperCase() + "/environment";
+    const read = async () => (await app.inject({ url, headers })).json();
+    const clear = () =>
+      app.inject({ method: "POST", url: url + "/clear", headers });
+    expect(await read()).toEqual({
+      usedBytes: 9 * 1024 ** 3,
+      limitBytes: 8 * 1024 ** 3,
+      limitGib: 8,
+      busy: false,
+      state: "over-budget",
+    });
+    expect(
+      (
+        await app.inject({
+          url: "/api/projects/" + randomUUID() + "/environment",
+          headers,
+        })
+      ).statusCode,
+    ).toBe(404);
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: url + "/clear",
+          headers: { origin },
+        })
+      ).statusCode,
+    ).toBe(401);
+
+    const message = randomUUID();
+    await db.query(
+      "INSERT INTO messages(id,chat_id,role,content) VALUES($1,$2,'user','Pending work')",
+      [message, chat],
+    );
+    const job = randomUUID();
+    await db.query(
+      "INSERT INTO jobs(id,chat_id,message_id,account_id,state) VALUES($1,$2,$3,$4,'waiting_approval')",
+      [job, chat, message, account],
+    );
+    expect(await read()).toMatchObject({ busy: true });
+    const conflict = await clear();
+    expect(conflict.statusCode).toBe(409);
+    expect(conflict.json().error).toMatch(
+      /Stop active tasks and close open terminals/,
+    );
+    await db.query("DELETE FROM jobs WHERE id=$1", [job]);
+
+    const copy = await createWorkspace(project, "copy", "Review copy", db);
+    await acquireFolder(copy.id, "terminal");
+    expect(await read()).toMatchObject({ busy: true });
+    expect((await clear()).statusCode).toBe(409);
+    expect(await readFile(path.join(env, "tool"), "utf8")).toBe(
+      "Installed tool",
+    );
+    await releaseFolder(copy.id);
+
+    const otherFolder = await createWorkspace(
+      otherProject,
+      "main",
+      "Other project",
+      db,
+    );
+    await acquireFolder(otherFolder.id, "terminal");
+    const containers = vi
+      .spyOn(docker, "listContainers")
+      .mockResolvedValueOnce([
+        {
+          Labels: { "ai.workspace.chat": chat },
+          Mounts: [{ Type: "bind", Source: env, Destination: "/env" }],
+        },
+      ] as unknown as Awaited<ReturnType<typeof docker.listContainers>>)
+      .mockResolvedValue([]);
+    try {
+      // A launched runner can still hold the mount while its failed start is stopping.
+      expect((await clear()).statusCode).toBe(409);
+      expect(await readFile(path.join(env, "tool"), "utf8")).toBe(
+        "Installed tool",
+      );
+      await db.query(`
+        CREATE FUNCTION reject_project_env_update() RETURNS trigger LANGUAGE plpgsql AS
+        $$ BEGIN RAISE EXCEPTION 'Test error updating project tool usage'; END; $$;
+        CREATE TRIGGER reject_project_env_update
+        BEFORE UPDATE OF env_measured_at ON projects FOR EACH ROW
+        EXECUTE FUNCTION reject_project_env_update();
+      `);
+      try {
+        expect((await clear()).statusCode).toBe(500);
+        expect(await readFile(path.join(env, "tool"), "utf8")).toBe(
+          "Installed tool",
+        );
+      } finally {
+        await db.query(
+          "DROP TRIGGER reject_project_env_update ON projects; DROP FUNCTION reject_project_env_update()",
+        );
+      }
+      const result = await clear();
+      expect(result.statusCode).toBe(200);
+      expect(result.json()).toMatchObject({
+        usedBytes: 0,
+        busy: false,
+        state: "ready",
+      });
+      expect(await read()).toEqual(result.json());
+      expect((await clear()).statusCode).toBe(200);
+    } finally {
+      containers.mockRestore();
+    }
+    await expect(access(env)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await readFile(path.join(otherEnv, "tool"), "utf8")).toBe(
+      "Other project's tool",
+    );
+    await releaseFolder(otherFolder.id);
+  });
+  it.skipIf(process.env.DOCKER_TESTS !== "1")(
+    "remeasures before allowing project tool writes and warns in the terminal over budget",
+    async () => {
+      const { project_id: project } = await chatWorkspace(chat);
+      const url = "/api/projects/" + project + "/environment";
+      await db.query("UPDATE workspaces SET initialized=true WHERE id=$1", [
+        chat,
+      ]);
+      const limit = 0.0001;
+      expect(
+        (
+          await app.inject({
+            method: "POST",
+            url: "/api/settings/environment",
+            headers,
+            payload: { projectEnvLimitGib: limit },
+          })
+        ).statusCode,
+      ).toBe(200);
+      const initial = await launch(chat, account, () => {}, {
+        projectEnv: "read-write",
+      });
+      try {
+        const { Mounts } = await docker.getContainer(initial.id).inspect();
+        expect(Mounts).toContainEqual(
+          expect.objectContaining({ Destination: "/env", RW: true }),
+        );
+        expect(initial.projectEnvWarning).toBeUndefined();
+      } finally {
+        await initial.stop();
+      }
+      const cached = await measureProjectEnv(project!);
+      expect(cached).toBeLessThan(100_000);
+      const payload = path.join(
+        data,
+        "project-env",
+        project!,
+        "budget-fixture",
+      );
+      await writeFile(payload, randomBytes(512 * 1024));
+      expect(await measureProjectEnv(project!)).toBe(cached);
+
+      const socket = await openTerminal();
+      let output = "";
+      socket.on("message", (raw) => {
+        const event = JSON.parse(raw.toString());
+        if (event.type === "terminal") output += event.data;
+      });
+      try {
+        await vi.waitFor(
+          () =>
+            expect(output).toContain(
+              `Project tools exceed the ${limit} GiB limit`,
+            ),
+          { timeout: 15000 },
+        );
+        await vi.waitFor(() => expect(output).toMatch(/\$ /), {
+          timeout: 15000,
+        });
+        const blocked = await app.inject({
+          method: "POST",
+          url: url + "/clear",
+          headers,
+        });
+        expect(blocked.statusCode).toBe(409);
+        socket.send(
+          JSON.stringify({
+            type: "terminal",
+            data: "test -r /env/budget-fixture && ! touch /env/blocked && printf '\\nBUDGET_''READONLY\\n'\r",
+          }),
+        );
+        await vi.waitFor(
+          () => expect(output).toMatch(/^BUDGET_READONLY\r?$/m),
+          { timeout: 15000 },
+        );
+        expect(await measureProjectEnv(project!)).toBeGreaterThanOrEqual(
+          512 * 1024,
+        );
+      } finally {
+        socket.close();
+        await vi.waitFor(
+          async () => {
+            expect(
+              (
+                await db.query(
+                  "SELECT 1 FROM workspace_leases WHERE chat_id=$1",
+                  [chat],
+                )
+              ).rowCount,
+            ).toBe(0);
+          },
+          { timeout: 15000 },
+        );
+      }
+      await rm(payload);
+      const after = await launch(chat, account, () => {}, {
+        projectEnv: "read-write",
+      });
+      try {
+        expect(after.projectEnvWarning).toBeUndefined();
+        const { Mounts } = await docker.getContainer(after.id).inspect();
+        expect(Mounts).toContainEqual(
+          expect.objectContaining({ Destination: "/env", RW: true }),
+        );
+      } finally {
+        await after.stop();
+      }
+      await writeFile(payload, randomBytes(512 * 1024));
+      expect((await app.inject({ url, headers })).json().state).toBe("ready");
+      const refreshed = await app.inject({ url: url + "?refresh=1", headers });
+      expect(refreshed.json()).toMatchObject({ state: "over-budget" });
+      expect(refreshed.json().usedBytes).toBeGreaterThanOrEqual(512 * 1024);
+      const cleared = await app.inject({
+        method: "POST",
+        url: url + "/clear",
+        headers,
+      });
+      expect(cleared.statusCode).toBe(200);
+      expect(cleared.json()).toMatchObject({ usedBytes: 0, state: "ready" });
+      await expect(access(payload)).rejects.toMatchObject({ code: "ENOENT" });
+    },
+    60_000,
+  );
+  it.skipIf(process.env.DOCKER_TESTS !== "1")(
+    "uses an agent-installed tool from the project terminal without agent credentials",
+    async () => {
+      const { project_id: project } = await chatWorkspace(chat);
+      const copy = await createWorkspace(project, "copy", "Terminal copy", db);
+      await db.query("UPDATE workspaces SET initialized=true WHERE id=$1", [
+        copy.id,
+      ]);
+      await db.query(
+        "INSERT INTO chats(id,project_id,workspace_id,title,provider,account_id,branch,mode) VALUES($1,$2,$1,'Terminal copy','codex',$3,$4,'plan')",
+        [copy.id, project, account, copy.branch],
+      );
+      await db.query("UPDATE projects SET github_token=$2 WHERE id=$1", [
+        project,
+        seal("terminal-test-github-token"),
+      ]);
+      const profile = path.join(data, "account-auth", account, ".codex");
+      await mkdir(profile, { recursive: true });
+      await writeFile(
+        path.join(profile, "auth.json"),
+        JSON.stringify({ tokens: { access_token: "terminal-test-account" } }),
+      );
+
+      const agent = await launch(chat, account, () => {}, {
+        projectEnv: "read-write",
+      });
+      try {
+        const exec = await docker.getContainer(agent.id).exec({
+          User: "1000:1000",
+          Cmd: [
+            "/bin/bash",
+            "-ec",
+            String.raw`
+              test -f /profile/.codex/auth.json
+              mkdir /tmp/package
+              printf '%s\n' '{"name":"workspace-terminal-fixture","version":"1.0.0","bin":{"workspace-terminal-fixture":"fixture.sh"}}' > /tmp/package/package.json
+              printf '#!/bin/sh\nprintf "project tool ready"\n' > /tmp/package/fixture.sh
+              chmod +x /tmp/package/fixture.sh
+              tar -czf /tmp/workspace-terminal-fixture.tgz -C /tmp package
+              npm install --global --offline --no-audit --no-fund /tmp/workspace-terminal-fixture.tgz
+            `,
+          ],
+          AttachStdout: true,
+          AttachStderr: true,
+          Tty: true,
+        });
+        const stream = await exec.start({ hijack: true, stdin: false });
+        let output = "";
+        for await (const chunk of stream) output += chunk.toString();
+        expect((await exec.inspect()).ExitCode, output).toBe(0);
+      } finally {
+        await agent.stop();
+      }
+
+      const socket = await openTerminal(copy.id);
+      let output = "";
+      socket.on("message", (raw) => {
+        const event = JSON.parse(raw.toString());
+        if (event.type === "terminal") output += event.data;
+      });
+      try {
+        await vi.waitFor(() => expect(output).not.toBe(""), { timeout: 15000 });
+        const command = [
+          ...Object.entries(projectToolEnvironment).map(
+            ([key, value]) => 'test "$' + key + '" = "' + value + '"',
+          ),
+          'test "$PATH" = "$WORKSPACE_PROJECT_TOOL_PATH"',
+          'test "$(workspace-terminal-fixture)" = "project tool ready"',
+          'test "$HOME" = /tmp',
+          "test ! -e /profile/.codex/auth.json",
+          'test -z "${CODEX_HOME+x}${CLAUDE_CONFIG_DIR+x}"',
+          'test -z "${WORKSPACE_GIT_TOKEN+x}${GITHUB_TOKEN+x}${GH_TOKEN+x}${GIT_ASKPASS+x}"',
+          'printf "terminal wrote here" > /env/terminal-proof',
+          "printf '\\nPROJECT_TERMINAL_''CHECK_PASSED\\n'",
+        ].join(" && ");
+        socket.send(JSON.stringify({ type: "terminal", data: command + "\r" }));
+        await vi.waitFor(
+          () => expect(output).toMatch(/^PROJECT_TERMINAL_CHECK_PASSED\r?$/m),
+          { timeout: 15000 },
+        );
+        expect(
+          await readFile(
+            path.join(data, "project-env", project!, "terminal-proof"),
+            "utf8",
+          ),
+        ).toBe("terminal wrote here");
+      } finally {
+        socket.close();
+        await vi.waitFor(
+          async () =>
+            expect(
+              (
+                await db.query(
+                  "SELECT 1 FROM workspace_leases WHERE chat_id=$1",
+                  [copy.id],
+                )
+              ).rowCount,
+            ).toBe(0),
+          { timeout: 15000 },
+        );
+      }
     },
     60_000,
   );

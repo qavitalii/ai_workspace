@@ -1,10 +1,11 @@
-import Docker from "dockerode";
+import type Docker from "dockerode";
 import type { Duplex } from "node:stream";
 import { consumeRunnerOutput } from "./runner-output.js";
 import { mkdir, chown, chmod } from "node:fs/promises";
 import path from "node:path";
-import { config } from "./config.js";
-import { concurrentTasks } from "./settings.js";
+import { config, GiB } from "./config.js";
+import { concurrentTasks, projectEnvLimitGib } from "./settings.js";
+import { docker } from "./docker.js";
 import type { AgentEvent, RunnerCommand } from "../shared.js";
 import { db } from "./db.js";
 import {
@@ -18,13 +19,14 @@ import { attachInput } from "./docker-attach.js";
 import { removeDockerResource } from "./docker-cleanup.js";
 import { cleanAwsCredentials, awsForRun } from "./aws.js";
 import { cleanSkillSnapshots, prepareSkills } from "./skills.js";
+import { measureProjectEnv, prepareProjectEnv } from "./project-env.js";
 import {
   prepareProfile,
   recoverRunProfiles,
   removeSessionsExcept,
   type ProfileRun,
 } from "./profiles.js";
-export const docker = new Docker();
+export { docker };
 // IDs here identify persistent folders, not chats.
 export const workspace = workspacePath;
 async function writable(dir: string) {
@@ -36,6 +38,7 @@ export type Running = {
   id: string;
   aws?: boolean;
   awsWarning?: string;
+  projectEnvWarning?: string;
   send: (c: RunnerCommand) => void;
   stop: () => Promise<void>;
   withPausedWorkspace?: <T>(operation: () => Promise<T>) => Promise<T>;
@@ -50,12 +53,17 @@ export async function launch(
     sessionId?: string | null;
     signIn?: boolean;
     installPackages?: boolean;
+    projectEnv?: "read-only" | "read-write";
   } = {},
 ): Promise<Running> {
-  const image = options.installPackages
-    ? await docker.getImage(config.image).inspect()
-    : undefined;
+  const w = chatId ? await chatWorkspace(chatId) : null;
+  const projectEnvId = options.projectEnv ? w?.project_id : null;
+  const image =
+    options.installPackages || projectEnvId
+      ? await docker.getImage(config.image).inspect()
+      : undefined;
   const installPackages =
+    options.installPackages &&
     image?.Config?.Labels?.["ai.workspace.runner.package-installer"] === "1";
   let packageConcurrency: number | undefined;
   if (installPackages) {
@@ -68,12 +76,36 @@ export async function launch(
     // Lowering the limit does not stop the jobs already admitted.
     packageConcurrency = Math.max(configured, Number(running.rows[0].n));
   }
-  const w = chatId ? await chatWorkspace(chatId) : null;
   const work = w
     ? workspace(w.id)
     : path.join(config.data, "auth-workspaces", accountId!);
   await writable(work);
   const mounts: any[] = [{ Type: "bind", Source: work, Target: "/workspace" }];
+  const projectEnv = projectEnvId
+    ? await prepareProjectEnv(projectEnvId, {
+        writable: options.projectEnv === "read-write",
+        imagePath: image?.Config?.Env?.find((entry) =>
+          entry.startsWith("PATH="),
+        )?.slice("PATH=".length),
+      })
+    : null;
+  let projectEnvWarning: string | undefined;
+  if (projectEnv && projectEnvId) {
+    // Cached measurements can describe read-only runs. A launch that would
+    // allow writes must account for installations since the last measurement.
+    const bytes = await measureProjectEnv(projectEnvId, {
+      fresh: !projectEnv.mount.ReadOnly,
+      image: image?.Id,
+    }).catch(() => null);
+    const limitGib = await projectEnvLimitGib();
+    if (bytes === null)
+      projectEnvWarning =
+        "Could not measure project tools. /env is mounted read-only for this session.";
+    else if (bytes > Math.round(limitGib * GiB))
+      projectEnvWarning = `Project tools exceed the ${limitGib} GiB limit. /env is mounted read-only for this session.`;
+    if (projectEnvWarning) projectEnv.mount.ReadOnly = true;
+    mounts.push(projectEnv.mount);
+  }
   if (chatId && w) {
     mounts.push(...workspaceGitMounts(w));
     if (w.resolution_operation_id)
@@ -182,7 +214,7 @@ export async function launch(
         "CODEX_HOME=/profile/.codex",
         "CLAUDE_CONFIG_DIR=/profile/.claude",
         "GIT_OPTIONAL_LOCKS=0",
-        ...Object.entries(aws?.env ?? {}).map(
+        ...Object.entries({ ...aws?.env, ...projectEnv?.env }).map(
           ([key, value]) => key + "=" + value,
         ),
         ...(packageConcurrency === undefined
@@ -315,12 +347,14 @@ export async function launch(
   void output.catch(() => {});
   try {
     await c.start();
-    if (image && !installPackages)
+    if (options.installPackages && !installPackages)
       await onEvent({
         type: "warning",
         message:
           "This runner image does not support installing system packages during a task. Refresh the bundled image with ./ops/compose.sh build runner-image, or rebuild your custom image from the current Workspace runner.",
       });
+    if (projectEnvWarning)
+      await onEvent({ type: "warning", message: projectEnvWarning });
   } catch (error) {
     await stop();
     throw error;
@@ -354,6 +388,7 @@ export async function launch(
     id: c.id,
     aws: !!aws,
     awsWarning,
+    projectEnvWarning,
     withPausedWorkspace,
     send(c) {
       if (!stopped) stream.write(JSON.stringify(c) + "\n");

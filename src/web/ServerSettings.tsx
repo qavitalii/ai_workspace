@@ -1,34 +1,6 @@
 import { useEffect, useState, useRef } from "react";
 import { api } from "./api";
-
-function bytes(n: number) {
-  const unit = n >= 1024 ** 4 ? "TiB" : n >= 1024 ** 3 ? "GiB" : "MiB";
-  const size =
-    unit === "TiB" ? 1024 ** 4 : unit === "GiB" ? 1024 ** 3 : 1024 ** 2;
-  return `${(n / size).toFixed(1)} ${unit}`;
-}
-function Metric({
-  label,
-  value,
-  detail,
-  percent,
-}: {
-  label: string;
-  value: string;
-  detail: string;
-  percent?: number | null;
-}) {
-  return (
-    <div className="resource-card">
-      <span>{label}</span>
-      <strong>{value}</strong>
-      {typeof percent === "number" && (
-        <progress aria-label={label + " usage"} value={percent} max={100} />
-      )}
-      <small>{detail}</small>
-    </div>
-  );
-}
+import { Metric, resourceBytes as bytes } from "./ResourceMetric";
 export function ServerSettings() {
   const [system, setSystem] = useState<any>(null);
   const [maximum, setMaximum] = useState("");
@@ -324,7 +296,97 @@ export function ServerSettings() {
             </p>
           )}
         </form>
+        {typeof system?.projectEnvLimitGib === "number" && (
+          <ProjectToolsLimit
+            limit={system.projectEnvLimitGib}
+            onSaved={(value) =>
+              setSystem((old: any) => ({ ...old, projectEnvLimitGib: value }))
+            }
+          />
+        )}
       </div>
     </section>
+  );
+}
+
+function ProjectToolsLimit({
+  limit,
+  onSaved,
+}: {
+  limit: number;
+  onSaved: (value: number) => void;
+}) {
+  const [draft, setDraft] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [feedback, setFeedback] = useState("");
+  const [error, setError] = useState("");
+  return (
+    <form
+      className="execution-settings workspace-settings-card"
+      onSubmit={async (event) => {
+        event.preventDefault();
+        if (saving) return;
+        setError("");
+        setFeedback("");
+        const value = Number(draft ?? limit);
+        if (!Number.isFinite(value) || value <= 0) {
+          setError("Enter a positive size in GiB.");
+          return;
+        }
+        setSaving(true);
+        try {
+          const saved = await api<{ projectEnvLimitGib: number }>(
+            "/settings/environment",
+            { projectEnvLimitGib: value },
+          );
+          onSaved(saved.projectEnvLimitGib);
+          setDraft(null);
+          setFeedback("Limit saved.");
+        } catch (error) {
+          setError((error as Error).message);
+        } finally {
+          setSaving(false);
+        }
+      }}
+    >
+      <header className="settings-card-heading">
+        <h4>Project tools</h4>
+      </header>
+      <label className="field">
+        <span>Limit (GiB per project)</span>
+        <input
+          type="number"
+          min={0}
+          step="any"
+          required
+          disabled={saving}
+          value={draft ?? String(limit)}
+          onChange={(event) => {
+            setDraft(event.target.value);
+            setFeedback("");
+            setError("");
+          }}
+          aria-describedby="project-tools-limit-help"
+        />
+      </label>
+      <p id="project-tools-limit-help" className="muted">
+        Applies to new sessions. Over the limit, installed tools are read-only.
+      </p>
+      <div className="settings-card-actions">
+        <button className="primary" disabled={saving}>
+          {saving ? "Saving…" : "Save project tools limit"}
+        </button>
+      </div>
+      {error && (
+        <p className="inline-error" role="alert">
+          {error}
+        </p>
+      )}
+      {feedback && (
+        <p className="success" role="status">
+          {feedback}
+        </p>
+      )}
+    </form>
   );
 }

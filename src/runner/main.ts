@@ -22,6 +22,7 @@ import {
 } from "node:fs/promises";
 import path from "node:path";
 import { randomBytes, randomUUID } from "node:crypto";
+import { projectToolEnvironment } from "../project-tool-environment.js";
 import { quotaError, type RunInput, type RunnerCommand } from "../shared.js";
 import { claudeSubscriptionUsage } from "../usage.js";
 const emit = (data: unknown) =>
@@ -285,6 +286,15 @@ function packageServerFor(input: RunInput) {
 }
 function executionPrompt(input: RunInput, packageServerName?: string) {
   let prompt = input.prompt;
+  if (input.projectEnvWarning) prompt += "\n\n" + input.projectEnvWarning;
+  else if (
+    process.env.WORKSPACE_PROJECT_TOOL_PATH &&
+    input.mode !== "plan" &&
+    !input.operation &&
+    (input.provider === "claude" || input.autonomous)
+  )
+    prompt +=
+      "\n\nUser-level tools persist for this project in /env. Use npm install -g or pip install --user for tools the project needs. Other agents of this project share them.";
   if (packageServerName)
     prompt +=
       "\n\nIf this task needs a system package, call " +
@@ -795,6 +805,7 @@ createInterface({ input: process.stdin }).on("line", async (line) => {
     if (c.type === "terminal") {
       if (!terminal) {
         const pty = await import("node-pty");
+        const projectToolPath = process.env.WORKSPACE_PROJECT_TOOL_PATH;
         terminal = pty.spawn("/bin/bash", ["--noprofile", "--norc"], {
           name: "xterm-256color",
           cwd: "/workspace",
@@ -804,9 +815,15 @@ createInterface({ input: process.stdin }).on("line", async (line) => {
             PATH: process.env.PATH,
             HOME: "/tmp",
             TERM: "xterm-256color",
+            // Keep the terminal environment explicit, even inside a runner.
             ...(Object.fromEntries(
               Object.entries(process.env).filter(
-                ([key, value]) => key.startsWith("AWS_") && value !== undefined,
+                ([key, value]) =>
+                  value !== undefined &&
+                  (key.startsWith("AWS_") ||
+                    (!!projectToolPath &&
+                      (key === "WORKSPACE_PROJECT_TOOL_PATH" ||
+                        Object.hasOwn(projectToolEnvironment, key)))),
               ),
             ) as Record<string, string>),
           },

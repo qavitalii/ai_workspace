@@ -37,6 +37,15 @@ These browser captures show the React interface as of 2026-11-19 using fictional
 | Servers and SSH keys | | [Mobile](ui-refresh/workspace-ssh-mobile.jpg) |
 | Skills | [Desktop](ui-refresh/workspace-skills-desktop.jpg) | |
 
+## Project tools
+
+These Chromium captures use fictional usage data and show the project environment and server resource settings.
+
+| Screen | Desktop | Mobile |
+| --- | --- | --- |
+| Project environment | [Usage](project-tools/project-tools-desktop.png) | [Over the limit](project-tools/project-tools-over-budget-mobile.png) |
+| Workspace resource settings | [Limit setting](project-tools/server-tools-limit-desktop.png) | [Saved limit](project-tools/server-tools-limit-mobile.png) |
+
 ## Refresh the captures
 
 1. Run `npm ci`, then `node ops/preview-docs.mjs`. The preview serves fictional data on `http://127.0.0.1:4178` without connecting to the database or providers.

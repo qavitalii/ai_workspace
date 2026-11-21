@@ -12,6 +12,13 @@ export type ProjectPackages = {
     disabled: boolean;
   }[];
 };
+export type ProjectEnvironmentInfo = {
+  usedBytes: number | null;
+  limitBytes: number;
+  limitGib: number;
+  state: "ready" | "over-budget" | "unavailable";
+  busy: boolean;
+};
 export type RunState =
   | "queued"
   | "running"
@@ -44,6 +51,7 @@ export type RunInput = {
   githubSync?: boolean;
   provider: Provider;
   prompt: string;
+  projectEnvWarning?: string;
   model?: string;
   effort?: string;
   autonomous: boolean;

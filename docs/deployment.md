@@ -87,6 +87,7 @@ The installer creates `.env` with permissions `600`. Do not commit it or include
 | `ENCRYPTION_KEY` | 32 random bytes in hexadecimal; do not rotate without migrating encrypted secrets |
 | `MAX_CONCURRENT` | Default maximum concurrent tasks, 3 initially; any positive whole number. A value saved in Settings → Resources overrides this environment default |
 | `OUTPUT_LIMIT_GB` | Initial shared saved-output budget in decimal GB, 1 by default (0.01–10000). After the first migration, change it in Settings → Resources |
+| `PROJECT_ENV_LIMIT_GIB` | Initial project tool storage limit, 8 GiB per project by default. A value saved in Settings → Resources takes precedence |
 | `WORKSPACE_PROXY_IP`, `WORKSPACE_SERVER_PROXY_IP`, `WORKSPACE_PROXY_SUBNET` | Dedicated proxy network: defaults `172.30.250.2`, `172.30.250.3`, `172.30.250.0/24`; change all three together if the subnet overlaps another network |
 | `TRUSTED_PROXY_IPS` | Outside Compose, comma-separated explicit immediate proxy IPs; empty trusts none. Compose sets this to Caddy’s fixed address |
 | `MAX_FILE_MB` | Maximum attachment size, 25 MB by default |
@@ -111,6 +112,8 @@ Open **Settings → Resources** to see CPU usage/idle percentage, used/available
 **Saved agent output limit (GB, all chats)** sets one shared budget for responses, persisted activity, approval details and conversation summaries. The default is 1 GB (1,000,000,000 bytes); fractional values from 0.01 to 10000 GB are accepted. Usage includes UTF-8 payload bytes plus a 256-byte allowance per event, assistant message and approval. This is not a total disk quota: PostgreSQL indexes/WAL/physical overhead, project files, attachments, provider-native histories, backups and container logs use additional space.
 
 Writes reserve capacity atomically across simultaneous tasks. If the next output cannot fit, that task stops with an explanation; raise the limit or delete old chats, then retry. Lowering the limit below existing usage keeps all history and blocks further growth. Existing installations are measured during migration, never purged. Completed streaming fragments are consolidated into their saved answer. Separately, the supervisor caps each runner event/frame at 1 MiB and each response at 4 MiB, waits for event processing before reading more, and bounds WebSocket buffering. Runner Docker logs rotate at 10 MB × 3 per container.
+
+**Project tools** sets the storage limit for each project's shared `/env`. Execution tasks and terminals can install packages with commands such as `npm install -g` or `pip install --user`. The tools remain available to later chats and terminals in the same project. Workspace measures usage before each session that can write and mounts `/env` read-only if usage is over the limit or the measurement fails. Open **Project settings → Environment** to refresh usage or clear the installed tools and caches after the project's tasks and terminals have stopped.
 
 Each account still serves only one running task at a time. Increasing capacity does not create accounts, bypass provider quotas, or reserve CPU/RAM in advance. Each runner retains its configured CPU/RAM/PID limits. Size the server for your workloads and use the live metrics to observe actual usage. A 50-slot scheduler test is not a 50-container performance benchmark.
 
@@ -168,6 +171,7 @@ A root VPS installation creates `/etc/cron.d/ai-workspace-backup`, scheduled for
 | `workspace-git/` | Shared Git history, branches and linked-worktree metadata |
 | `workspace-operations/` | Copy baselines, frozen reviews, resolution inputs and recovery journals/files |
 | `workspace-checkpoints/` | Previous main folders saved before transfers |
+| `project-env/` | Project tool installations and caches |
 | `uploads/`, `account-auth/`, `account-sessions/`, `shared/` | Original attachments, account sign-in files, per-chat native sessions and default connected folders |
 | `profiles/` | Legacy shared account profiles, read once for migration; removed with the account |
 

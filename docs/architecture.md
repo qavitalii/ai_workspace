@@ -42,6 +42,12 @@ An execution task starts a local installer broker before dropping the agent CLI 
 
 The installer requires Landlock ABI 3 or newer in the Docker host kernel. When the policy cannot start, the unprivileged agent can still execute tasks with the bundled tools. Before downloading packages, the installer estimates archive and unpacked dependency sizes against a 1 GiB cumulative budget per run and checks available space on the Docker filesystem. It reserves 512 MiB plus one run's budget per other execution slot, counting already active jobs if they exceed the configured limit. This preflight uses package metadata and a snapshot of free space. Successful requests appear in the task log. Additional packages are discarded with the container.
 
+## Project tools
+
+`DATA_ROOT/project-env/<project-id>` backs the `/env` mount shared by project chats, terminals and working copies. The runner adds project tool directories to the end of `PATH` and places supported user-level installations and caches under `/env`. Planning and read-only operations mount it read-only. Personal chats and account-management containers have no project environment.
+
+Before a writable start, a restricted helper measures the directory. If usage is over the configured per-project limit or measurement fails, that session can read existing tools. Workspace checks the limit at session start, so an active session retains its original mount permissions. Clearing tools checks active jobs and terminals under the scheduler lock, invalidates cached usage and detaches the project's directory. Startup retries any unfinished deletion of detached files.
+
 ## Account profiles
 
 An agent can be prompt-injected, so `/profile` is not persistent agent-writable state. Before each run the supervisor creates `run-profiles/<run-id>`, copies in the account's sign-in files and, for chat runs, that chat's stored session transcript, and mounts it at `/profile`. Once the container is removed (or its processes have exited), the supervisor:
@@ -75,6 +81,7 @@ All `/api/*` routes except `/login` and `/health` require an HttpOnly session co
 | `GET /api/overview`, `GET /api/search` | Projects, chats, accounts, history search |
 | `POST /api/projects`, `PATCH /api/projects/:id` | Connect a GitHub URL/`owner/repository`, or create a files-only project with `name` and empty/omitted `repo`; rename and manage project-specific tokens |
 | `GET /api/projects/:id/workspaces`, `POST /api/projects/:id/main-workspace` | List persistent folders; explicitly choose the main folder (`workspace_id`, or null for a fresh main folder) |
+| `GET /api/projects/:id/environment`, `POST /api/projects/:id/environment/clear` | Check project tool disk usage, optionally with `refresh=1`, and clear tools when idle |
 | `POST /api/workspaces/:id/initialize` | Prepare the selected folder under an exclusive lease |
 | `POST /api/workspaces/:id/sync` | Sync the selected Git folder from its project’s GitHub base branch under an exclusive lease |
 | `GET/POST /api/workspaces/:id/files`, `GET /api/workspaces/:id/file` | Browse, upload and download working files independently of any chat |
@@ -89,6 +96,7 @@ All `/api/*` routes except `/login` and `/health` require an HttpOnly session co
 | `PATCH /api/chats/:id/model`, `/permissions` | Update model/effort or approval mode |
 | `POST /api/chats/:id/mode` | Switch planning/execution mode |
 | `GET /api/settings/models`, `POST /api/settings/models/:provider` | Read and save provider defaults for new chats |
+| `POST /api/settings/environment` | Set the storage limit in GiB for each project's tools |
 | `POST /api/accounts/:id/usage` | Refresh reported account limits |
 | `POST /api/chats/:id/messages` | Message, attachment IDs, and `client_id` |
 | `POST /api/chats/:id/attachments?client_id=…` | Upload one multipart file |
