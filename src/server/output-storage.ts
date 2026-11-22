@@ -30,7 +30,7 @@ CREATE TABLE IF NOT EXISTS output_storage(
 CREATE OR REPLACE FUNCTION output_row_bytes(tbl text, r jsonb) RETURNS bigint
 LANGUAGE sql IMMUTABLE AS $$
   SELECT CASE WHEN r IS NULL THEN 0 ELSE CASE tbl
-    WHEN 'events' THEN octet_length((r->'data')::text) + 256
+    WHEN 'events' THEN CASE WHEN r->>'package_startup_notice'='true' THEN 0 ELSE octet_length((r->'data')::text) + 256 END
     WHEN 'messages' THEN CASE WHEN r->>'role'='assistant' THEN octet_length(r->>'content') + 256 ELSE 0 END
     WHEN 'approvals' THEN octet_length(r->>'description') + COALESCE(octet_length((r->'details')::text),0) + COALESCE(octet_length((r->'questions')::text),0) + 256
     WHEN 'chats' THEN octet_length(r->>'summary')

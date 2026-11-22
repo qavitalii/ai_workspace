@@ -23,6 +23,8 @@ import { githubSyncMessage, type AgentEvent } from "../shared.js";
 import { packageNames } from "../runner/package-request.js";
 import { rememberProjectPackages } from "./project-packages.js";
 export const active = new Map<string, Running>();
+const maxPackageStartupNotices = 4;
+const maxPackageStartupNoticeBytes = 32 * 1024;
 let ticking = false,
   shutting = false;
 export function summaryFrom(
@@ -106,6 +108,8 @@ export async function runJob(job: any) {
     text = "",
     textBytes = 0,
     lastCheckpoint = 0;
+  let packageStartupNotices = 0;
+  let agentStarted = false;
   const chat = (
     await db.query("SELECT * FROM chats WHERE id=$1", [job.chat_id])
   ).rows[0];
@@ -239,6 +243,33 @@ export async function runJob(job: any) {
   }
   async function handle(e: AgentEvent) {
     if (finished) return;
+    if (e.type === "session") agentStarted = true;
+    // Startup can produce a log and a warning for each of failed and skipped
+    // presets. Only these bounded notices are exempt from the output quota.
+    if (
+      chat.project_id &&
+      !agentStarted &&
+      e.projectPackageStartup === true &&
+      (e.type === "log" || e.type === "warning") &&
+      packageStartupNotices < maxPackageStartupNotices
+    ) {
+      const field = e.type === "log" ? "text" : "message";
+      const notice = e[field];
+      if (
+        typeof notice === "string" &&
+        Buffer.byteLength(notice) <= maxPackageStartupNoticeBytes
+      ) {
+        packageStartupNotices++;
+        await event(
+          chat.id,
+          job.id,
+          e.type,
+          { type: e.type, projectPackageStartup: true, [field]: notice },
+          { packageStartupNotice: true },
+        );
+        return;
+      }
+    }
     if (e.type === "generated_image") {
       if (
         typeof e.name === "string" &&

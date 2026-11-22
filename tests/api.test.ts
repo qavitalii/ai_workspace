@@ -317,6 +317,85 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
       });
     });
 
+    it("keeps a full startup package list when the remaining output quota is small", async () => {
+      await withRunningJob(async (emit, jobId) => {
+        const packages = Array.from({ length: 256 }, (_, index) =>
+          `workspace-fixture-package-${index}`.padEnd(63, "x"),
+        );
+        const output = {
+          type: "log",
+          projectPackageStartup: true,
+          text: `Preset budget is zero.\nPackages: ${packages.join(", ")}`,
+        };
+        const warning = {
+          type: "warning",
+          projectPackageStartup: true,
+          message: "Workspace skipped some saved Debian packages.",
+        };
+        await db.query(
+          "UPDATE output_storage SET limit_bytes=used_bytes+5000 WHERE id=1",
+        );
+        const before = await outputStorage();
+        await emit(output);
+        await emit(warning);
+        expect(await outputStorage()).toEqual(before);
+
+        await emit({ type: "session", id: "fixture-session" });
+        const lateLog = { ...output, text: "Marked log after startup." };
+        const afterStartup = await outputStorage();
+        await emit(lateLog);
+        expect((await outputStorage()).usedBytes).toBeGreaterThan(
+          afterStartup.usedBytes,
+        );
+        await emit({ type: "completed", result: "Task completed." });
+        const response = await request({ url: `/api/chats/${chat}`, headers });
+        expect(response.statusCode).toBe(200);
+        const detail = response.json();
+        expect(detail.jobs[0]).toMatchObject({ id: jobId, state: "completed" });
+        expect(detail.messages.at(-1)).toMatchObject({
+          role: "assistant",
+          content: "Task completed.",
+        });
+        expect(detail.events).toMatchObject([
+          { data: output },
+          { data: warning },
+          { data: lateLog },
+        ]);
+      });
+    });
+
+    it("bounds the size and number of quota-exempt startup notices", async () => {
+      await withRunningJob(async (emit, jobId) => {
+        const startup = {
+          type: "log",
+          projectPackageStartup: true,
+          text: "Startup notice",
+        };
+        await emit({ ...startup, text: "x".repeat(33 * 1024) });
+        for (let i = 0; i < 5; i++) await emit(startup);
+        await emit({ type: "completed" });
+
+        const { rows } = await db.query(
+          "SELECT package_startup_notice FROM events WHERE job_id=$1 AND type='log' ORDER BY id",
+          [jobId],
+        );
+        expect(rows.map((row) => row.package_startup_notice)).toEqual([
+          false,
+          true,
+          true,
+          true,
+          true,
+          false,
+        ]);
+        const { usedBytes } = await outputStorage();
+        await db.query(
+          "DELETE FROM events WHERE job_id=$1 AND package_startup_notice",
+          [jobId],
+        );
+        expect((await outputStorage()).usedBytes).toBe(usedBytes);
+      });
+    });
+
     it.skipIf(process.env.DOCKER_TESTS !== "1").each([
       ["zero budget", "the preset budget is zero"],
       ["full project storage", "no project tool storage was available"],

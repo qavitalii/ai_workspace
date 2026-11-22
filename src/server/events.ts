@@ -10,12 +10,13 @@ async function writeEvent(
   jobId: string | null,
   type: string,
   data: unknown,
+  packageStartupNotice: boolean,
 ) {
   const clean = JSON.parse(redact(JSON.stringify(data)));
   const row = (
     await db.query(
-      "INSERT INTO events(chat_id,job_id,type,data) VALUES($1,$2,$3,$4) RETURNING *",
-      [chatId, jobId, type, clean],
+      "INSERT INTO events(chat_id,job_id,type,data,package_startup_notice) VALUES($1,$2,$3,$4,$5) RETURNING *",
+      [chatId, jobId, type, clean, packageStartupNotice],
     )
   ).rows[0];
   bus.emit("event", row);
@@ -26,8 +27,11 @@ export function event(
   jobId: string | null,
   type: string,
   data: unknown,
+  { packageStartupNotice = false } = {},
 ) {
-  const next = writing.then(() => writeEvent(chatId, jobId, type, data));
+  const next = writing.then(() =>
+    writeEvent(chatId, jobId, type, data, packageStartupNotice),
+  );
   writing = next.catch(() => {});
   return next;
 }
