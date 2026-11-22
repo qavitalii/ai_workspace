@@ -7,6 +7,7 @@ import {
 } from "./integrations.js";
 import { githubSyncBridge } from "./github-sync-bridge.js";
 import { drainPackageAudit } from "./package-audit.js";
+import { packagePresetResults } from "./package-request.js";
 import { codexImageItem } from "./generated-images.js";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createInterface } from "node:readline";
@@ -27,6 +28,51 @@ import { quotaError, type RunInput, type RunnerCommand } from "../shared.js";
 import { claudeSubscriptionUsage } from "../usage.js";
 const emit = (data: unknown) =>
   process.stdout.write(JSON.stringify(data) + "\n");
+const preinstalledPackages: string[] = [];
+const packagePresetReport = process.env.WORKSPACE_PROJECT_PACKAGE_RESULT;
+delete process.env.WORKSPACE_PROJECT_PACKAGE_RESULT;
+if (packagePresetReport) {
+  let results = null;
+  let incomplete = true;
+  try {
+    const report = JSON.parse(packagePresetReport);
+    results = packagePresetResults(report.results);
+    incomplete = report.incomplete !== false;
+  } catch {}
+  emit({ type: "project_packages_ready", results: results ?? [] });
+  if (results?.length) {
+    preinstalledPackages.push(
+      ...results.filter(({ ok }) => ok).map(({ name }) => name),
+    );
+    const failures = results.filter(({ ok }) => !ok).map(({ name }) => name);
+    if (failures.length) {
+      const summary = failures.slice(0, 3).join(", ");
+      const additional = failures.length - 3;
+      emit({
+        type: "warning",
+        message:
+          "Could not preinstall project Debian packages: " +
+          summary +
+          (additional > 0
+            ? ` and ${additional} more. See the execution log.`
+            : ""),
+      });
+      if (additional > 0)
+        emit({
+          type: "log",
+          text:
+            "Project Debian packages that could not be preinstalled: " +
+            failures.join(", "),
+        });
+    }
+  }
+  if (incomplete || !results)
+    emit({
+      type: "warning",
+      message:
+        "Project Debian package installation did not finish before the agent started.",
+    });
+}
 const githubSync = githubSyncBridge((id) => emit({ type: "github_sync", id }));
 function flushPackageAudit() {
   if (process.env.WORKSPACE_SYSTEM_PACKAGES === "1")
@@ -295,11 +341,20 @@ function executionPrompt(input: RunInput, packageServerName?: string) {
   )
     prompt +=
       "\n\nUser-level tools persist for this project in /env. Use npm install -g or pip install --user for tools the project needs. Other agents of this project share them.";
-  if (packageServerName)
+  if (preinstalledPackages.length)
+    prompt +=
+      "\n\nPreinstalled project packages: " +
+      preinstalledPackages.join(", ") +
+      ".";
+  if (packageServerName) {
     prompt +=
       "\n\nIf this task needs a system package, call " +
       packageToolName(packageServerName) +
-      " with its Debian package name, for example ffmpeg. The tool is the same installer as workspace-install and avoids shell permission prompts. Installed packages last only for this run.";
+      " with its Debian package name, for example ffmpeg. The tool is the same installer as workspace-install and avoids shell permission prompts.";
+    if (process.env.WORKSPACE_PROJECT_TOOL_PATH)
+      prompt +=
+        " Workspace remembers packages for future runs when automatic remembering is enabled in Project settings.";
+  }
   if (input.githubSync)
     prompt += `\n\nWhen the user asks to update this working folder from GitHub, call ${githubSyncToolName} before editing files. It uses the project’s saved GitHub access and stops for local edits or conflicts. Report blocked syncs without resetting or stashing changes.`;
   return prompt;
@@ -721,6 +776,8 @@ createInterface({ input: process.stdin }).on("line", async (line) => {
       const githubSyncPort = c.input.githubSync
         ? await githubSync.start()
         : undefined;
+      // Stop can arrive while the runner is processing buffered startup input.
+      if (ended) return;
       if (c.input.provider === "codex") await runCodex(c.input, githubSyncPort);
       else await runClaude(c.input, githubSyncPort);
     }

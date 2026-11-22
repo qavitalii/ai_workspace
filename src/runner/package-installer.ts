@@ -3,11 +3,11 @@ import {
   estimateInstallBytes,
   packageIndexAllowance,
   parseInstallPlan,
+  type InstallMode,
   type PackageBudgets,
 } from "./package-disk.js";
-import { maxPackageRequests } from "./package-request.js";
+import { maxPackageRequests, packagePresetTimeout } from "./package-request.js";
 
-export type InstallMode = keyof PackageBudgets;
 export type InstallResult = { ok: boolean; output: string };
 type AptResult = InstallResult & {
   interrupted?: boolean;
@@ -42,9 +42,11 @@ export function packageFailure(
     ok: false,
     output,
     ...(mode === "preset" && {
+      incomplete: true,
       results: names.map((name) => ({
         name,
         ok: false,
+        skipped: true,
         output: output.slice(0, maxPresetPackageOutput),
       })),
     }),
@@ -65,6 +67,7 @@ export function createPackageInstaller({
   budgets: PackageBudgets;
 }) {
   let refreshed = false;
+  let presetDeadline: number | undefined;
   let unavailable = "";
   const chargedBytes = { run: 0, preset: 0 };
   const installed: string[][] = [];
@@ -250,7 +253,10 @@ export function createPackageInstaller({
         `This run has reached its limit of ${maxPackageRequests} package install requests.`,
       );
     const apt = runApt(mode);
-    const deadline = Date.now() + (mode === "preset" ? 180_000 : 210_000);
+    const deadline =
+      mode === "preset"
+        ? (presetDeadline ??= Date.now() + packagePresetTimeout)
+        : Date.now() + 210_000;
     if (!refreshed) {
       const index = await refreshIndex(mode, apt, deadline, signal).catch(
         () => couldNotStart,
@@ -266,6 +272,14 @@ export function createPackageInstaller({
     // plan cannot prevent the rest of the preset from being installed.
     const results = [];
     for (const name of names) {
+      const reason =
+        unavailable ||
+        (signal.aborted ? cancelled.output : "") ||
+        (Date.now() >= deadline ? timedOut.output : "");
+      if (reason) {
+        results.push({ name, ok: false, skipped: true, output: reason });
+        continue;
+      }
       const { ok, output } = await install(
         [name],
         mode,
@@ -282,6 +296,7 @@ export function createPackageInstaller({
     const ok = results.every((result) => result.ok);
     return {
       ok,
+      incomplete: results.some(({ skipped }) => skipped),
       output: ok
         ? "Preset packages are ready."
         : "Some preset packages could not be installed.",

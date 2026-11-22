@@ -19,11 +19,10 @@ import {
   packageSocket,
   packageUsage,
 } from "./package-request.js";
-import { packageBudgets } from "./package-disk.js";
+import { packageBudgets, type InstallMode } from "./package-disk.js";
 import {
   createPackageInstaller,
   packageFailure,
-  type InstallMode,
   type RunApt,
 } from "./package-installer.js";
 

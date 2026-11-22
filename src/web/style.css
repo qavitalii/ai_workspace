@@ -845,10 +845,10 @@ small,
   font-size: 13px;
   color: #8a7750;
   margin: 18px 0;
+  overflow-wrap: anywhere;
 }
 .run-notice p {
   margin-top: 8px;
-  overflow-wrap: anywhere;
 }
 .composer-wrap {
   padding: 12px max(25px, calc((100% - 780px) / 2)) 19px;

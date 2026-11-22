@@ -3,7 +3,10 @@ export const packageRunBudget = 1024 * MiB;
 export const packageIndexAllowance = 128 * MiB;
 const filesystemReserve = 512 * MiB;
 
-export type PackageBudgets = { run: number; preset: number };
+export type InstallMode = "run" | "preset";
+export type PackageBudgets = Record<InstallMode, number> & {
+  peerPreset?: number;
+};
 
 function budgetBytes(value: string | undefined, fallback: number) {
   if (value === undefined || !/^\d+$/.test(value)) return fallback;
@@ -11,10 +14,20 @@ function budgetBytes(value: string | undefined, fallback: number) {
   return Number.isSafeInteger(bytes) ? bytes : fallback;
 }
 
-export function packageBudgets(env: NodeJS.ProcessEnv): PackageBudgets {
+export function packageBudgets(
+  env: NodeJS.ProcessEnv,
+  presetDefault = packageRunBudget,
+): PackageBudgets {
+  const preset = budgetBytes(
+    env.WORKSPACE_PACKAGE_PRESET_BUDGET,
+    presetDefault,
+  );
   return {
     run: budgetBytes(env.WORKSPACE_PACKAGE_RUN_BUDGET, packageRunBudget),
-    preset: budgetBytes(env.WORKSPACE_PACKAGE_PRESET_BUDGET, packageRunBudget),
+    preset,
+    ...(env.WORKSPACE_PACKAGE_PEER_PRESET_BUDGET && {
+      peerPreset: budgetBytes(env.WORKSPACE_PACKAGE_PEER_PRESET_BUDGET, preset),
+    }),
   };
 }
 
@@ -109,7 +122,7 @@ export function diskLimitError(
   available: bigint,
   concurrency: number,
   budgets: PackageBudgets = { run: packageRunBudget, preset: packageRunBudget },
-  mode: keyof PackageBudgets = "run",
+  mode: InstallMode = "run",
 ): string | undefined {
   const budget = budgets[mode];
   if (requested > budget - used) {
@@ -118,8 +131,11 @@ export function diskLimitError(
     return `This installation would exceed the ${size} system-package budget for this ${label}.`;
   }
   if (!requested) return;
+  const peerBudget =
+    BigInt(budgets.run) +
+    BigInt(mode === "preset" ? (budgets.peerPreset ?? budgets.preset) : 0);
   const reserve =
-    BigInt(filesystemReserve) + BigInt(concurrency - 1) * BigInt(budgets.run);
+    BigInt(filesystemReserve) + BigInt(concurrency - 1) * peerBudget;
   if (available < reserve + BigInt(requested))
     return "Not enough space on the Docker disk to install system packages and keep space available for other tasks.";
 }

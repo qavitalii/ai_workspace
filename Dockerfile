@@ -62,6 +62,7 @@ RUN mkdir -p /run/workspace-ssh /private && chown node:node /run/workspace-ssh /
     && printf 'Include /run/workspace-ssh/config\n' > /etc/ssh/ssh_config.d/00-workspace.conf
 ENV HOME=/profile CODEX_HOME=/profile/.codex CLAUDE_CONFIG_DIR=/profile/.claude
 LABEL ai.workspace.runner.package-installer="1"
+LABEL ai.workspace.runner.package-presets="1"
 USER node
 WORKDIR /workspace
 CMD ["node","/app/dist/node/runner/main.js"]

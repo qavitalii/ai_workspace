@@ -98,6 +98,27 @@ describe("Debian package budgets", () => {
       }),
     ).toEqual({ run: packageRunBudget, preset: packageRunBudget });
   });
+
+  it("reserves for peers with more preset space than this project", () => {
+    const peerPreset = 2048 * MiB;
+    const requested = 16 * MiB;
+    const budgets = packageBudgets({
+      WORKSPACE_PACKAGE_PRESET_BUDGET: String(64 * MiB),
+      WORKSPACE_PACKAGE_PEER_PRESET_BUDGET: String(peerPreset),
+    });
+    const required = BigInt(
+      512 * MiB + 2 * (packageRunBudget + peerPreset) + requested,
+    );
+    expect(
+      diskLimitError(0, requested, required - 1n, 3, budgets, "preset"),
+    ).toContain("Docker disk");
+    expect(
+      diskLimitError(0, requested, required, 3, budgets, "preset"),
+    ).toBeUndefined();
+    expect(
+      diskLimitError(0, requested, required - 1n, 3, budgets, "run"),
+    ).toBeUndefined();
+  });
 });
 
 it("accepts a full batch of 64 names in the request and MCP tool", async () => {
@@ -212,11 +233,13 @@ describe("Debian package presets", () => {
       await install("preset", ["dpkg-failed", "curl"], signal),
     ).toMatchObject({
       ok: false,
+      incomplete: true,
       results: [
         { name: "dpkg-failed", ok: false, output: "dpkg failed" },
         {
           name: "curl",
           ok: false,
+          skipped: true,
           output: expect.stringContaining("did not finish cleanly"),
         },
       ],
@@ -224,6 +247,27 @@ describe("Debian package presets", () => {
     const calls = apt.mock.calls.length;
     expect(await install("run", ["zip"], signal)).toMatchObject({ ok: false });
     expect(apt).toHaveBeenCalledTimes(calls);
+  });
+
+  it("shares the preset deadline across batches without limiting agent requests", async () => {
+    const { install, apt } = fakeInstaller();
+    const now = vi.spyOn(Date, "now").mockReturnValue(1000);
+    try {
+      expect(await install("preset", ["curl"], signal)).toMatchObject({
+        ok: true,
+      });
+      const calls = apt.mock.calls.length;
+      now.mockReturnValue(181_000);
+      expect(await install("preset", ["zip"], signal)).toMatchObject({
+        ok: false,
+        incomplete: true,
+        results: [{ name: "zip", ok: false, skipped: true }],
+      });
+      expect(apt).toHaveBeenCalledTimes(calls);
+      expect(await install("run", ["zip"], signal)).toMatchObject({ ok: true });
+    } finally {
+      now.mockRestore();
+    }
   });
 
   it("keeps the broker usable after a preset interruption before dpkg", async () => {

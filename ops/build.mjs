@@ -9,6 +9,7 @@ await build({
     "src/runner/main.ts",
     "src/runner/package-broker.ts",
     "src/runner/package-install.ts",
+    "src/runner/package-presets.ts",
     "src/runner/permissions.ts",
     "src/runner/package-tools.ts",
     "src/runner/github-sync-tool.ts",

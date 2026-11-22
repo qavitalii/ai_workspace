@@ -7,6 +7,7 @@ set -eu
     WORKSPACE_PACKAGE_CONCURRENCY="${WORKSPACE_PACKAGE_CONCURRENCY:-3}" \
     WORKSPACE_PACKAGE_RUN_BUDGET="${WORKSPACE_PACKAGE_RUN_BUDGET:-}" \
     WORKSPACE_PACKAGE_PRESET_BUDGET="${WORKSPACE_PACKAGE_PRESET_BUDGET:-}" \
+    WORKSPACE_PACKAGE_PEER_PRESET_BUDGET="${WORKSPACE_PACKAGE_PEER_PRESET_BUDGET:-}" \
     /usr/local/lib/workspace-install/sandbox \
     /usr/local/bin/node /app/dist/node/runner/package-broker.js </dev/null >/dev/null &
 broker=$!
@@ -27,6 +28,20 @@ done
 if [ "${WORKSPACE_SYSTEM_PACKAGES:-}" != 1 ]; then
     kill "$broker" 2>/dev/null || true
 fi
+
+if [ -n "${WORKSPACE_PROJECT_PACKAGES:-}" ]; then
+    if [ "${WORKSPACE_SYSTEM_PACKAGES:-}" = 1 ] &&
+        WORKSPACE_PROJECT_PACKAGE_RESULT=$(
+            /usr/bin/setpriv --bounding-set=-all --inh-caps=-all --ambient-caps=-all -- \
+                /usr/bin/env -i WORKSPACE_PROJECT_PACKAGES="$WORKSPACE_PROJECT_PACKAGES" \
+                /usr/local/bin/node /app/dist/node/runner/package-presets.js </dev/null
+        ); then
+        export WORKSPACE_PROJECT_PACKAGE_RESULT
+    else
+        export WORKSPACE_PROJECT_PACKAGE_RESULT='{"results":[],"incomplete":true}'
+    fi
+fi
+unset WORKSPACE_PROJECT_PACKAGES
 
 cd /workspace
 exec /usr/bin/setpriv --reuid=1000 --regid=1000 --clear-groups \

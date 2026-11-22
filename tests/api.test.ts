@@ -62,6 +62,11 @@ import { initializeWorkspace, projectToken } from "../src/server/git";
 import { hash, seal, unseal } from "../src/server/security";
 import { projectToolEnvironment } from "../src/project-tool-environment";
 import { measureProjectEnv } from "../src/server/project-env";
+import {
+  projectPackagePresets,
+  recordPackagePresetResults,
+  rememberProjectPackages,
+} from "../src/server/project-packages";
 const enabled = process.env.INTEGRATION_TESTS === "1";
 describe.skipIf(!enabled)("PostgreSQL API integration", () => {
   let app: Awaited<ReturnType<typeof createApp>>,
@@ -229,6 +234,166 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
         { name: "curl", source: "agent", source_chat_id: chat },
       ]);
     });
+
+    it("counts concurrent preset failures once each and ignores replaced entries", async () => {
+      expect((await add("hello")).statusCode).toBe(200);
+      expect((await add("sl")).statusCode).toBe(200);
+      const presets = await projectPackagePresets(project);
+      const fail = () =>
+        recordPackagePresetResults(project, presets, [
+          { name: "hello", ok: false },
+        ]);
+      await Promise.all([fail(), fail(), fail()]);
+      expect((await list()).packages).toContainEqual(
+        expect.objectContaining({ name: "hello", failures: 3, disabled: true }),
+      );
+      expect([...(await projectPackagePresets(project)).keys()]).toEqual([
+        "sl",
+      ]);
+
+      expect(
+        (await request({ method: "DELETE", url: url + "/sl", headers }))
+          .statusCode,
+      ).toBe(200);
+      expect((await add("sl")).statusCode).toBe(200);
+      await recordPackagePresetResults(project, presets, [
+        { name: "sl", ok: false },
+      ]);
+      expect((await list()).packages).toContainEqual(
+        expect.objectContaining({ name: "sl", failures: 0, disabled: false }),
+      );
+    });
+
+    it.skipIf(process.env.DOCKER_TESTS !== "1")(
+      "preinstalls remembered Debian packages before the first command in another chat",
+      async () => {
+        let output = "";
+        const first = await launch(
+          chat,
+          account,
+          async (e) => {
+            if (e.type === "terminal") output += e.data;
+            if (e.type === "packages_installed")
+              await rememberProjectPackages(
+                project,
+                chat,
+                randomUUID(),
+                e.packages,
+              );
+          },
+          { installPackages: true, projectEnv: "read-write" },
+        );
+        try {
+          first.send({
+            type: "terminal",
+            data: "if ! command -v hello && workspace-install hello; then printf '\\nHELLO_''INSTALLED\\n'; fi\r",
+          });
+          await vi.waitFor(
+            () => expect(output).toMatch(/^HELLO_INSTALLED\r?$/m),
+            { timeout: 90_000 },
+          );
+          await vi.waitFor(async () =>
+            expect((await projectPackagePresets(project)).has("hello")).toBe(
+              true,
+            ),
+          );
+        } finally {
+          await first.stop();
+        }
+
+        const missing = "workspace-nonexistent-fixture-name";
+        const disabled = "workspace-disabled-fixture-name";
+        expect((await add(missing)).statusCode).toBe(200);
+        expect((await add(disabled)).statusCode).toBe(200);
+        await db.query(
+          "UPDATE project_packages SET added_at=now()-interval '1 day',failures=2 WHERE project_id=$1 AND name=$2",
+          [project, missing],
+        );
+        await db.query(
+          "UPDATE project_packages SET failures=1 WHERE project_id=$1 AND name='hello'",
+          [project],
+        );
+        await db.query(
+          "UPDATE project_packages SET failures=3,disabled=true WHERE project_id=$1 AND name=$2",
+          [project, disabled],
+        );
+        await db.query("UPDATE projects SET auto_packages=false WHERE id=$1", [
+          project,
+        ]);
+        // Revalidate even rows that predate or bypass the current owner API.
+        await db.query(
+          "INSERT INTO project_packages(project_id,name,source,request_id) VALUES($1,'hello --bad','owner',$2)",
+          [project, randomUUID()],
+        );
+        const secondChat = randomUUID();
+        await db.query(
+          "INSERT INTO chats(id,project_id,workspace_id,title,provider,account_id,branch) VALUES($1,$2,$3,'Next chat','codex',$4,'workspace/test')",
+          [secondChat, project, chat, account],
+        );
+        output = "";
+        const events: import("../src/shared").AgentEvent[] = [];
+        const second = await launch(
+          secondChat,
+          account,
+          (e) => {
+            if (e.type === "terminal") output += e.data;
+            else events.push(e);
+          },
+          { installPackages: true, projectEnv: "read-write" },
+        );
+        try {
+          second.send({
+            type: "terminal",
+            data: "hello && test -z \"$WORKSPACE_PROJECT_PACKAGES$WORKSPACE_PROJECT_PACKAGE_RESULT\" && printf '\\nPRESET_''AVAILABLE\\n'\r",
+          });
+          const { Config } = await docker.getContainer(second.id).inspect();
+          expect(Config.Env).toContain(
+            `WORKSPACE_PROJECT_PACKAGES=${JSON.stringify([missing, "hello"])}`,
+          );
+          await vi.waitFor(
+            () => expect(output).toMatch(/^PRESET_AVAILABLE\r?$/m),
+            { timeout: 105_000 },
+          );
+          expect(events).toContainEqual({
+            type: "project_packages_ready",
+            results: [
+              { name: missing, ok: false },
+              { name: "hello", ok: true },
+            ],
+          });
+          expect(events).toContainEqual({
+            type: "warning",
+            message: expect.stringContaining(missing),
+          });
+          expect(events.some(({ type }) => type === "packages_installed")).toBe(
+            false,
+          );
+          expect((await list()).packages).toEqual(
+            expect.arrayContaining([
+              expect.objectContaining({
+                name: "hello",
+                failures: 0,
+                disabled: false,
+                source_chat_id: chat,
+              }),
+              expect.objectContaining({
+                name: missing,
+                failures: 3,
+                disabled: true,
+              }),
+              expect.objectContaining({
+                name: disabled,
+                failures: 3,
+                disabled: true,
+              }),
+            ]),
+          );
+        } finally {
+          await second.stop();
+        }
+      },
+      210_000,
+    );
 
     it("groups requests, upserts successes, and keeps packages when the source chat is deleted", async () => {
       expect(await list()).toEqual({ auto_packages: true, packages: [] });
