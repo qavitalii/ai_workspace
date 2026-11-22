@@ -1,7 +1,10 @@
 import type { PackageInstallResult } from "./package-client.js";
-import { packageNames, packageUsage } from "./package-request.js";
-
-const namePattern = "^[a-z0-9][a-z0-9+.-]{1,62}$";
+import {
+  maxPackageNames,
+  packageNamePattern,
+  packageNames,
+  packageUsage,
+} from "./package-request.js";
 
 export function packageToolHandler(
   install: (
@@ -67,9 +70,9 @@ export function packageToolHandler(
                   properties: {
                     packages: {
                       type: "array",
-                      items: { type: "string", pattern: namePattern },
+                      items: { type: "string", pattern: packageNamePattern },
                       minItems: 1,
-                      maxItems: 16,
+                      maxItems: maxPackageNames,
                     },
                   },
                   required: ["packages"],

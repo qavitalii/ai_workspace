@@ -2,10 +2,20 @@ import { describe, expect, it, vi } from "vitest";
 import {
   diskLimitError,
   estimateInstallBytes,
+  packageBudgets,
+  packageIndexAllowance,
   packageRunBudget,
   parseInstallPlan,
 } from "../src/runner/package-disk.js";
+import {
+  createPackageInstaller,
+  type RunApt,
+} from "../src/runner/package-installer.js";
 import { packageToolHandler } from "../src/runner/package-mcp.js";
+import {
+  maxPackageRequestBytes,
+  packageNames,
+} from "../src/runner/package-request.js";
 
 const MiB = 1024 * 1024;
 
@@ -67,6 +77,215 @@ describe("Debian package budgets", () => {
       "Docker disk",
     );
     expect(diskLimitError(0, requested, reserve, 3)).toBeUndefined();
+  });
+
+  it("reads independent byte budgets and falls back for invalid values", () => {
+    const budgets = packageBudgets({
+      WORKSPACE_PACKAGE_RUN_BUDGET: "1048576",
+      WORKSPACE_PACKAGE_PRESET_BUDGET: "0",
+    });
+    expect(budgets).toEqual({ run: MiB, preset: 0 });
+    expect(diskLimitError(0, 1, 10n ** 12n, 3, budgets, "preset")).toContain(
+      "0 bytes",
+    );
+    expect(
+      diskLimitError(0, 1, BigInt(514 * MiB + 1), 3, budgets),
+    ).toBeUndefined();
+    expect(
+      packageBudgets({
+        WORKSPACE_PACKAGE_RUN_BUDGET: "1GiB",
+        WORKSPACE_PACKAGE_PRESET_BUDGET: "9007199254740992",
+      }),
+    ).toEqual({ run: packageRunBudget, preset: packageRunBudget });
+  });
+});
+
+it("accepts a full batch of 64 names in the request and MCP tool", async () => {
+  const names = Array.from({ length: 64 }, (_, i) =>
+    `package-${i}`.padEnd(63, "a"),
+  );
+  expect(Buffer.byteLength(JSON.stringify(names) + "\n")).toBeLessThan(
+    maxPackageRequestBytes,
+  );
+  expect(packageNames(names)).toEqual(names);
+  expect(packageNames([...names, "extra"])).toBeNull();
+  const install = vi.fn(async () => ({ ok: true, output: "Ready" }));
+  const write = vi.fn();
+  const handle = packageToolHandler(install, write);
+  await handle(JSON.stringify({ id: 1, method: "tools/list" }));
+  expect(
+    write.mock.calls[0][0].result.tools[0].inputSchema.properties.packages
+      .maxItems,
+  ).toBe(64);
+  await handle(
+    JSON.stringify({
+      id: 2,
+      method: "tools/call",
+      params: { name: "install", arguments: { packages: names } },
+    }),
+  );
+  expect(install).toHaveBeenCalledWith(names, expect.any(AbortSignal));
+});
+
+function fakeInstaller(budgets = packageBudgets({}), failAfterDpkg = false) {
+  const apt = vi.fn<RunApt>(
+    async (command, args, _deadline, _signal, onLine, trackDpkg) => {
+      const name = /\?exact-name\(([^)]+)\)/.exec(args.at(-1) ?? "")?.[1];
+      if (command === "apt-cache") {
+        if (name && name !== "missing") onLine?.(`Package: ${name}`);
+        if (!name) {
+          for (const line of [
+            "Package: sized",
+            "Architecture: all",
+            "Version: 1",
+            "Size: 1000",
+            "Installed-Size: 100",
+          ])
+            onLine?.(line);
+        }
+      } else if (args.includes("--simulate")) {
+        if (name === "sized") {
+          onLine?.("0 upgraded, 1 newly installed, 0 to remove.");
+          onLine?.("Inst sized (1 Debian:12/oldstable [all])");
+        } else {
+          onLine?.("0 upgraded, 0 newly installed, 0 to remove.");
+        }
+      } else if (args.includes("install")) {
+        if (name === "download-failed")
+          return { ok: false, output: "Download failed" };
+        if (name === "interrupted")
+          return {
+            ok: false,
+            output: "Download interrupted",
+            interrupted: true,
+          };
+        if (name === "dpkg-failed")
+          return { ok: false, output: "dpkg failed", dpkgFailed: trackDpkg };
+        if (name === "sized" && trackDpkg && failAfterDpkg)
+          return {
+            ok: false,
+            output: "Post-install hook failed",
+            dpkgStarted: true,
+          };
+      }
+      return { ok: true, output: "Ready" };
+    },
+  );
+  const recordInstalled = vi.fn();
+  const install = createPackageInstaller({
+    apt,
+    recordInstalled,
+    budgets,
+    concurrency: 3,
+    availableBytes: async () => 10n ** 12n,
+  });
+  return { apt, install, recordInstalled };
+}
+
+describe("Debian package presets", () => {
+  const signal = new AbortController().signal;
+
+  it("reports each failure and continues with the remaining packages", async () => {
+    const { install, recordInstalled } = fakeInstaller();
+    expect(
+      await install("preset", ["missing", "download-failed", "curl"], signal),
+    ).toMatchObject({
+      ok: false,
+      results: [
+        {
+          name: "missing",
+          ok: false,
+          output: expect.stringContaining("exact name"),
+        },
+        { name: "download-failed", ok: false, output: "Download failed" },
+        { name: "curl", ok: true },
+      ],
+    });
+    expect(recordInstalled).not.toHaveBeenCalled();
+    expect(await install("run", ["zip"], signal)).toMatchObject({ ok: true });
+    expect(recordInstalled).toHaveBeenCalledWith([["zip"]]);
+  });
+
+  it("reports the remaining packages and stops apt after a dpkg failure", async () => {
+    const { apt, install } = fakeInstaller();
+    expect(
+      await install("preset", ["dpkg-failed", "curl"], signal),
+    ).toMatchObject({
+      ok: false,
+      results: [
+        { name: "dpkg-failed", ok: false, output: "dpkg failed" },
+        {
+          name: "curl",
+          ok: false,
+          output: expect.stringContaining("did not finish cleanly"),
+        },
+      ],
+    });
+    const calls = apt.mock.calls.length;
+    expect(await install("run", ["zip"], signal)).toMatchObject({ ok: false });
+    expect(apt).toHaveBeenCalledTimes(calls);
+  });
+
+  it("keeps the broker usable after a preset interruption before dpkg", async () => {
+    const { install } = fakeInstaller();
+    expect(await install("preset", ["interrupted"], signal)).toMatchObject({
+      ok: false,
+      results: [{ name: "interrupted", output: "Download interrupted" }],
+    });
+    expect(await install("run", ["zip"], signal)).toMatchObject({ ok: true });
+  });
+
+  it("charges preset installations against their own budget", async () => {
+    const { install } = fakeInstaller({
+      run: 20 * MiB,
+      preset: packageIndexAllowance + 20 * MiB,
+    });
+    expect(await install("preset", ["sized"], signal)).toMatchObject({
+      ok: true,
+    });
+    expect(await install("preset", ["sized"], signal)).toMatchObject({
+      ok: false,
+      results: [{ name: "sized", output: expect.stringContaining("preset") }],
+    });
+    expect(await install("run", ["sized"], signal)).toMatchObject({ ok: true });
+    expect(await install("run", ["sized"], signal)).toMatchObject({
+      ok: false,
+      output: expect.stringContaining("budget for this run"),
+    });
+  });
+
+  it("keeps the preset charge after an APT error following dpkg", async () => {
+    const { install } = fakeInstaller(
+      {
+        run: 0,
+        preset: packageIndexAllowance + 20 * MiB,
+      },
+      true,
+    );
+    expect(await install("preset", ["sized"], signal)).toMatchObject({
+      ok: false,
+      results: [{ name: "sized", output: "Post-install hook failed" }],
+    });
+    expect(await install("preset", ["sized"], signal)).toMatchObject({
+      ok: false,
+      results: [{ name: "sized", output: expect.stringContaining("preset") }],
+    });
+    expect(await install("run", ["zip"], signal)).toMatchObject({ ok: true });
+  });
+
+  it("keeps the agent request limit separate from presets", async () => {
+    const { install, recordInstalled } = fakeInstaller();
+    for (let i = 0; i < 64; i++)
+      expect(await install("run", ["zip"], signal)).toMatchObject({ ok: true });
+    expect(recordInstalled).toHaveBeenCalledTimes(64);
+    expect(await install("run", ["zip"], signal)).toMatchObject({
+      ok: false,
+      output: expect.stringContaining("64 package install requests"),
+    });
+    expect(await install("preset", ["zip"], signal)).toMatchObject({
+      ok: true,
+    });
+    expect(recordInstalled).toHaveBeenCalledTimes(64);
   });
 });
 

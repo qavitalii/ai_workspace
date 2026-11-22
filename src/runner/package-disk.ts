@@ -3,6 +3,21 @@ export const packageRunBudget = 1024 * MiB;
 export const packageIndexAllowance = 128 * MiB;
 const filesystemReserve = 512 * MiB;
 
+export type PackageBudgets = { run: number; preset: number };
+
+function budgetBytes(value: string | undefined, fallback: number) {
+  if (value === undefined || !/^\d+$/.test(value)) return fallback;
+  const bytes = Number(value);
+  return Number.isSafeInteger(bytes) ? bytes : fallback;
+}
+
+export function packageBudgets(env: NodeJS.ProcessEnv): PackageBudgets {
+  return {
+    run: budgetBytes(env.WORKSPACE_PACKAGE_RUN_BUDGET, packageRunBudget),
+    preset: budgetBytes(env.WORKSPACE_PACKAGE_PRESET_BUDGET, packageRunBudget),
+  };
+}
+
 type PlannedPackage = {
   name: string;
   argument: string;
@@ -93,13 +108,18 @@ export function diskLimitError(
   requested: number,
   available: bigint,
   concurrency: number,
+  budgets: PackageBudgets = { run: packageRunBudget, preset: packageRunBudget },
+  mode: keyof PackageBudgets = "run",
 ): string | undefined {
-  if (used + requested > packageRunBudget)
-    return "This installation would exceed the 1 GiB system-package budget for this run.";
+  const budget = budgets[mode];
+  if (requested > budget - used) {
+    const label = mode === "run" ? "run" : "preset";
+    const size = budget === packageRunBudget ? "1 GiB" : `${budget} bytes`;
+    return `This installation would exceed the ${size} system-package budget for this ${label}.`;
+  }
   if (!requested) return;
   const reserve =
-    BigInt(filesystemReserve) +
-    BigInt(concurrency - 1) * BigInt(packageRunBudget);
+    BigInt(filesystemReserve) + BigInt(concurrency - 1) * BigInt(budgets.run);
   if (available < reserve + BigInt(requested))
     return "Not enough space on the Docker disk to install system packages and keep space available for other tasks.";
 }

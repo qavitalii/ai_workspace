@@ -1,20 +1,31 @@
 import { spawn } from "node:child_process";
-import { chmodSync, renameSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  writeFileSync,
+} from "node:fs";
 import { statfs } from "node:fs/promises";
 import { createServer, type Socket } from "node:net";
 import { createInterface } from "node:readline";
 import {
+  maxPackageRequestBytes,
   packageAuditPath,
   packageNames,
+  packagePresetDirectory,
+  packagePresetSocket,
   packageSocket,
   packageUsage,
 } from "./package-request.js";
+import { packageBudgets } from "./package-disk.js";
 import {
-  diskLimitError,
-  estimateInstallBytes,
-  packageIndexAllowance,
-  parseInstallPlan,
-} from "./package-disk.js";
+  createPackageInstaller,
+  packageFailure,
+  type InstallMode,
+  type RunApt,
+} from "./package-installer.js";
 
 const aptEnvironment = {
   APT_CONFIG: "/etc/workspace-install/apt.conf",
@@ -30,59 +41,115 @@ const concurrency =
   Number.isSafeInteger(maximumRunners) && maximumRunners >= 1
     ? maximumRunners
     : 3;
-const cancelled = {
-  ok: false,
-  output: "Package installation was cancelled.",
-} as const;
-const timedOut = {
-  ok: false,
-  output: "Package installation timed out.",
-} as const;
-let unavailable = "";
-function apt(
-  command: "apt-get" | "apt-cache",
-  args: string[],
-  deadline: number,
-  signal: AbortSignal,
-  onLine = (_line: string) => {},
-): Promise<{ ok: boolean; output: string }> {
-  if (signal.aborted) return Promise.resolve(cancelled);
+let interruptedGroup: number | undefined;
+
+function aptIsStopping() {
+  if (interruptedGroup === undefined) return false;
+  try {
+    process.kill(-interruptedGroup, 0);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ESRCH") {
+      interruptedGroup = undefined;
+      return false;
+    }
+  }
+  // The runner can keep unreaped zombies. Only living group members can
+  // still hold locks or write to APT's cache.
+  let processes: string[];
+  try {
+    processes = readdirSync("/proc");
+  } catch {
+    return true;
+  }
+  for (const pid of processes) {
+    if (!/^\d+$/.test(pid)) continue;
+    try {
+      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+      const [state, , group] = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+      if (Number(group) === interruptedGroup && state !== "Z" && state !== "X")
+        return true;
+    } catch (error) {
+      // Processes may exit during the scan. Keep waiting on other errors.
+      if (
+        !["ENOENT", "ESRCH"].includes(
+          (error as NodeJS.ErrnoException).code ?? "",
+        )
+      )
+        return true;
+    }
+  }
+  interruptedGroup = undefined;
+  return false;
+}
+
+const apt: RunApt = (command, args, deadline, signal, onLine, trackDpkg) => {
+  const cancelled = "Package installation was cancelled.";
+  const timedOut = "Package installation timed out.";
+  if (signal.aborted) return Promise.resolve({ ok: false, output: cancelled });
   const timeLeft = deadline - Date.now();
-  if (timeLeft <= 0) return Promise.resolve(timedOut);
+  if (timeLeft <= 0) return Promise.resolve({ ok: false, output: timedOut });
+
   return new Promise((resolve, reject) => {
     let output = Buffer.alloc(0);
-    const child = spawn("/usr/bin/" + command, args, {
-      cwd: aptEnvironment.HOME,
-      env: aptEnvironment,
-      detached: true,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    for (const pipe of [child.stdout, child.stderr])
+    let dpkgStarted = false;
+    let dpkgFailed = false;
+    let interruption = "";
+    let closePipes: NodeJS.Timeout | undefined;
+    const child = spawn(
+      "/usr/bin/" + command,
+      trackDpkg ? ["-o", "APT::Status-Fd=3", ...args] : args,
+      {
+        cwd: aptEnvironment.HOME,
+        env: aptEnvironment,
+        detached: true,
+        stdio: ["ignore", "pipe", "pipe", trackDpkg ? "pipe" : "ignore"],
+      },
+    );
+    const pipes = [child.stdout!, child.stderr!];
+    const progress = child.stdio[3];
+    for (const pipe of pipes)
       pipe.on("data", (chunk: Buffer) => {
         output = Buffer.concat([output, chunk]).subarray(-maxLogBytes);
       });
-    createInterface({ input: child.stdout }).on("line", onLine);
-    function interrupt(result: { ok: false; output: string }) {
-      // Helpers running as _apt may outlive the root child. Settle the
-      // request immediately and never start another apt in this container.
-      unavailable = result.output + " Start a new run to retry.";
-      if (child.pid) {
-        try {
-          process.kill(-child.pid, "SIGKILL");
-        } catch {
-          // A child that already exited no longer needs a signal.
+    if (onLine) createInterface({ input: child.stdout! }).on("line", onLine);
+    if (progress && "read" in progress)
+      createInterface({ input: progress }).on("line", (line) => {
+        // Apt writes this record just before it forks dpkg.
+        if (line.startsWith("pmstatus:dpkg-exec:")) dpkgStarted = true;
+        if (line.startsWith("pmerror:")) dpkgFailed = true;
+      });
+    createInterface({ input: child.stderr! }).on("line", (line) => {
+      // Apt also reports dpkg process failures without a pmerror record.
+      if (
+        /^E: (?:Sub-process \/usr\/bin\/dpkg |dpkg was interrupted,)/.test(line)
+      )
+        dpkgFailed = true;
+    });
+
+    function interrupt(reason: string) {
+      if (interruption) return;
+      interruption = reason;
+      interruptedGroup = child.pid;
+      // Give apt a chance to shut down its acquisition workers gracefully.
+      child.kill("SIGINT");
+      closePipes = setTimeout(() => {
+        if (child.pid) {
+          try {
+            process.kill(-child.pid, "SIGKILL");
+          } catch {
+            // The group may already have exited.
+          }
         }
-      }
-      child.stdout.destroy();
-      child.stderr.destroy();
-      release();
-      resolve(result);
+        for (const pipe of pipes) pipe.destroy();
+        progress?.destroy();
+      }, 1000);
     }
     const abort = () => interrupt(cancelled);
     const timeout = setTimeout(() => interrupt(timedOut), timeLeft);
     signal.addEventListener("abort", abort, { once: true });
     function release() {
       clearTimeout(timeout);
+      clearTimeout(closePipes);
       signal.removeEventListener("abort", abort);
     }
     child.once("error", (error) => {
@@ -91,218 +158,106 @@ function apt(
     });
     child.once("close", (code) => {
       release();
+      const ok = !interruption && code === 0;
       resolve({
-        ok: code === 0,
-        output: output.toString("utf8").trim(),
+        ok,
+        output: interruption || output.toString("utf8").trim(),
+        interrupted: Boolean(interruption),
+        dpkgStarted,
+        dpkgFailed:
+          !ok &&
+          (dpkgFailed || (dpkgStarted && (!!interruption || code === null))),
       });
     });
   });
-}
+};
 
-let refreshed = false;
-let chargedBytes = 0;
-const installed: string[][] = [];
-
-async function checkDisk(requested: number) {
-  let available;
-  try {
+const install = createPackageInstaller({
+  apt,
+  concurrency,
+  budgets: packageBudgets(process.env),
+  async availableBytes() {
     const disk = await statfs(aptEnvironment.HOME, { bigint: true });
-    available = disk.bavail * disk.bsize;
-  } catch {
-    return "Could not verify available space on the Docker disk.";
-  }
-  return diskLimitError(chargedBytes, requested, available, concurrency);
-}
-
-async function install(names: string[], signal: AbortSignal) {
-  const deadline = Date.now() + 210_000;
-  if (!refreshed) {
-    const error = await checkDisk(packageIndexAllowance);
-    if (error) return { ok: false, output: error };
-    const updated = await apt(
-      "apt-get",
-      ["-q", "update", "--error-on=any"],
-      deadline,
-      signal,
-    );
-    if (!updated.ok) return updated;
-    refreshed = true;
-    chargedBytes += packageIndexAllowance;
-  }
-  // APT can also match foreign-architecture placeholders without an
-  // installable version when a dependency mentions the same package name.
-  const patterns = names.map(
-    (name) => `?and(?exact-name(${name}),?not(?virtual))`,
-  );
-  const found = new Set<string>();
-  const checked = await apt(
-    "apt-cache",
-    ["show", "--no-all-versions", "--", ...patterns],
-    deadline,
-    signal,
-    (line) => {
-      if (line.startsWith("Package: "))
-        found.add(line.slice("Package: ".length));
-    },
-  );
-  if (unavailable || signal.aborted) return checked;
-  const missing = names.filter((name) => !found.has(name));
-  if (missing.length)
-    return {
-      ok: false,
-      output: "No Debian package found with exact name: " + missing.join(", "),
-    };
-  if (!checked.ok) return checked;
-  const installArguments = [
-    "-q",
-    "install",
-    "-y",
-    "--no-install-recommends",
-    "--no-remove",
-    "--",
-    ...patterns,
-  ];
-  const planLines: string[] = [];
-  const simulated = await apt(
-    "apt-get",
-    ["--simulate", ...installArguments],
-    deadline,
-    signal,
-    (line) => {
-      if (
-        (line.startsWith("Inst ") || /^\d+ upgraded,/.test(line)) &&
-        planLines.length <= 4097
-      )
-        planLines.push(line);
-    },
-  );
-  if (!simulated.ok) return simulated;
-  const plan = parseInstallPlan(planLines);
-  const unknownSize = {
-    ok: false,
-    output:
-      "Could not verify the disk size of every Debian package in this request.",
-  };
-  if (!plan) return unknownSize;
-  const metadata: string[] = [];
-  if (plan.length) {
-    const details = await apt(
-      "apt-cache",
-      [
-        "show",
-        "--no-all-versions",
-        "--",
-        ...plan.map(({ argument }) => argument),
-      ],
-      deadline,
-      signal,
-      (line) => {
-        if (
-          !line ||
-          /^(Package|Architecture|Version|Size|Installed-Size): /.test(line)
-        )
-          metadata.push(line);
-      },
-    );
-    if (!details.ok) return details;
-  }
-  const estimated = estimateInstallBytes(plan, metadata);
-  if (estimated === null) return unknownSize;
-  const error = await checkDisk(estimated);
-  if (error) return { ok: false, output: error };
-  if (signal.aborted) return cancelled;
-  if (Date.now() >= deadline) return timedOut;
-  chargedBytes += estimated;
-  const result = await apt("apt-get", installArguments, deadline, signal);
-  if (result.ok) {
-    // Keep the agent runner as the only writer to Docker's JSON stdout.
+    return disk.bavail * disk.bsize;
+  },
+  recordInstalled(names) {
     // Publish the snapshot atomically before replying to the client.
     const temporary = packageAuditPath + ".new";
-    installed.push(names);
-    writeFileSync(temporary, JSON.stringify(installed), { mode: 0o644 });
+    writeFileSync(temporary, JSON.stringify(names), { mode: 0o644 });
     renameSync(temporary, packageAuditPath);
-    await apt("apt-get", ["clean"], deadline, signal).catch(() => {});
-  } else {
-    unavailable ||=
-      "A package installation did not finish cleanly. Start a new run to retry.";
-  }
-  return result;
-}
+  },
+});
 
-function reply(socket: Socket, ok: boolean, output: string) {
-  socket.end(JSON.stringify({ ok, output }) + "\n");
+function reply(socket: Socket, result: object) {
+  socket.end(JSON.stringify(result) + "\n");
 }
 
 let busy = false;
-const server = createServer((socket) => {
-  let request = "";
-  let accepted = false;
-  const abort = new AbortController();
-  socket.on("error", () => {});
-  socket.once("end", () => abort.abort());
-  socket.once("close", () => abort.abort());
-  socket.setTimeout(5000, () => socket.destroy());
-  socket.setEncoding("utf8");
-  socket.on("data", async (chunk) => {
-    if (accepted) {
-      socket.destroy();
-      return;
-    }
-    request += chunk;
-    if (request.length > 2048) {
-      socket.destroy();
-      return;
-    }
-    const newline = request.indexOf("\n");
-    if (newline < 0) return;
-    accepted = true;
-    socket.setTimeout(0);
-    let names: string[] | null = null;
-    try {
-      names = packageNames(JSON.parse(request.slice(0, newline)));
-    } catch {}
-    if (!names) {
-      reply(socket, false, packageUsage);
-      return;
-    }
-    if (unavailable) {
-      reply(socket, false, unavailable);
-      return;
-    }
-    if (installed.length >= 64) {
-      reply(
-        socket,
-        false,
-        "This run has reached its limit of 64 package install requests.",
-      );
-      return;
-    }
-    if (busy) {
-      reply(
-        socket,
-        false,
-        "Another package installation is running. Retry after it finishes.",
-      );
-      return;
-    }
-    busy = true;
-    try {
-      const result = await install(names, abort.signal);
-      if (!abort.signal.aborted) reply(socket, result.ok, result.output);
-    } catch {
-      if (!abort.signal.aborted)
+function packageServer(mode: InstallMode) {
+  const server = createServer((socket) => {
+    let request = "";
+    let accepted = false;
+    const abort = new AbortController();
+    socket.on("error", () => {});
+    socket.once("end", () => abort.abort());
+    socket.once("close", () => abort.abort());
+    socket.setTimeout(5000, () => socket.destroy());
+    socket.setEncoding("utf8");
+    socket.on("data", async (chunk) => {
+      if (accepted) {
+        socket.destroy();
+        return;
+      }
+      request += chunk;
+      if (request.length > maxPackageRequestBytes) {
+        socket.destroy();
+        return;
+      }
+      const newline = request.indexOf("\n");
+      if (newline < 0) return;
+      accepted = true;
+      socket.setTimeout(0);
+      let names: string[] | null = null;
+      try {
+        names = packageNames(JSON.parse(request.slice(0, newline)));
+      } catch {}
+      if (!names) {
+        reply(socket, { ok: false, output: packageUsage });
+        return;
+      }
+      if (busy || aptIsStopping()) {
         reply(
           socket,
-          false,
-          "The package installer could not start Debian apt.",
+          packageFailure(
+            mode,
+            names,
+            "Another package installation is running. Retry after it finishes.",
+          ),
         );
-    } finally {
-      busy = false;
-    }
+        return;
+      }
+      busy = true;
+      try {
+        const result = await install(mode, names, abort.signal);
+        if (!abort.signal.aborted) {
+          const { ok, output } = result;
+          reply(socket, mode === "preset" ? result : { ok, output });
+        }
+      } finally {
+        busy = false;
+      }
+    });
   });
-});
-server.maxConnections = 8;
-server.listen(packageSocket, () => {
-  chmodSync(packageSocket, 0o666);
-  writeFileSync("/run/workspace-packages/ready", "");
+  server.maxConnections = 8;
+  return server;
+}
+
+// The bootstrap caller can use the preset budget through a root-only directory.
+// Agent requests keep their existing protocol on the public socket.
+mkdirSync(packagePresetDirectory, { mode: 0o700 });
+packageServer("preset").listen(packagePresetSocket, () => {
+  packageServer("run").listen(packageSocket, () => {
+    chmodSync(packageSocket, 0o666);
+    writeFileSync("/run/workspace-packages/ready", "");
+  });
 });
