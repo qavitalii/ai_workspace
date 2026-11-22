@@ -153,6 +153,8 @@ function fakeInstaller(budgets = packageBudgets({}), failAfterDpkg = false) {
     async (command, args, _deadline, _signal, onLine, trackDpkg) => {
       const name = /\?exact-name\(([^)]+)\)/.exec(args.at(-1) ?? "")?.[1];
       if (command === "apt-cache") {
+        if (name === "apt-start-error")
+          throw new Error("spawn apt-cache failed");
         if (name && name !== "missing") onLine?.(`Package: ${name}`);
         if (!name) {
           for (const line of [
@@ -306,6 +308,31 @@ describe("Debian package presets", () => {
       ok: false,
       results: [{ name: "interrupted", output: "Download interrupted" }],
     });
+    expect(await install("run", ["zip"], signal)).toMatchObject({ ok: true });
+  });
+
+  it("skips pending presets when the installer cannot start apt", async () => {
+    const { apt, install } = fakeInstaller();
+    const skipped = {
+      ok: false,
+      skipped: true,
+      output: "The package installer could not start Debian apt.",
+    };
+
+    expect(
+      await install("preset", ["curl", "apt-start-error", "zip"], signal),
+    ).toMatchObject({
+      incomplete: true,
+      output: skipped.output,
+      results: [
+        { name: "curl", ok: true },
+        { name: "apt-start-error", ...skipped },
+        { name: "zip", ...skipped },
+      ],
+    });
+    expect(
+      apt.mock.calls.some(([, args]) => args.at(-1)?.includes("zip")),
+    ).toBe(false);
     expect(await install("run", ["zip"], signal)).toMatchObject({ ok: true });
   });
 

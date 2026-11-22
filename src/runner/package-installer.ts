@@ -37,9 +37,10 @@ const timedOut: InstallResult = {
   output: "Package installation timed out.",
   skip: "startup",
 };
-const couldNotStart = {
+const couldNotStart: InstallResult = {
   ok: false,
   output: "The package installer could not start Debian apt.",
+  skip: "startup",
 };
 const incompleteInstall =
   "A package installation did not finish cleanly. Start a new run to retry.";
