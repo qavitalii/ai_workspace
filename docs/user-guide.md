@@ -48,7 +48,7 @@ When Codex returns image data or an accessible image file, Workspace saves it to
 
 Agent tasks and chat terminals include C and C++ build tools (`gcc`, `g++`, `make`, `pkg-config`), the SQLite, PostgreSQL and MySQL-compatible clients (`sqlite3`, `psql`, `mysql`), and `rsync`, `zip`, `xz`, `file`, `less` and `tree`.
 
-During an execution task, ask Codex or Claude Code to install a Debian package such as `ffmpeg`. Both agents have a dedicated installer tool, also available as `workspace-install ffmpeg` in the task container. The tool accepts package names from Debian's signed repositories and records successful installs in the task log. Downloads and dependencies count toward a 1 GiB budget per run.
+During an execution task, ask Codex or Claude Code to install a Debian package such as `ffmpeg`. Both agents have a dedicated installer tool, also available as `workspace-install ffmpeg` in the task container. The tool accepts up to 64 package names per request from Debian's signed repositories and records successful installs in the task log. Downloads and dependencies count toward a budget of 1 GiB per run by default.
 
 Open **Project settings → Environment → System packages** to see saved Debian packages grouped by installation request, with the source chat and date. Turn **Remember packages installed by agents** off to stop saving new installs automatically. You can add a package by name or remove a package or an entire group from the saved list. **Installation failed** marks a disabled entry.
 

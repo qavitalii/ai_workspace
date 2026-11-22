@@ -5,7 +5,14 @@ import {
   openSync,
   readFileSync,
 } from "node:fs";
-import { packageAuditPath, packageNames } from "./package-request.js";
+import {
+  maxPackageRequestBytes,
+  maxPackageRequests,
+  packageAuditPath,
+  packageNames,
+} from "./package-request.js";
+
+const maxAuditBytes = maxPackageRequests * maxPackageRequestBytes + 2;
 
 let emitted = 0;
 let previousSize = 0;
@@ -19,7 +26,7 @@ export function drainPackageAudit(): string[][] {
       const info = fstatSync(file);
       if (
         !info.isFile() ||
-        info.size > 128 * 1024 ||
+        info.size > maxAuditBytes ||
         info.size === previousSize
       )
         return [];

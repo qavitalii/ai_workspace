@@ -88,6 +88,8 @@ The installer creates `.env` with permissions `600`. Do not commit it or include
 | `MAX_CONCURRENT` | Default maximum concurrent tasks, 3 initially; any positive whole number. A value saved in Settings → Resources overrides this environment default |
 | `OUTPUT_LIMIT_GB` | Initial shared saved-output budget in decimal GB, 1 by default (0.01–10000). After the first migration, change it in Settings → Resources |
 | `PROJECT_ENV_LIMIT_GIB` | Initial project tool storage limit, 8 GiB per project by default. A value saved in Settings → Resources takes precedence |
+| `WORKSPACE_PACKAGE_RUN_BUDGET` | Disk budget in bytes for Debian package installation requests from an agent. Defaults to 1 GiB |
+| `WORKSPACE_PACKAGE_PRESET_BUDGET` | Separate disk budget in bytes for Debian package presets requested by the runner bootstrap. Defaults to 1 GiB |
 | `WORKSPACE_PROXY_IP`, `WORKSPACE_SERVER_PROXY_IP`, `WORKSPACE_PROXY_SUBNET` | Dedicated proxy network: defaults `172.30.250.2`, `172.30.250.3`, `172.30.250.0/24`; change all three together if the subnet overlaps another network |
 | `TRUSTED_PROXY_IPS` | Outside Compose, comma-separated explicit immediate proxy IPs; empty trusts none. Compose sets this to Caddy’s fixed address |
 | `MAX_FILE_MB` | Maximum attachment size, 25 MB by default |

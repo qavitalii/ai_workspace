@@ -5,6 +5,8 @@ set -eu
 /usr/bin/setpriv --bounding-set=-setpcap -- \
     /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C \
     WORKSPACE_PACKAGE_CONCURRENCY="${WORKSPACE_PACKAGE_CONCURRENCY:-3}" \
+    WORKSPACE_PACKAGE_RUN_BUDGET="${WORKSPACE_PACKAGE_RUN_BUDGET:-}" \
+    WORKSPACE_PACKAGE_PRESET_BUDGET="${WORKSPACE_PACKAGE_PRESET_BUDGET:-}" \
     /usr/local/lib/workspace-install/sandbox \
     /usr/local/bin/node /app/dist/node/runner/package-broker.js </dev/null >/dev/null &
 broker=$!

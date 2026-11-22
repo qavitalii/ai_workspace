@@ -65,7 +65,7 @@ export async function launch(
   const installPackages =
     options.installPackages &&
     image?.Config?.Labels?.["ai.workspace.runner.package-installer"] === "1";
-  let packageConcurrency: number | undefined;
+  const packageEnv: string[] = [];
   if (installPackages) {
     const [configured, running] = await Promise.all([
       concurrentTasks(),
@@ -74,7 +74,15 @@ export async function launch(
       ),
     ]);
     // Lowering the limit does not stop the jobs already admitted.
-    packageConcurrency = Math.max(configured, Number(running.rows[0].n));
+    const packageConcurrency = Math.max(configured, Number(running.rows[0].n));
+    packageEnv.push("WORKSPACE_PACKAGE_CONCURRENCY=" + packageConcurrency);
+    for (const name of [
+      "WORKSPACE_PACKAGE_RUN_BUDGET",
+      "WORKSPACE_PACKAGE_PRESET_BUDGET",
+    ]) {
+      const value = process.env[name];
+      if (value) packageEnv.push(`${name}=${value}`);
+    }
   }
   const work = w
     ? workspace(w.id)
@@ -217,9 +225,7 @@ export async function launch(
         ...Object.entries({ ...aws?.env, ...projectEnv?.env }).map(
           ([key, value]) => key + "=" + value,
         ),
-        ...(packageConcurrency === undefined
-          ? []
-          : ["WORKSPACE_PACKAGE_CONCURRENCY=" + packageConcurrency]),
+        ...packageEnv,
       ],
       HostConfig: {
         Mounts: mounts,
