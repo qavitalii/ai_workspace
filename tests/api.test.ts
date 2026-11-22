@@ -264,6 +264,110 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
       );
     });
 
+    it("returns startup notices beyond the recent history for the latest job", async () => {
+      await withRunningJob(async (emit, jobId) => {
+        const output = {
+          type: "log",
+          projectPackageStartup: true,
+          text: "Preset budget is zero.\nPackages: hello, sl",
+        };
+        const warning = {
+          type: "warning",
+          projectPackageStartup: true,
+          message: "Workspace skipped some saved Debian packages.",
+        };
+        const read = async () => {
+          const response = await request({
+            url: `/api/chats/${chat}`,
+            headers,
+          });
+          expect(response.statusCode).toBe(200);
+          return response.json();
+        };
+        await emit(output);
+        await emit(warning);
+        const ids = (await read()).events.map(
+          (entry: { id: string }) => entry.id,
+        );
+        expect(ids).toHaveLength(2);
+        await db.query(
+          `INSERT INTO events(chat_id,job_id,type,data)
+           SELECT $1,$2,'log',jsonb_build_object('text','Later output '||n)
+           FROM generate_series(1,165) n`,
+          [chat, jobId],
+        );
+        const { events } = await read();
+        expect(events).toHaveLength(102);
+        expect(events.slice(0, 2)).toMatchObject([
+          { id: ids[0], data: output },
+          { id: ids[1], data: warning },
+        ]);
+        await emit({ type: "completed" });
+        expect(
+          (
+            await request({
+              method: "POST",
+              url: `/api/chats/${chat}/messages`,
+              headers,
+              payload: { content: "Next task", client_id: randomUUID() },
+            })
+          ).statusCode,
+        ).toBe(200);
+        expect((await read()).events).toHaveLength(100);
+      });
+    });
+
+    it.skipIf(process.env.DOCKER_TESTS !== "1").each([
+      ["zero budget", "the preset budget is zero"],
+      ["full project storage", "no project tool storage was available"],
+    ])(
+      "logs the skipped package names for %s before starting the runner",
+      async (scenario, reason) => {
+        for (const name of ["hello", "sl"])
+          expect((await add(name)).statusCode).toBe(200);
+        await db.query(
+          "UPDATE project_packages SET failures=2 WHERE project_id=$1",
+          [project],
+        );
+        if (scenario === "zero budget") {
+          vi.stubEnv("WORKSPACE_PACKAGE_PRESET_BUDGET", "0");
+        } else {
+          config.projectEnvLimitGib = 1 / 1024 ** 3;
+          const dir = path.join(data, "project-env", project);
+          await mkdir(dir, { recursive: true });
+          await writeFile(path.join(dir, "fixture"), Buffer.alloc(4096, 1));
+        }
+        const events: import("../src/shared").AgentEvent[] = [];
+        let runner;
+        try {
+          runner = await launch(
+            chat,
+            account,
+            (e) => {
+              events.push(e);
+            },
+            {
+              installPackages: true,
+              projectEnv: "read-write",
+            },
+          );
+          expect(events).toContainEqual({
+            type: "log",
+            projectPackageStartup: true,
+            text: `Skipped project Debian packages because ${reason}.\nPackages: hello, sl`,
+          });
+          expect((await list()).packages).toMatchObject([
+            { name: "sl", failures: 2, disabled: false },
+            { name: "hello", failures: 2, disabled: false },
+          ]);
+        } finally {
+          vi.unstubAllEnvs();
+          await runner?.stop();
+        }
+      },
+      20_000,
+    );
+
     it.skipIf(process.env.DOCKER_TESTS !== "1")(
       "logs the preset disk-budget skip and leaves the package enabled",
       async () => {
@@ -305,6 +409,7 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
           });
           expect(events).toContainEqual({
             type: "log",
+            projectPackageStartup: true,
             text: expect.stringContaining(
               `exceed the ${budget} bytes system-package budget for this preset.\nPackages: ${["hello", ...morePackages].join(", ")}`,
             ),
@@ -423,6 +528,7 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
           });
           expect(events).toContainEqual({
             type: "warning",
+            projectPackageStartup: true,
             message: expect.stringContaining(missing),
           });
           expect(events.some(({ type }) => type === "packages_installed")).toBe(

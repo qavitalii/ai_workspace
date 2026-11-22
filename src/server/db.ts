@@ -127,6 +127,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS workspace_lease_chat ON workspace_leases(chat_
 CREATE TABLE IF NOT EXISTS events(id bigserial PRIMARY KEY,chat_id uuid REFERENCES chats(id),job_id uuid REFERENCES jobs(id),type text NOT NULL,data jsonb NOT NULL,created_at timestamptz NOT NULL DEFAULT now());
 CREATE INDEX IF NOT EXISTS events_chat ON events(chat_id,id);
 CREATE INDEX IF NOT EXISTS events_job_output ON events(job_id) WHERE type IN ('delta','completed');
+CREATE INDEX IF NOT EXISTS events_project_package_startup ON events(job_id,id) WHERE type IN ('log','warning') AND data @> '{"projectPackageStartup":true}';
 CREATE TABLE IF NOT EXISTS approvals(id uuid PRIMARY KEY,job_id uuid NOT NULL REFERENCES jobs(id),request_id text NOT NULL,description text NOT NULL,decision boolean,created_at timestamptz NOT NULL DEFAULT now());
 ALTER TABLE approvals ADD COLUMN IF NOT EXISTS kind text NOT NULL DEFAULT 'permission';
 ALTER TABLE approvals ADD COLUMN IF NOT EXISTS questions jsonb;

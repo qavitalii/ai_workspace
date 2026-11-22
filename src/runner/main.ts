@@ -53,8 +53,17 @@ if (packagePresetReport) {
     if (failures.length) {
       const summary = failures.slice(0, 3).join(", ");
       const additional = failures.length - 3;
+      if (additional > 0)
+        emit({
+          type: "log",
+          projectPackageStartup: true,
+          text:
+            "Project Debian packages that could not be preinstalled: " +
+            failures.join(", "),
+        });
       emit({
         type: "warning",
+        projectPackageStartup: true,
         message:
           "Could not preinstall project Debian packages: " +
           summary +
@@ -62,28 +71,24 @@ if (packagePresetReport) {
             ? ` and ${additional} more. See the execution log.`
             : ""),
       });
-      if (additional > 0)
-        emit({
-          type: "log",
-          text:
-            "Project Debian packages that could not be preinstalled: " +
-            failures.join(", "),
-        });
     }
   }
   if (skipLog.length) {
     emit({
-      type: "warning",
-      message:
-        "Workspace skipped some saved Debian packages. See the execution log.",
+      type: "log",
+      projectPackageStartup: true,
+      text: "Skipped project Debian packages. " + skipLog.join("\n\n"),
     });
     emit({
-      type: "log",
-      text: "Skipped project Debian packages. " + skipLog.join("\n\n"),
+      type: "warning",
+      projectPackageStartup: true,
+      message:
+        "Workspace skipped some saved Debian packages. See the execution log.",
     });
   } else if (incomplete || !results)
     emit({
       type: "warning",
+      projectPackageStartup: true,
       message:
         "Project Debian package installation did not finish before the agent started.",
     });

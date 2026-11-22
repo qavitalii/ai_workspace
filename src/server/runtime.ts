@@ -105,6 +105,7 @@ export async function launch(
     : null;
   let projectEnvWarning: string | undefined;
   let packagePresetWarning: string | undefined;
+  let packagePresetLog: string | undefined;
   let presets: Map<string, string> | undefined;
   if (projectEnv && projectEnvId) {
     // Cached measurements can describe read-only runs. A launch that would
@@ -160,7 +161,12 @@ export async function launch(
       }
     }
   }
-  if (packagePresetWarning) presets = undefined;
+  if (packagePresetWarning) {
+    if (presets?.size)
+      packagePresetLog =
+        packagePresetWarning + "\nPackages: " + [...presets.keys()].join(", ");
+    presets = undefined;
+  }
   if (chatId && w) {
     mounts.push(...workspaceGitMounts(w));
     if (w.resolution_operation_id)
@@ -435,8 +441,18 @@ export async function launch(
       });
     if (projectEnvWarning)
       await onEvent({ type: "warning", message: projectEnvWarning });
+    if (packagePresetLog)
+      await onEvent({
+        type: "log",
+        projectPackageStartup: true,
+        text: packagePresetLog,
+      });
     if (packagePresetWarning)
-      await onEvent({ type: "warning", message: packagePresetWarning });
+      await onEvent({
+        type: "warning",
+        projectPackageStartup: true,
+        message: packagePresetWarning,
+      });
   } catch (error) {
     await stop();
     throw error;

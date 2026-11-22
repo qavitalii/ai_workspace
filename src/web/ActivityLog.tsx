@@ -10,6 +10,7 @@ import {
 import {
   describeActivity,
   mergeActivityEvents,
+  recentActivityEvents,
   type ActivityEvent,
   type ActivityKind,
 } from "./activity-log";
@@ -18,20 +19,26 @@ export function ActivityLog({
   history,
   live,
   running,
+  latestJobId,
 }: {
   history: ActivityEvent[];
   live: ActivityEvent[];
   running: boolean;
+  latestJobId: string | null;
 }) {
   const [filter, setFilter] = useState<"all" | ActivityKind>("all");
   const events = useMemo(
     () => mergeActivityEvents(history, live),
     [history, live],
   );
+  const limit = 60;
   const recent = useMemo(
     () =>
-      events.slice(-60).map((event) => ({ event, ...describeActivity(event) })),
-    [events],
+      recentActivityEvents(events, limit, latestJobId).map((event) => ({
+        event,
+        ...describeActivity(event),
+      })),
+    [events, latestJobId],
   );
   if (!events.length) return null;
   const counts = {
@@ -91,7 +98,12 @@ export function ActivityLog({
             ))}
           </div>
           <span className="execution-order">
-            {events.length > 60 ? "Latest 60 entries · " : ""}Oldest first
+            {recent.length > limit
+              ? "Latest 60 + startup notices · "
+              : events.length > limit
+                ? "Latest 60 entries · "
+                : ""}
+            Oldest first
           </span>
         </div>
         <div className="execution-entries">

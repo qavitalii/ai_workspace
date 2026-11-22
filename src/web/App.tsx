@@ -1,6 +1,7 @@
 import { ChangesPanel } from "./ChangesPanel";
 import { AccountSwitcher } from "./AccountSwitcher";
 import { ActivityLog } from "./ActivityLog";
+import { recentActivityEvents, type ActivityEvent } from "./activity-log";
 import { ChatMarkdown } from "./ChatMarkdown";
 import { SshSettings, SshAccess } from "./SshSettings";
 import { SkillsSettings } from "./SkillsSettings";
@@ -289,7 +290,7 @@ export function App() {
     [searching, setSearching] = useState(false),
     [searchError, setSearchError] = useState(""),
     [streams, setStreams] = useState<Record<string, string>>({}),
-    [liveLogs, setLiveLogs] = useState<any[]>([]),
+    [liveLogs, setLiveLogs] = useState<ActivityEvent[]>([]),
     [workspaceRevision, setWorkspaceRevision] = useState(0),
     [connected, setConnected] = useState(false);
   const updates = useWorkspaceUpdates(Boolean(me), modal === "settings");
@@ -515,7 +516,7 @@ export function App() {
             [ev.job_id]: (s[ev.job_id] || "") + ev.data.text,
           }));
         if (["tool", "log", "handoff", "warning"].includes(ev.type))
-          setLiveLogs((s) => [...s.slice(-149), ev]);
+          setLiveLogs((s) => recentActivityEvents([...s, ev], 150));
         if (
           [
             "status",
@@ -1321,6 +1322,7 @@ export function App() {
                   history={detail.events}
                   live={liveLogs}
                   running={job?.state === "running"}
+                  latestJobId={detail.jobs[0]?.id ?? null}
                 />
                 {detail.approvals.map((a: any) =>
                   a.kind === "question" ? (

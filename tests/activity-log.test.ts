@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   describeActivity,
   mergeActivityEvents,
+  recentActivityEvents,
   type ActivityEvent,
 } from "../src/web/activity-log";
 
@@ -27,6 +28,42 @@ describe("execution history", () => {
         [event("9007199254740992"), event("11", "delta")],
       ).map((e) => e.id),
     ).toEqual(["9", "10", "9007199254740992", "9007199254740993"]);
+  });
+  it("keeps startup details through the live and visible log limits", () => {
+    const older = {
+      ...event("1", "log", { text: "Older run", projectPackageStartup: true }),
+      job_id: "older",
+    };
+    const details = {
+      ...event("2", "log", {
+        text: "Preset budget is zero.\nPackages: hello, sl",
+        projectPackageStartup: true,
+      }),
+      job_id: "current",
+    };
+    const warning = {
+      ...event("3", "warning", {
+        message: "Workspace skipped some saved Debian packages.",
+        projectPackageStartup: true,
+      }),
+      job_id: "current",
+    };
+    let live: ActivityEvent[] = [older, details, warning];
+    for (let id = 4; id <= 168; id++)
+      live = recentActivityEvents([...live, event(String(id))], 150);
+    expect(live.slice(0, 2)).toEqual([details, warning]);
+    const recent = recentActivityEvents(
+      mergeActivityEvents([details, warning], live),
+      60,
+      "current",
+    );
+    expect(recent).toHaveLength(62);
+    expect(recent.slice(0, 2)).toEqual([details, warning]);
+    expect(describeActivity(recent[0])).toMatchObject({
+      kind: "output",
+      body: "Preset budget is zero.\nPackages: hello, sl",
+    });
+    expect(recentActivityEvents(live, 60, "next")).not.toContain(details);
   });
   it("recognizes Codex and Claude commands without inventing completion status", () => {
     for (const item of [
