@@ -4854,6 +4854,12 @@ esac
       }),
     ).toMatchObject({ statusCode: 401 });
   });
+  // These scenarios make several requests after the shared test client has
+  // exercised most of the API. Give them a separate rate-limit bucket.
+  function projectEnvironmentRequest(options: InjectOptions) {
+    return app.inject({ ...options, remoteAddress: "192.0.2.41" });
+  }
+
   it("reports project tool usage and clears only an idle project's tool directory", async () => {
     const project = (await chatWorkspace(chat)).project_id!;
     const otherProject = randomUUID();
@@ -4874,9 +4880,14 @@ esac
     );
 
     const url = "/api/projects/" + project.toUpperCase() + "/environment";
-    const read = async () => (await app.inject({ url, headers })).json();
+    const read = async () =>
+      (await projectEnvironmentRequest({ url, headers })).json();
     const clear = () =>
-      app.inject({ method: "POST", url: url + "/clear", headers });
+      projectEnvironmentRequest({
+        method: "POST",
+        url: url + "/clear",
+        headers,
+      });
     expect(await read()).toEqual({
       usedBytes: 9 * 1024 ** 3,
       limitBytes: 8 * 1024 ** 3,
@@ -4886,7 +4897,7 @@ esac
     });
     expect(
       (
-        await app.inject({
+        await projectEnvironmentRequest({
           url: "/api/projects/" + randomUUID() + "/environment",
           headers,
         })
@@ -4894,7 +4905,7 @@ esac
     ).toBe(404);
     expect(
       (
-        await app.inject({
+        await projectEnvironmentRequest({
           method: "POST",
           url: url + "/clear",
           headers: { origin },
@@ -4997,7 +5008,7 @@ esac
       const limit = 0.0001;
       expect(
         (
-          await app.inject({
+          await projectEnvironmentRequest({
             method: "POST",
             url: "/api/settings/environment",
             headers,
@@ -5045,7 +5056,7 @@ esac
         await vi.waitFor(() => expect(output).toMatch(/\$ /), {
           timeout: 15000,
         });
-        const blocked = await app.inject({
+        const blocked = await projectEnvironmentRequest({
           method: "POST",
           url: url + "/clear",
           headers,
@@ -5094,11 +5105,16 @@ esac
         await after.stop();
       }
       await writeFile(payload, randomBytes(512 * 1024));
-      expect((await app.inject({ url, headers })).json().state).toBe("ready");
-      const refreshed = await app.inject({ url: url + "?refresh=1", headers });
+      expect(
+        (await projectEnvironmentRequest({ url, headers })).json().state,
+      ).toBe("ready");
+      const refreshed = await projectEnvironmentRequest({
+        url: url + "?refresh=1",
+        headers,
+      });
       expect(refreshed.json()).toMatchObject({ state: "over-budget" });
       expect(refreshed.json().usedBytes).toBeGreaterThanOrEqual(512 * 1024);
-      const cleared = await app.inject({
+      const cleared = await projectEnvironmentRequest({
         method: "POST",
         url: url + "/clear",
         headers,
