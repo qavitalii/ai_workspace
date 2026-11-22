@@ -34,10 +34,15 @@ delete process.env.WORKSPACE_PROJECT_PACKAGE_RESULT;
 if (packagePresetReport) {
   let results = null;
   let incomplete = true;
+  let skipLog: string[] = [];
   try {
     const report = JSON.parse(packagePresetReport);
     results = packagePresetResults(report.results);
     incomplete = report.incomplete !== false;
+    if (Array.isArray(report.skipLog))
+      skipLog = report.skipLog.filter(
+        (entry: unknown) => typeof entry === "string",
+      );
   } catch {}
   emit({ type: "project_packages_ready", results: results ?? [] });
   if (results?.length) {
@@ -66,7 +71,17 @@ if (packagePresetReport) {
         });
     }
   }
-  if (incomplete || !results)
+  if (skipLog.length) {
+    emit({
+      type: "warning",
+      message:
+        "Workspace skipped some saved Debian packages. See the execution log.",
+    });
+    emit({
+      type: "log",
+      text: "Skipped project Debian packages. " + skipLog.join("\n\n"),
+    });
+  } else if (incomplete || !results)
     emit({
       type: "warning",
       message:

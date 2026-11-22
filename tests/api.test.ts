@@ -265,6 +265,66 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
     });
 
     it.skipIf(process.env.DOCKER_TESTS !== "1")(
+      "logs the preset disk-budget skip and leaves the package enabled",
+      async () => {
+        expect((await add("hello")).statusCode).toBe(200);
+        const morePackages = Array.from(
+          { length: 64 },
+          (_, i) => `workspace-fixture-package-${String(i).padStart(2, "0")}`,
+        );
+        await db.query(
+          `INSERT INTO project_packages(project_id,name,source,request_id)
+           SELECT $1,name,'owner',$2 FROM unnest($3::text[]) AS packages(name)`,
+          [project, randomUUID(), morePackages],
+        );
+        await db.query(
+          "UPDATE project_packages SET failures=2 WHERE project_id=$1 AND name='hello'",
+          [project],
+        );
+        const budget = String(64 * 1024 ** 2);
+        vi.stubEnv("WORKSPACE_PACKAGE_PRESET_BUDGET", budget);
+        const events: import("../src/shared").AgentEvent[] = [];
+        let runner;
+        try {
+          let output = "";
+          runner = await launch(
+            chat,
+            account,
+            (e) => {
+              if (e.type === "terminal") output += e.data;
+              else events.push(e);
+            },
+            { installPackages: true, projectEnv: "read-write" },
+          );
+          runner.send({
+            type: "terminal",
+            data: "printf '\\nRUNNER_''READY\\n'\r",
+          });
+          await vi.waitFor(() => expect(output).toMatch(/^RUNNER_READY\r?$/m), {
+            timeout: 15_000,
+          });
+          expect(events).toContainEqual({
+            type: "log",
+            text: expect.stringContaining(
+              `exceed the ${budget} bytes system-package budget for this preset.\nPackages: ${["hello", ...morePackages].join(", ")}`,
+            ),
+          });
+          expect((await list()).packages).toContainEqual(
+            expect.objectContaining({
+              name: "hello",
+              failures: 2,
+              disabled: false,
+            }),
+          );
+        } finally {
+          vi.unstubAllEnvs();
+          await runner?.stop();
+        }
+      },
+      45_000,
+    );
+
+    it.skipIf(process.env.DOCKER_TESTS !== "1")(
       "preinstalls remembered Debian packages before the first command in another chat",
       async () => {
         let output = "";

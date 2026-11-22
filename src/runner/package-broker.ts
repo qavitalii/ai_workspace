@@ -84,15 +84,18 @@ function aptIsStopping() {
 const apt: RunApt = (command, args, deadline, signal, onLine, trackDpkg) => {
   const cancelled = "Package installation was cancelled.";
   const timedOut = "Package installation timed out.";
-  if (signal.aborted) return Promise.resolve({ ok: false, output: cancelled });
+  if (signal.aborted)
+    return Promise.resolve({ ok: false, output: cancelled, skip: "startup" });
   const timeLeft = deadline - Date.now();
-  if (timeLeft <= 0) return Promise.resolve({ ok: false, output: timedOut });
+  if (timeLeft <= 0)
+    return Promise.resolve({ ok: false, output: timedOut, skip: "startup" });
 
   return new Promise((resolve, reject) => {
     let output = Buffer.alloc(0);
     let dpkgStarted = false;
     let dpkgFailed = false;
     let interruption = "";
+    let spaceError = "";
     let closePipes: NodeJS.Timeout | undefined;
     const child = spawn(
       "/usr/bin/" + command,
@@ -118,6 +121,14 @@ const apt: RunApt = (command, args, deadline, signal, onLine, trackDpkg) => {
         if (line.startsWith("pmerror:")) dpkgFailed = true;
       });
     createInterface({ input: child.stderr! }).on("line", (line) => {
+      if (line.includes("Disk quota exceeded"))
+        spaceError ||= "APT reported that its disk quota was exceeded.";
+      else if (
+        /No space left on device|You don't have enough free space in /.test(
+          line,
+        )
+      )
+        spaceError ||= "APT reported insufficient free disk space.";
       // Apt also reports dpkg process failures without a pmerror record.
       if (
         /^E: (?:Sub-process \/usr\/bin\/dpkg |dpkg was interrupted,)/.test(line)
@@ -160,7 +171,13 @@ const apt: RunApt = (command, args, deadline, signal, onLine, trackDpkg) => {
       const ok = !interruption && code === 0;
       resolve({
         ok,
-        output: interruption || output.toString("utf8").trim(),
+        output:
+          interruption || (!ok && spaceError) || output.toString("utf8").trim(),
+        skip: interruption
+          ? "startup"
+          : !ok && spaceError
+            ? "space"
+            : undefined,
         interrupted: Boolean(interruption),
         dpkgStarted,
         dpkgFailed:

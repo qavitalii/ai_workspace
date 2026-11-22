@@ -174,6 +174,13 @@ function fakeInstaller(budgets = packageBudgets({}), failAfterDpkg = false) {
       } else if (args.includes("install")) {
         if (name === "download-failed")
           return { ok: false, output: "Download failed" };
+        if (name === "startup-timeout")
+          return {
+            ok: false,
+            output: "Package installation timed out.",
+            skip: "startup",
+            interrupted: true,
+          };
         if (name === "interrupted")
           return {
             ok: false,
@@ -270,6 +277,29 @@ describe("Debian package presets", () => {
     }
   });
 
+  it("skips the package in progress when the startup deadline interrupts apt", async () => {
+    const { install, apt } = fakeInstaller();
+    const timeout = {
+      ok: false,
+      skipped: true,
+      output: "Package installation timed out.",
+    };
+    expect(
+      await install("preset", ["curl", "startup-timeout", "zip"], signal),
+    ).toMatchObject({
+      incomplete: true,
+      results: [
+        { name: "curl", ok: true },
+        { name: "startup-timeout", ...timeout },
+        { name: "zip", ...timeout },
+      ],
+    });
+    expect(
+      apt.mock.calls.some(([, args]) => args.join(" ").includes("zip")),
+    ).toBe(false);
+    expect(await install("run", ["zip"], signal)).toMatchObject({ ok: true });
+  });
+
   it("keeps the broker usable after a preset interruption before dpkg", async () => {
     const { install } = fakeInstaller();
     expect(await install("preset", ["interrupted"], signal)).toMatchObject({
@@ -279,7 +309,7 @@ describe("Debian package presets", () => {
     expect(await install("run", ["zip"], signal)).toMatchObject({ ok: true });
   });
 
-  it("charges preset installations against their own budget", async () => {
+  it("skips over-budget packages and keeps processing the preset", async () => {
     const { install } = fakeInstaller({
       run: 20 * MiB,
       preset: packageIndexAllowance + 20 * MiB,
@@ -287,9 +317,21 @@ describe("Debian package presets", () => {
     expect(await install("preset", ["sized"], signal)).toMatchObject({
       ok: true,
     });
-    expect(await install("preset", ["sized"], signal)).toMatchObject({
+    expect(await install("preset", ["sized", "curl"], signal)).toMatchObject({
       ok: false,
-      results: [{ name: "sized", output: expect.stringContaining("preset") }],
+      incomplete: false,
+      results: [
+        {
+          name: "sized",
+          ok: false,
+          skipped: true,
+          output: expect.stringContaining("budget for this preset"),
+        },
+        { name: "curl", ok: true },
+      ],
+    });
+    expect(await install("preset", ["zip"], signal)).toMatchObject({
+      ok: true,
     });
     expect(await install("run", ["sized"], signal)).toMatchObject({ ok: true });
     expect(await install("run", ["sized"], signal)).toMatchObject({
