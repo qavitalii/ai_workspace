@@ -29,17 +29,23 @@ if [ "${WORKSPACE_SYSTEM_PACKAGES:-}" != 1 ]; then
     kill "$broker" 2>/dev/null || true
 fi
 
+skip_project_packages() {
+    WORKSPACE_PROJECT_PACKAGE_RESULT=$(printf '{"results":[],"incomplete":true,"skipLog":["%s"],"skippedPackages":%s}' \
+        "$1" "$WORKSPACE_PROJECT_PACKAGES")
+    export WORKSPACE_PROJECT_PACKAGE_RESULT
+}
+
 if [ -n "${WORKSPACE_PROJECT_PACKAGES:-}" ]; then
     if [ "${WORKSPACE_SYSTEM_PACKAGES:-}" != 1 ]; then
-        export WORKSPACE_PROJECT_PACKAGE_RESULT='{"results":[],"incomplete":true,"skipLog":["The Debian package installer is unavailable in this runner."]}'
+        skip_project_packages "The Debian package installer is unavailable in this runner."
     elif WORKSPACE_PROJECT_PACKAGE_RESULT=$(
             /usr/bin/setpriv --bounding-set=-all --inh-caps=-all --ambient-caps=-all -- \
                 /usr/bin/env -i WORKSPACE_PROJECT_PACKAGES="$WORKSPACE_PROJECT_PACKAGES" \
                 /usr/local/bin/node /app/dist/node/runner/package-presets.js </dev/null
-        ); then
+        ) && [ -n "$WORKSPACE_PROJECT_PACKAGE_RESULT" ]; then
         export WORKSPACE_PROJECT_PACKAGE_RESULT
     else
-        export WORKSPACE_PROJECT_PACKAGE_RESULT='{"results":[],"incomplete":true,"skipLog":["The package preset helper exited without a result."]}'
+        skip_project_packages "The package preset helper exited without a result."
     fi
 fi
 unset WORKSPACE_PROJECT_PACKAGES

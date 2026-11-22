@@ -7,7 +7,10 @@ import {
 } from "./integrations.js";
 import { githubSyncBridge } from "./github-sync-bridge.js";
 import { drainPackageAudit } from "./package-audit.js";
-import { packagePresetResults } from "./package-request.js";
+import {
+  packagePresetResults,
+  projectPackageNames,
+} from "./package-request.js";
 import { codexImageItem } from "./generated-images.js";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createInterface } from "node:readline";
@@ -35,10 +38,12 @@ if (packagePresetReport) {
   let results = null;
   let incomplete = true;
   let skipLog: string[] = [];
+  let skippedPackages = null;
   try {
     const report = JSON.parse(packagePresetReport);
     results = packagePresetResults(report.results);
     incomplete = report.incomplete !== false;
+    skippedPackages = projectPackageNames(report.skippedPackages);
     if (Array.isArray(report.skipLog))
       skipLog = report.skipLog.filter(
         (entry: unknown) => typeof entry === "string",
@@ -77,7 +82,10 @@ if (packagePresetReport) {
     emit({
       type: "log",
       projectPackageStartup: true,
-      text: "Skipped project Debian packages. " + skipLog.join("\n\n"),
+      text:
+        "Skipped project Debian packages. " +
+        skipLog.join("\n\n") +
+        (skippedPackages ? "\nPackages: " + skippedPackages.join(", ") : ""),
     });
     emit({
       type: "warning",

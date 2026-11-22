@@ -419,7 +419,6 @@ export async function launch(
               "Workspace could not save the project Debian package installation results.",
           });
       }
-      if (!stopped) await onEvent({ type: e.type, results });
       return;
     }
     await onEvent(e);

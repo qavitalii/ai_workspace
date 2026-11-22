@@ -368,6 +368,88 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
       20_000,
     );
 
+    it.skipIf(process.env.DOCKER_TESTS !== "1").each([
+      {
+        scenario: "the installer cannot start",
+        target: "/usr/local/lib/workspace-install/sandbox",
+        script: "#!/bin/sh\nexit 1\n",
+        reason: "The Debian package installer is unavailable in this runner.",
+      },
+      {
+        scenario: "the preset helper exits with an error",
+        target: "/app/dist/node/runner/package-presets.js",
+        script: "process.exitCode = 1;\n",
+        reason: "The package preset helper exited without a result.",
+      },
+      {
+        scenario: "the preset helper exits successfully without output",
+        target: "/app/dist/node/runner/package-presets.js",
+        script: "process.exitCode = 0;\n",
+        reason: "The package preset helper exited without a result.",
+      },
+    ])(
+      "logs all skipped package names when $scenario",
+      async ({ target, script, reason }) => {
+        for (const name of ["hello", "sl"])
+          expect((await add(name)).statusCode).toBe(200);
+        await db.query(
+          "UPDATE project_packages SET failures=2 WHERE project_id=$1",
+          [project],
+        );
+        const fixture = path.join(data, "package-startup-failure");
+        await writeFile(fixture, script, { mode: 0o755 });
+        const createContainer = docker.createContainer.bind(docker);
+        const containers = vi
+          .spyOn(docker, "createContainer")
+          .mockImplementation((options) => {
+            if (
+              options.Entrypoint?.[0] ===
+              "/usr/local/bin/workspace-package-runner"
+            )
+              options.HostConfig?.Mounts?.push({
+                Type: "bind",
+                Source: fixture,
+                Target: target,
+                ReadOnly: true,
+              });
+            return createContainer(options);
+          });
+        let runner;
+        try {
+          let output = "";
+          const logs: string[] = [];
+          runner = await launch(
+            chat,
+            account,
+            (e) => {
+              if (e.type === "terminal") output += e.data;
+              if (e.type === "log" && e.projectPackageStartup)
+                logs.push(e.text);
+            },
+            { installPackages: true, projectEnv: "read-write" },
+          );
+          runner.send({
+            type: "terminal",
+            data: "printf '\\nRUNNER_''READY\\n'\r",
+          });
+          await vi.waitFor(() => expect(output).toMatch(/^RUNNER_READY\r?$/m), {
+            timeout: 15_000,
+          });
+          expect(logs).toEqual([
+            `Skipped project Debian packages. ${reason}\nPackages: hello, sl`,
+          ]);
+          expect((await list()).packages).toMatchObject([
+            { name: "sl", failures: 2, disabled: false },
+            { name: "hello", failures: 2, disabled: false },
+          ]);
+        } finally {
+          containers.mockRestore();
+          await runner?.stop();
+        }
+      },
+      25_000,
+    );
+
     it.skipIf(process.env.DOCKER_TESTS !== "1")(
       "logs the preset disk-budget skip and leaves the package enabled",
       async () => {
@@ -519,13 +601,9 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
             () => expect(output).toMatch(/^PRESET_AVAILABLE\r?$/m),
             { timeout: 105_000 },
           );
-          expect(events).toContainEqual({
-            type: "project_packages_ready",
-            results: [
-              { name: missing, ok: false },
-              { name: "hello", ok: true },
-            ],
-          });
+          expect(
+            events.some(({ type }) => type === "project_packages_ready"),
+          ).toBe(false);
           expect(events).toContainEqual({
             type: "warning",
             projectPackageStartup: true,
