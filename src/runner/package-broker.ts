@@ -234,7 +234,7 @@ function packageServer(mode: InstallMode) {
         return;
       }
       request += chunk;
-      if (request.length > maxPackageRequestBytes) {
+      if (Buffer.byteLength(request) > maxPackageRequestBytes) {
         socket.destroy();
         return;
       }

@@ -1,8 +1,8 @@
 import type { PackageInstallResult } from "./package-client.js";
 import {
-  maxPackageNames,
   packageNamePattern,
   packageNames,
+  packageRequestLimit,
   packageUsage,
 } from "./package-request.js";
 
@@ -63,8 +63,7 @@ export function packageToolHandler(
             tools: [
               {
                 name: "install",
-                description:
-                  "Install named Debian packages in the agent runner.",
+                description: `Install named Debian packages in the agent runner. ${packageRequestLimit}`,
                 inputSchema: {
                   type: "object",
                   properties: {
@@ -72,7 +71,6 @@ export function packageToolHandler(
                       type: "array",
                       items: { type: "string", pattern: packageNamePattern },
                       minItems: 1,
-                      maxItems: maxPackageNames,
                     },
                   },
                   required: ["packages"],

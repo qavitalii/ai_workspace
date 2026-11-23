@@ -121,23 +121,25 @@ describe("Debian package budgets", () => {
   });
 });
 
-it("accepts a full batch of 64 names in the request and MCP tool", async () => {
-  const names = Array.from({ length: 64 }, (_, i) =>
+it("applies the 8 KiB request boundary to package names and the MCP tool", async () => {
+  const longNames = Array.from({ length: 124 }, (_, i) =>
     `package-${i}`.padEnd(63, "a"),
   );
-  expect(Buffer.byteLength(JSON.stringify(names) + "\n")).toBeLessThan(
+  const names = [...longNames, "git"];
+  const tooLarge = [...longNames, "grep"];
+  expect(Buffer.byteLength(JSON.stringify(names) + "\n")).toBe(
     maxPackageRequestBytes,
   );
   expect(packageNames(names)).toEqual(names);
-  expect(packageNames([...names, "extra"])).toBeNull();
+  expect(packageNames(tooLarge)).toBeNull();
+  expect(packageNames(["git", "git"])).toEqual(["git"]);
   const install = vi.fn(async () => ({ ok: true, output: "Ready" }));
   const write = vi.fn();
   const handle = packageToolHandler(install, write);
   await handle(JSON.stringify({ id: 1, method: "tools/list" }));
-  expect(
-    write.mock.calls[0][0].result.tools[0].inputSchema.properties.packages
-      .maxItems,
-  ).toBe(64);
+  const tool = write.mock.calls[0][0].result.tools[0];
+  expect(tool.description).toContain("8 KiB");
+  expect(tool.inputSchema.properties.packages).not.toHaveProperty("maxItems");
   await handle(
     JSON.stringify({
       id: 2,
@@ -146,6 +148,22 @@ it("accepts a full batch of 64 names in the request and MCP tool", async () => {
     }),
   );
   expect(install).toHaveBeenCalledWith(names, expect.any(AbortSignal));
+  await handle(
+    JSON.stringify({
+      id: 3,
+      method: "tools/call",
+      params: { name: "install", arguments: { packages: tooLarge } },
+    }),
+  );
+  expect(install).toHaveBeenCalledTimes(1);
+  expect(write).toHaveBeenLastCalledWith({
+    jsonrpc: "2.0",
+    id: 3,
+    result: {
+      content: [{ type: "text", text: expect.stringContaining("8 KiB") }],
+      isError: true,
+    },
+  });
 });
 
 function fakeInstaller(budgets = packageBudgets({}), failAfterDpkg = false) {
