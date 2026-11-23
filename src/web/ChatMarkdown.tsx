@@ -1,6 +1,6 @@
 import type { Element, Root } from "hast";
-import { Download } from "lucide-react";
-import { useState } from "react";
+import { ArrowLeftRight, Download } from "lucide-react";
+import { useEffect, useRef, useState, type ComponentProps } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 
@@ -163,12 +163,65 @@ function WorkspaceImage({
   );
 }
 
+function MarkdownTable(props: ComponentProps<"table">) {
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const tableRef = useRef<HTMLTableElement>(null);
+  const [overflowing, setOverflowing] = useState(false);
+
+  useEffect(() => {
+    const scroller = scrollRef.current!;
+    const table = tableRef.current!;
+    const update = () =>
+      setOverflowing(scroller.scrollWidth > scroller.clientWidth);
+    update();
+    const observer = new ResizeObserver(update);
+    observer.observe(scroller);
+    observer.observe(table);
+    return () => observer.disconnect();
+  }, []);
+
+  return (
+    <div className="chat-table">
+      {overflowing && (
+        <div className="chat-table-hint" aria-hidden="true">
+          <ArrowLeftRight size={13} />
+          Scroll to see all columns
+        </div>
+      )}
+      <div
+        ref={scrollRef}
+        className="chat-table-scroll"
+        role={overflowing ? "region" : undefined}
+        aria-label={overflowing ? "Scrollable table" : undefined}
+        tabIndex={overflowing ? 0 : undefined}
+        onKeyDown={(event) => {
+          if (
+            !overflowing ||
+            event.target !== event.currentTarget ||
+            event.altKey ||
+            event.ctrlKey ||
+            event.metaKey ||
+            event.shiftKey ||
+            (event.key !== "ArrowLeft" && event.key !== "ArrowRight")
+          )
+            return;
+          event.preventDefault();
+          event.currentTarget.scrollLeft += event.key === "ArrowLeft" ? -40 : 40;
+        }}
+      >
+        <table {...props} ref={tableRef} />
+      </div>
+    </div>
+  );
+}
+
 const components: Components = {
   a: ({ children, node, ...props }) => (
     <a {...props} target="_blank" rel="noopener noreferrer">
       {children}
     </a>
   ),
+  table: ({ node, ...props }) => <MarkdownTable {...props} />,
   img: ({ src, alt }) =>
     src && /^\/api\/attachments\/[0-9a-f-]{36}$/i.test(src) ? (
       <img src={src} alt={alt} />
