@@ -21,6 +21,12 @@ import { cleanAwsCredentials, awsForRun } from "./aws.js";
 import { cleanSkillSnapshots, prepareSkills } from "./skills.js";
 import { measureProjectEnv, prepareProjectEnv } from "./project-env.js";
 import {
+  projectPackagePresets,
+  recordPackagePresetResults,
+} from "./project-packages.js";
+import { packageBudgets } from "../runner/package-disk.js";
+import { packagePresetResults } from "../runner/package-request.js";
+import {
   prepareProfile,
   recoverRunProfiles,
   removeSessionsExcept,
@@ -65,7 +71,7 @@ export async function launch(
   const installPackages =
     options.installPackages &&
     image?.Config?.Labels?.["ai.workspace.runner.package-installer"] === "1";
-  const packageEnv: string[] = [];
+  const packageEnv: Record<string, string> = {};
   if (installPackages) {
     const [configured, running] = await Promise.all([
       concurrentTasks(),
@@ -75,13 +81,13 @@ export async function launch(
     ]);
     // Lowering the limit does not stop the jobs already admitted.
     const packageConcurrency = Math.max(configured, Number(running.rows[0].n));
-    packageEnv.push("WORKSPACE_PACKAGE_CONCURRENCY=" + packageConcurrency);
+    packageEnv.WORKSPACE_PACKAGE_CONCURRENCY = String(packageConcurrency);
     for (const name of [
       "WORKSPACE_PACKAGE_RUN_BUDGET",
       "WORKSPACE_PACKAGE_PRESET_BUDGET",
     ]) {
       const value = process.env[name];
-      if (value) packageEnv.push(`${name}=${value}`);
+      if (value) packageEnv[name] = value;
     }
   }
   const work = w
@@ -98,6 +104,9 @@ export async function launch(
       })
     : null;
   let projectEnvWarning: string | undefined;
+  let packagePresetWarning: string | undefined;
+  let packagePresetLog: string | undefined;
+  let presets: Map<string, string> | undefined;
   if (projectEnv && projectEnvId) {
     // Cached measurements can describe read-only runs. A launch that would
     // allow writes must account for installations since the last measurement.
@@ -113,6 +122,50 @@ export async function launch(
       projectEnvWarning = `Project tools exceed the ${limitGib} GiB limit. /env is mounted read-only for this session.`;
     if (projectEnvWarning) projectEnv.mount.ReadOnly = true;
     mounts.push(projectEnv.mount);
+    if (installPackages && options.projectEnv === "read-write") {
+      presets = await projectPackagePresets(projectEnvId).catch((error) => {
+        console.error("Could not load project Debian packages", error);
+        packagePresetWarning =
+          "Workspace could not load the saved project Debian packages.";
+        return undefined;
+      });
+      if (presets?.size) {
+        const projectLimit = Math.round(limitGib * GiB);
+        const remaining = projectLimit - (bytes ?? Infinity);
+        if (
+          image?.Config?.Labels?.["ai.workspace.runner.package-presets"] !== "1"
+        )
+          packagePresetWarning =
+            "This runner image does not support preinstalling project Debian packages. Rebuild it from the current Workspace runner.";
+        else if (remaining <= 0)
+          packagePresetWarning =
+            "Skipped project Debian packages because no project tool storage was available.";
+        else {
+          const presetCap = Math.min(
+            projectLimit,
+            packageBudgets(process.env, projectLimit).preset,
+          );
+          const budget = Math.min(remaining, presetCap);
+          if (budget === 0)
+            packagePresetWarning =
+              "Skipped project Debian packages because the preset budget is zero.";
+          else {
+            packageEnv.WORKSPACE_PROJECT_PACKAGES = JSON.stringify([
+              ...presets.keys(),
+            ]);
+            packageEnv.WORKSPACE_PACKAGE_PRESET_BUDGET = String(budget);
+            // Another project may have more space left in its budget than this one.
+            packageEnv.WORKSPACE_PACKAGE_PEER_PRESET_BUDGET = String(presetCap);
+          }
+        }
+      }
+    }
+  }
+  if (packagePresetWarning) {
+    if (presets?.size)
+      packagePresetLog =
+        packagePresetWarning + "\nPackages: " + [...presets.keys()].join(", ");
+    presets = undefined;
   }
   if (chatId && w) {
     mounts.push(...workspaceGitMounts(w));
@@ -222,10 +275,11 @@ export async function launch(
         "CODEX_HOME=/profile/.codex",
         "CLAUDE_CONFIG_DIR=/profile/.claude",
         "GIT_OPTIONAL_LOCKS=0",
-        ...Object.entries({ ...aws?.env, ...projectEnv?.env }).map(
-          ([key, value]) => key + "=" + value,
-        ),
-        ...packageEnv,
+        ...Object.entries({
+          ...aws?.env,
+          ...projectEnv?.env,
+          ...packageEnv,
+        }).map(([key, value]) => key + "=" + value),
       ],
       HostConfig: {
         Mounts: mounts,
@@ -342,7 +396,32 @@ export async function launch(
   }
   const output = consumeRunnerOutput(stream, async (e) => {
     if (e.type === "session" && typeof e.id === "string") session = e.id;
-    if (!stopped) await onEvent(e);
+    if (stopped) return;
+    if (e.type === "project_packages_ready") {
+      const requested = presets;
+      presets = undefined;
+      const results = packagePresetResults(e.results);
+      if (
+        !projectEnvId ||
+        !requested ||
+        !results?.length ||
+        results.some(({ name }) => !requested.has(name))
+      )
+        return;
+      try {
+        await recordPackagePresetResults(projectEnvId, requested, results);
+      } catch (error) {
+        console.error("Could not record project Debian package results", error);
+        if (!stopped)
+          await onEvent({
+            type: "warning",
+            message:
+              "Workspace could not save the project Debian package installation results.",
+          });
+      }
+      return;
+    }
+    await onEvent(e);
   }).catch(async (error) => {
     if (stopped) return;
     await stop();
@@ -361,6 +440,18 @@ export async function launch(
       });
     if (projectEnvWarning)
       await onEvent({ type: "warning", message: projectEnvWarning });
+    if (packagePresetLog)
+      await onEvent({
+        type: "log",
+        projectPackageStartup: true,
+        text: packagePresetLog,
+      });
+    if (packagePresetWarning)
+      await onEvent({
+        type: "warning",
+        projectPackageStartup: true,
+        message: packagePresetWarning,
+      });
   } catch (error) {
     await stop();
     throw error;

@@ -45,6 +45,8 @@ These Chromium captures use fictional usage and package data and show the projec
 | --- | --- | --- |
 | Project environment | [Usage](project-tools/project-tools-desktop.png) | [Over the limit](project-tools/project-tools-over-budget-mobile.png) |
 | System packages | [Desktop](system-packages/system-packages-desktop.png) | [Mobile](system-packages/system-packages-mobile.png) |
+| Package preinstall warning | [Desktop](system-packages/chat-preset-warning-desktop.png) | [Mobile](system-packages/chat-preset-warning-mobile.png) · [320 px](system-packages/narrow-banner-after-mobile.png) |
+| Disabled saved package | [Desktop](system-packages/settings-preset-failed-desktop.png) | [Mobile](system-packages/settings-preset-failed-mobile.png) |
 | Workspace resource settings | [Limit setting](project-tools/server-tools-limit-desktop.png) | [Saved limit](project-tools/server-tools-limit-mobile.png) |
 
 ## Refresh the captures

@@ -2,6 +2,7 @@ import { cleanTerminalText } from "../shared";
 
 export type ActivityEvent = {
   id: string | number;
+  job_id?: string | null;
   type: string;
   created_at?: string;
   data: Record<string, unknown>;
@@ -21,6 +22,29 @@ export function mergeActivityEvents(
   }
   return [...events.values()].sort((a, b) =>
     String(a.id).localeCompare(String(b.id), "en", { numeric: true }),
+  );
+}
+
+export function recentActivityEvents(
+  events: ActivityEvent[],
+  limit: number,
+  startupJobId?: string | null,
+) {
+  if (events.length <= limit) return events;
+  if (startupJobId === undefined) {
+    for (let index = events.length - 1; index >= 0; index--) {
+      if (events[index].data.projectPackageStartup === true) {
+        startupJobId = events[index].job_id;
+        break;
+      }
+    }
+  }
+  return events.filter(
+    (event, index) =>
+      index >= events.length - limit ||
+      (startupJobId != null &&
+        event.job_id === startupJobId &&
+        event.data.projectPackageStartup === true),
   );
 }
 

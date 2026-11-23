@@ -675,8 +675,13 @@ export async function createApp() {
 
   app.get("/api/chats/:id", async (req) => {
     const id = idOf(req);
+    const chat = await chatBy(id);
+    const { rows: jobs } = await db.query(
+      "SELECT * FROM jobs WHERE chat_id=$1 ORDER BY created_at DESC LIMIT 20",
+      [id],
+    );
     return {
-      chat: await chatBy(id),
+      chat,
       messages: (
         await db.query(
           "SELECT * FROM messages WHERE chat_id=$1 ORDER BY created_at",
@@ -689,12 +694,7 @@ export async function createApp() {
           [id],
         )
       ).rows,
-      jobs: (
-        await db.query(
-          "SELECT * FROM jobs WHERE chat_id=$1 ORDER BY created_at DESC LIMIT 20",
-          [id],
-        )
-      ).rows,
+      jobs,
       approvals: (
         await db.query(
           "SELECT a.* FROM approvals a JOIN jobs j ON j.id=a.job_id WHERE j.chat_id=$1 AND a.decision IS NULL",
@@ -703,8 +703,17 @@ export async function createApp() {
       ).rows,
       events: (
         await db.query(
-          "SELECT * FROM (SELECT * FROM events WHERE chat_id=$1 AND type IN ('handoff','tool','log','warning') ORDER BY id DESC LIMIT 100) e ORDER BY id",
-          [id],
+          `WITH recent AS (
+             SELECT * FROM events WHERE chat_id=$1 AND type IN ('handoff','tool','log','warning')
+             ORDER BY id DESC LIMIT 100
+           )
+           SELECT * FROM recent
+           UNION ALL
+           SELECT * FROM events WHERE chat_id=$1 AND job_id=$2
+             AND type IN ('log','warning') AND data @> '{"projectPackageStartup":true}'
+             AND id < (SELECT min(id) FROM recent)
+           ORDER BY id`,
+          [id, jobs[0]?.id ?? null],
         )
       ).rows,
     };

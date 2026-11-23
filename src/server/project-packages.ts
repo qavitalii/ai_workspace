@@ -1,9 +1,13 @@
 import { randomUUID } from "node:crypto";
 import type { PoolClient } from "pg";
 import type { ProjectPackages } from "../shared.js";
+import {
+  maxProjectPackages as packageLimit,
+  validPackageName,
+  type PackagePresetResult,
+} from "../runner/package-request.js";
 import { db, transaction } from "./db.js";
 
-const packageLimit = 256;
 const limitMessage = `Projects can remember up to ${packageLimit} Debian packages.`;
 
 function projectNotFound() {
@@ -34,6 +38,45 @@ export async function listProjectPackages(projectId: string) {
   );
   if (!rows[0]) throw projectNotFound();
   return rows[0];
+}
+
+export async function projectPackagePresets(projectId: string) {
+  const { rows } = await db.query<{ name: string; request_id: string }>(
+    `SELECT name,request_id FROM project_packages
+     WHERE project_id=$1 AND NOT disabled
+     ORDER BY added_at,name LIMIT $2`,
+    [projectId, packageLimit],
+  );
+  return new Map(
+    rows
+      .filter(({ name }) => validPackageName(name))
+      .map(({ name, request_id }) => [name, request_id]),
+  );
+}
+
+export async function recordPackagePresetResults(
+  projectId: string,
+  presets: ReadonlyMap<string, string>,
+  results: PackagePresetResult[],
+) {
+  const reported = results.map(({ name, ok }) => ({
+    name,
+    ok,
+    request_id: presets.get(name),
+  }));
+  await transaction(async (c) => {
+    await lockProject(c, projectId);
+    // The owner may have removed or replaced a package while apt was running.
+    await c.query(
+      `UPDATE project_packages pp
+       SET failures=CASE WHEN result.ok THEN 0 ELSE pp.failures+1 END,
+           disabled=NOT result.ok AND pp.failures+1>=3
+       FROM json_to_recordset($2::json) AS result(name text,ok boolean,request_id uuid)
+       WHERE pp.project_id=$1 AND pp.name=result.name
+         AND pp.request_id=result.request_id AND (result.ok OR NOT pp.disabled)`,
+      [projectId, JSON.stringify(reported)],
+    );
+  });
 }
 
 async function savePackages(

@@ -52,7 +52,7 @@ During an execution task, ask Codex or Claude Code to install a Debian package s
 
 Open **Project settings → Environment → System packages** to see saved Debian packages grouped by installation request, with the source chat and date. Turn **Remember packages installed by agents** off to stop saving new installs automatically. You can add a package by name or remove a package or an entire group from the saved list. **Installation failed** marks a disabled entry.
 
-The saved list persists across chats. Each execution still uses a fresh container, so ask the agent to install any additional Debian tools it needs for that run.
+Workspace preinstalls saved packages before an execution task starts, including in other chats of the same project. A task can start when a package fails to install. Workspace warns about failed installs and skips a package in future runs after three consecutive failures. To retry a disabled package, remove it from the saved list and add it again.
 
 ### SSH servers
 

@@ -64,7 +64,7 @@ export function packageToolHandler(
               {
                 name: "install",
                 description:
-                  "Install named Debian packages for this agent run only.",
+                  "Install named Debian packages in the agent runner.",
                 inputSchema: {
                   type: "object",
                   properties: {

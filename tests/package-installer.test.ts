@@ -98,6 +98,27 @@ describe("Debian package budgets", () => {
       }),
     ).toEqual({ run: packageRunBudget, preset: packageRunBudget });
   });
+
+  it("reserves for peers with more preset space than this project", () => {
+    const peerPreset = 2048 * MiB;
+    const requested = 16 * MiB;
+    const budgets = packageBudgets({
+      WORKSPACE_PACKAGE_PRESET_BUDGET: String(64 * MiB),
+      WORKSPACE_PACKAGE_PEER_PRESET_BUDGET: String(peerPreset),
+    });
+    const required = BigInt(
+      512 * MiB + 2 * (packageRunBudget + peerPreset) + requested,
+    );
+    expect(
+      diskLimitError(0, requested, required - 1n, 3, budgets, "preset"),
+    ).toContain("Docker disk");
+    expect(
+      diskLimitError(0, requested, required, 3, budgets, "preset"),
+    ).toBeUndefined();
+    expect(
+      diskLimitError(0, requested, required - 1n, 3, budgets, "run"),
+    ).toBeUndefined();
+  });
 });
 
 it("accepts a full batch of 64 names in the request and MCP tool", async () => {
@@ -132,7 +153,11 @@ function fakeInstaller(budgets = packageBudgets({}), failAfterDpkg = false) {
     async (command, args, _deadline, _signal, onLine, trackDpkg) => {
       const name = /\?exact-name\(([^)]+)\)/.exec(args.at(-1) ?? "")?.[1];
       if (command === "apt-cache") {
-        if (name && name !== "missing") onLine?.(`Package: ${name}`);
+        if (name === "apt-start-error")
+          throw new Error("spawn apt-cache failed");
+        if (name === "missing")
+          return { ok: false, output: "E: No packages found" };
+        if (name) onLine?.(`Package: ${name}`);
         if (!name) {
           for (const line of [
             "Package: sized",
@@ -153,6 +178,13 @@ function fakeInstaller(budgets = packageBudgets({}), failAfterDpkg = false) {
       } else if (args.includes("install")) {
         if (name === "download-failed")
           return { ok: false, output: "Download failed" };
+        if (name === "startup-timeout")
+          return {
+            ok: false,
+            output: "Package installation timed out.",
+            skip: "startup",
+            interrupted: true,
+          };
         if (name === "interrupted")
           return {
             ok: false,
@@ -187,10 +219,14 @@ describe("Debian package presets", () => {
 
   it("reports each failure and continues with the remaining packages", async () => {
     const { install, recordInstalled } = fakeInstaller();
-    expect(
-      await install("preset", ["missing", "download-failed", "curl"], signal),
-    ).toMatchObject({
+    const result = await install(
+      "preset",
+      ["missing", "download-failed", "curl"],
+      signal,
+    );
+    expect(result).toMatchObject({
       ok: false,
+      incomplete: false,
       results: [
         {
           name: "missing",
@@ -201,6 +237,7 @@ describe("Debian package presets", () => {
         { name: "curl", ok: true },
       ],
     });
+    expect(result).not.toHaveProperty("results.0.skipped");
     expect(recordInstalled).not.toHaveBeenCalled();
     expect(await install("run", ["zip"], signal)).toMatchObject({ ok: true });
     expect(recordInstalled).toHaveBeenCalledWith([["zip"]]);
@@ -212,11 +249,13 @@ describe("Debian package presets", () => {
       await install("preset", ["dpkg-failed", "curl"], signal),
     ).toMatchObject({
       ok: false,
+      incomplete: true,
       results: [
         { name: "dpkg-failed", ok: false, output: "dpkg failed" },
         {
           name: "curl",
           ok: false,
+          skipped: true,
           output: expect.stringContaining("did not finish cleanly"),
         },
       ],
@@ -224,6 +263,50 @@ describe("Debian package presets", () => {
     const calls = apt.mock.calls.length;
     expect(await install("run", ["zip"], signal)).toMatchObject({ ok: false });
     expect(apt).toHaveBeenCalledTimes(calls);
+  });
+
+  it("shares the preset deadline across batches without limiting agent requests", async () => {
+    const { install, apt } = fakeInstaller();
+    const now = vi.spyOn(Date, "now").mockReturnValue(1000);
+    try {
+      expect(await install("preset", ["curl"], signal)).toMatchObject({
+        ok: true,
+      });
+      const calls = apt.mock.calls.length;
+      now.mockReturnValue(181_000);
+      expect(await install("preset", ["zip"], signal)).toMatchObject({
+        ok: false,
+        incomplete: true,
+        results: [{ name: "zip", ok: false, skipped: true }],
+      });
+      expect(apt).toHaveBeenCalledTimes(calls);
+      expect(await install("run", ["zip"], signal)).toMatchObject({ ok: true });
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  it("skips the package in progress when the startup deadline interrupts apt", async () => {
+    const { install, apt } = fakeInstaller();
+    const timeout = {
+      ok: false,
+      skipped: true,
+      output: "Package installation timed out.",
+    };
+    expect(
+      await install("preset", ["curl", "startup-timeout", "zip"], signal),
+    ).toMatchObject({
+      incomplete: true,
+      results: [
+        { name: "curl", ok: true },
+        { name: "startup-timeout", ...timeout },
+        { name: "zip", ...timeout },
+      ],
+    });
+    expect(
+      apt.mock.calls.some(([, args]) => args.join(" ").includes("zip")),
+    ).toBe(false);
+    expect(await install("run", ["zip"], signal)).toMatchObject({ ok: true });
   });
 
   it("keeps the broker usable after a preset interruption before dpkg", async () => {
@@ -235,7 +318,32 @@ describe("Debian package presets", () => {
     expect(await install("run", ["zip"], signal)).toMatchObject({ ok: true });
   });
 
-  it("charges preset installations against their own budget", async () => {
+  it("skips pending presets when the installer cannot start apt", async () => {
+    const { apt, install } = fakeInstaller();
+    const skipped = {
+      ok: false,
+      skipped: true,
+      output: "The package installer could not start Debian apt.",
+    };
+
+    expect(
+      await install("preset", ["curl", "apt-start-error", "zip"], signal),
+    ).toMatchObject({
+      incomplete: true,
+      output: skipped.output,
+      results: [
+        { name: "curl", ok: true },
+        { name: "apt-start-error", ...skipped },
+        { name: "zip", ...skipped },
+      ],
+    });
+    expect(
+      apt.mock.calls.some(([, args]) => args.at(-1)?.includes("zip")),
+    ).toBe(false);
+    expect(await install("run", ["zip"], signal)).toMatchObject({ ok: true });
+  });
+
+  it("skips over-budget packages and keeps processing the preset", async () => {
     const { install } = fakeInstaller({
       run: 20 * MiB,
       preset: packageIndexAllowance + 20 * MiB,
@@ -243,9 +351,21 @@ describe("Debian package presets", () => {
     expect(await install("preset", ["sized"], signal)).toMatchObject({
       ok: true,
     });
-    expect(await install("preset", ["sized"], signal)).toMatchObject({
+    expect(await install("preset", ["sized", "curl"], signal)).toMatchObject({
       ok: false,
-      results: [{ name: "sized", output: expect.stringContaining("preset") }],
+      incomplete: false,
+      results: [
+        {
+          name: "sized",
+          ok: false,
+          skipped: true,
+          output: expect.stringContaining("budget for this preset"),
+        },
+        { name: "curl", ok: true },
+      ],
+    });
+    expect(await install("preset", ["zip"], signal)).toMatchObject({
+      ok: true,
     });
     expect(await install("run", ["sized"], signal)).toMatchObject({ ok: true });
     expect(await install("run", ["sized"], signal)).toMatchObject({

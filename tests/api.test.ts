@@ -62,6 +62,11 @@ import { initializeWorkspace, projectToken } from "../src/server/git";
 import { hash, seal, unseal } from "../src/server/security";
 import { projectToolEnvironment } from "../src/project-tool-environment";
 import { measureProjectEnv } from "../src/server/project-env";
+import {
+  projectPackagePresets,
+  recordPackagePresetResults,
+  rememberProjectPackages,
+} from "../src/server/project-packages";
 const enabled = process.env.INTEGRATION_TESTS === "1";
 describe.skipIf(!enabled)("PostgreSQL API integration", () => {
   let app: Awaited<ReturnType<typeof createApp>>,
@@ -229,6 +234,514 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
         { name: "curl", source: "agent", source_chat_id: chat },
       ]);
     });
+
+    it("counts concurrent preset failures once each and ignores replaced entries", async () => {
+      expect((await add("hello")).statusCode).toBe(200);
+      expect((await add("sl")).statusCode).toBe(200);
+      const presets = await projectPackagePresets(project);
+      const fail = () =>
+        recordPackagePresetResults(project, presets, [
+          { name: "hello", ok: false },
+        ]);
+      await Promise.all([fail(), fail(), fail()]);
+      expect((await list()).packages).toContainEqual(
+        expect.objectContaining({ name: "hello", failures: 3, disabled: true }),
+      );
+      expect([...(await projectPackagePresets(project)).keys()]).toEqual([
+        "sl",
+      ]);
+
+      expect(
+        (await request({ method: "DELETE", url: url + "/sl", headers }))
+          .statusCode,
+      ).toBe(200);
+      expect((await add("sl")).statusCode).toBe(200);
+      await recordPackagePresetResults(project, presets, [
+        { name: "sl", ok: false },
+      ]);
+      expect((await list()).packages).toContainEqual(
+        expect.objectContaining({ name: "sl", failures: 0, disabled: false }),
+      );
+    });
+
+    it("returns startup notices beyond the recent history for the latest job", async () => {
+      await withRunningJob(async (emit, jobId) => {
+        const output = {
+          type: "log",
+          projectPackageStartup: true,
+          text: "Preset budget is zero.\nPackages: hello, sl",
+        };
+        const warning = {
+          type: "warning",
+          projectPackageStartup: true,
+          message: "Workspace skipped some saved Debian packages.",
+        };
+        const read = async () => {
+          const response = await request({
+            url: `/api/chats/${chat}`,
+            headers,
+          });
+          expect(response.statusCode).toBe(200);
+          return response.json();
+        };
+        await emit(output);
+        await emit(warning);
+        const ids = (await read()).events.map(
+          (entry: { id: string }) => entry.id,
+        );
+        expect(ids).toHaveLength(2);
+        await db.query(
+          `INSERT INTO events(chat_id,job_id,type,data)
+           SELECT $1,$2,'log',jsonb_build_object('text','Later output '||n)
+           FROM generate_series(1,165) n`,
+          [chat, jobId],
+        );
+        const { events } = await read();
+        expect(events).toHaveLength(102);
+        expect(events.slice(0, 2)).toMatchObject([
+          { id: ids[0], data: output },
+          { id: ids[1], data: warning },
+        ]);
+        await emit({ type: "completed" });
+        expect(
+          (
+            await request({
+              method: "POST",
+              url: `/api/chats/${chat}/messages`,
+              headers,
+              payload: { content: "Next task", client_id: randomUUID() },
+            })
+          ).statusCode,
+        ).toBe(200);
+        expect((await read()).events).toHaveLength(100);
+      });
+    });
+
+    it("keeps a full startup package list when the remaining output quota is small", async () => {
+      await withRunningJob(async (emit, jobId) => {
+        const packages = Array.from({ length: 256 }, (_, index) =>
+          `workspace-fixture-package-${index}`.padEnd(63, "x"),
+        );
+        const output = {
+          type: "log",
+          projectPackageStartup: true,
+          text: `Preset budget is zero.\nPackages: ${packages.join(", ")}`,
+        };
+        const warning = {
+          type: "warning",
+          projectPackageStartup: true,
+          message: "Workspace skipped some saved Debian packages.",
+        };
+        await db.query(
+          "UPDATE output_storage SET limit_bytes=used_bytes+5000 WHERE id=1",
+        );
+        const before = await outputStorage();
+        await emit(output);
+        await emit(warning);
+        expect(await outputStorage()).toEqual(before);
+
+        await emit({ type: "session", id: "fixture-session" });
+        const lateLog = { ...output, text: "Marked log after startup." };
+        const afterStartup = await outputStorage();
+        await emit(lateLog);
+        expect((await outputStorage()).usedBytes).toBeGreaterThan(
+          afterStartup.usedBytes,
+        );
+        await emit({ type: "completed", result: "Task completed." });
+        const response = await request({ url: `/api/chats/${chat}`, headers });
+        expect(response.statusCode).toBe(200);
+        const detail = response.json();
+        expect(detail.jobs[0]).toMatchObject({ id: jobId, state: "completed" });
+        expect(detail.messages.at(-1)).toMatchObject({
+          role: "assistant",
+          content: "Task completed.",
+        });
+        expect(detail.events).toMatchObject([
+          { data: output },
+          { data: warning },
+          { data: lateLog },
+        ]);
+      });
+    });
+
+    it("bounds the size and number of quota-exempt startup notices", async () => {
+      await withRunningJob(async (emit, jobId) => {
+        const startup = {
+          type: "log",
+          projectPackageStartup: true,
+          text: "Startup notice",
+        };
+        await emit({ ...startup, text: "x".repeat(33 * 1024) });
+        for (let i = 0; i < 5; i++) await emit(startup);
+        await emit({ type: "completed" });
+
+        const { rows } = await db.query(
+          "SELECT package_startup_notice FROM events WHERE job_id=$1 AND type='log' ORDER BY id",
+          [jobId],
+        );
+        expect(rows.map((row) => row.package_startup_notice)).toEqual([
+          false,
+          true,
+          true,
+          true,
+          true,
+          false,
+        ]);
+        const { usedBytes } = await outputStorage();
+        await db.query(
+          "DELETE FROM events WHERE job_id=$1 AND package_startup_notice",
+          [jobId],
+        );
+        expect((await outputStorage()).usedBytes).toBe(usedBytes);
+      });
+    });
+
+    it.skipIf(process.env.DOCKER_TESTS !== "1").each([
+      ["zero budget", "the preset budget is zero"],
+      ["full project storage", "no project tool storage was available"],
+    ])(
+      "logs the skipped package names for %s before starting the runner",
+      async (scenario, reason) => {
+        for (const name of ["hello", "sl"])
+          expect((await add(name)).statusCode).toBe(200);
+        await db.query(
+          "UPDATE project_packages SET failures=2 WHERE project_id=$1",
+          [project],
+        );
+        if (scenario === "zero budget") {
+          vi.stubEnv("WORKSPACE_PACKAGE_PRESET_BUDGET", "0");
+        } else {
+          config.projectEnvLimitGib = 1 / 1024 ** 3;
+          const dir = path.join(data, "project-env", project);
+          await mkdir(dir, { recursive: true });
+          await writeFile(path.join(dir, "fixture"), Buffer.alloc(4096, 1));
+        }
+        const events: import("../src/shared").AgentEvent[] = [];
+        let runner;
+        try {
+          runner = await launch(
+            chat,
+            account,
+            (e) => {
+              events.push(e);
+            },
+            {
+              installPackages: true,
+              projectEnv: "read-write",
+            },
+          );
+          expect(events).toContainEqual({
+            type: "log",
+            projectPackageStartup: true,
+            text: `Skipped project Debian packages because ${reason}.\nPackages: hello, sl`,
+          });
+          expect((await list()).packages).toMatchObject([
+            { name: "sl", failures: 2, disabled: false },
+            { name: "hello", failures: 2, disabled: false },
+          ]);
+        } finally {
+          vi.unstubAllEnvs();
+          await runner?.stop();
+        }
+      },
+      20_000,
+    );
+
+    it.skipIf(process.env.DOCKER_TESTS !== "1").each([
+      {
+        scenario: "the installer cannot start",
+        scripts: [
+          ["/usr/local/lib/workspace-install/sandbox", "#!/bin/sh\nexit 1\n"],
+        ],
+        reason: "The Debian package installer is unavailable in this runner.",
+      },
+      {
+        scenario: "the preset helper exits with an error",
+        scripts: [
+          [
+            "/app/dist/node/runner/package-presets.js",
+            "process.exitCode = 1;\n",
+          ],
+        ],
+        reason: "The package preset helper exited without a result.",
+      },
+      {
+        scenario: "the preset helper exits successfully without output",
+        scripts: [
+          [
+            "/app/dist/node/runner/package-presets.js",
+            "process.exitCode = 0;\n",
+          ],
+        ],
+        reason: "The package preset helper exited without a result.",
+      },
+      {
+        scenario: "apt-cache exits with code 127",
+        scripts: [
+          ["/usr/bin/apt-get", "#!/bin/sh\nexit 0\n"],
+          [
+            "/usr/bin/apt-cache",
+            "#!/bin/sh\necho 'apt-cache: error while loading shared libraries' >&2\nexit 127\n",
+          ],
+        ],
+        reason: "apt-cache: error while loading shared libraries",
+      },
+    ])(
+      "logs all skipped package names when $scenario",
+      async ({ scripts, reason }) => {
+        for (const name of ["hello", "sl"])
+          expect((await add(name)).statusCode).toBe(200);
+        await db.query(
+          "UPDATE project_packages SET failures=2 WHERE project_id=$1",
+          [project],
+        );
+        const mounts = await Promise.all(
+          scripts.map(async ([target, script], index) => {
+            const fixture = path.join(data, `package-startup-failure-${index}`);
+            await writeFile(fixture, script, { mode: 0o755 });
+            return {
+              Type: "bind",
+              Source: fixture,
+              Target: target,
+              ReadOnly: true,
+            } as const;
+          }),
+        );
+        const createContainer = docker.createContainer.bind(docker);
+        const containers = vi
+          .spyOn(docker, "createContainer")
+          .mockImplementation((options) => {
+            if (
+              options.Entrypoint?.[0] ===
+              "/usr/local/bin/workspace-package-runner"
+            )
+              options.HostConfig?.Mounts?.push(...mounts);
+            return createContainer(options);
+          });
+        let runner;
+        try {
+          let output = "";
+          const logs: string[] = [];
+          runner = await launch(
+            chat,
+            account,
+            (e) => {
+              if (e.type === "terminal") output += e.data;
+              if (e.type === "log" && e.projectPackageStartup)
+                logs.push(e.text);
+            },
+            { installPackages: true, projectEnv: "read-write" },
+          );
+          runner.send({
+            type: "terminal",
+            data: "printf '\\nRUNNER_''READY\\n'\r",
+          });
+          await vi.waitFor(() => expect(output).toMatch(/^RUNNER_READY\r?$/m), {
+            timeout: 15_000,
+          });
+          expect(logs).toEqual([
+            `Skipped project Debian packages. ${reason}\nPackages: hello, sl`,
+          ]);
+          expect((await list()).packages).toMatchObject([
+            { name: "sl", failures: 2, disabled: false },
+            { name: "hello", failures: 2, disabled: false },
+          ]);
+        } finally {
+          containers.mockRestore();
+          await runner?.stop();
+        }
+      },
+      25_000,
+    );
+
+    it.skipIf(process.env.DOCKER_TESTS !== "1")(
+      "logs the preset disk-budget skip and leaves the package enabled",
+      async () => {
+        expect((await add("hello")).statusCode).toBe(200);
+        const morePackages = Array.from(
+          { length: 64 },
+          (_, i) => `workspace-fixture-package-${String(i).padStart(2, "0")}`,
+        );
+        await db.query(
+          `INSERT INTO project_packages(project_id,name,source,request_id)
+           SELECT $1,name,'owner',$2 FROM unnest($3::text[]) AS packages(name)`,
+          [project, randomUUID(), morePackages],
+        );
+        await db.query(
+          "UPDATE project_packages SET failures=2 WHERE project_id=$1 AND name='hello'",
+          [project],
+        );
+        const budget = String(64 * 1024 ** 2);
+        vi.stubEnv("WORKSPACE_PACKAGE_PRESET_BUDGET", budget);
+        const events: import("../src/shared").AgentEvent[] = [];
+        let runner;
+        try {
+          let output = "";
+          runner = await launch(
+            chat,
+            account,
+            (e) => {
+              if (e.type === "terminal") output += e.data;
+              else events.push(e);
+            },
+            { installPackages: true, projectEnv: "read-write" },
+          );
+          runner.send({
+            type: "terminal",
+            data: "printf '\\nRUNNER_''READY\\n'\r",
+          });
+          await vi.waitFor(() => expect(output).toMatch(/^RUNNER_READY\r?$/m), {
+            timeout: 15_000,
+          });
+          expect(events).toContainEqual({
+            type: "log",
+            projectPackageStartup: true,
+            text: expect.stringContaining(
+              `exceed the ${budget} bytes system-package budget for this preset.\nPackages: ${["hello", ...morePackages].join(", ")}`,
+            ),
+          });
+          expect((await list()).packages).toContainEqual(
+            expect.objectContaining({
+              name: "hello",
+              failures: 2,
+              disabled: false,
+            }),
+          );
+        } finally {
+          vi.unstubAllEnvs();
+          await runner?.stop();
+        }
+      },
+      45_000,
+    );
+
+    it.skipIf(process.env.DOCKER_TESTS !== "1")(
+      "preinstalls remembered Debian packages before the first command in another chat",
+      async () => {
+        let output = "";
+        const first = await launch(
+          chat,
+          account,
+          async (e) => {
+            if (e.type === "terminal") output += e.data;
+            if (e.type === "packages_installed")
+              await rememberProjectPackages(
+                project,
+                chat,
+                randomUUID(),
+                e.packages,
+              );
+          },
+          { installPackages: true, projectEnv: "read-write" },
+        );
+        try {
+          first.send({
+            type: "terminal",
+            data: "if ! command -v hello && workspace-install hello; then printf '\\nHELLO_''INSTALLED\\n'; fi\r",
+          });
+          await vi.waitFor(
+            () => expect(output).toMatch(/^HELLO_INSTALLED\r?$/m),
+            { timeout: 90_000 },
+          );
+          await vi.waitFor(async () =>
+            expect((await projectPackagePresets(project)).has("hello")).toBe(
+              true,
+            ),
+          );
+        } finally {
+          await first.stop();
+        }
+
+        const missing = "workspace-nonexistent-fixture-name";
+        const disabled = "workspace-disabled-fixture-name";
+        expect((await add(missing)).statusCode).toBe(200);
+        expect((await add(disabled)).statusCode).toBe(200);
+        await db.query(
+          "UPDATE project_packages SET added_at=now()-interval '1 day',failures=2 WHERE project_id=$1 AND name=$2",
+          [project, missing],
+        );
+        await db.query(
+          "UPDATE project_packages SET failures=1 WHERE project_id=$1 AND name='hello'",
+          [project],
+        );
+        await db.query(
+          "UPDATE project_packages SET failures=3,disabled=true WHERE project_id=$1 AND name=$2",
+          [project, disabled],
+        );
+        await db.query("UPDATE projects SET auto_packages=false WHERE id=$1", [
+          project,
+        ]);
+        // Revalidate even rows that predate or bypass the current owner API.
+        await db.query(
+          "INSERT INTO project_packages(project_id,name,source,request_id) VALUES($1,'hello --bad','owner',$2)",
+          [project, randomUUID()],
+        );
+        const secondChat = randomUUID();
+        await db.query(
+          "INSERT INTO chats(id,project_id,workspace_id,title,provider,account_id,branch) VALUES($1,$2,$3,'Next chat','codex',$4,'workspace/test')",
+          [secondChat, project, chat, account],
+        );
+        output = "";
+        const events: import("../src/shared").AgentEvent[] = [];
+        const second = await launch(
+          secondChat,
+          account,
+          (e) => {
+            if (e.type === "terminal") output += e.data;
+            else events.push(e);
+          },
+          { installPackages: true, projectEnv: "read-write" },
+        );
+        try {
+          second.send({
+            type: "terminal",
+            data: "hello && test -z \"$WORKSPACE_PROJECT_PACKAGES$WORKSPACE_PROJECT_PACKAGE_RESULT\" && printf '\\nPRESET_''AVAILABLE\\n'\r",
+          });
+          const { Config } = await docker.getContainer(second.id).inspect();
+          expect(Config.Env).toContain(
+            `WORKSPACE_PROJECT_PACKAGES=${JSON.stringify([missing, "hello"])}`,
+          );
+          await vi.waitFor(
+            () => expect(output).toMatch(/^PRESET_AVAILABLE\r?$/m),
+            { timeout: 105_000 },
+          );
+          expect(
+            events.some(({ type }) => type === "project_packages_ready"),
+          ).toBe(false);
+          expect(events).toContainEqual({
+            type: "warning",
+            projectPackageStartup: true,
+            message: expect.stringContaining(missing),
+          });
+          expect(events.some(({ type }) => type === "packages_installed")).toBe(
+            false,
+          );
+          expect((await list()).packages).toEqual(
+            expect.arrayContaining([
+              expect.objectContaining({
+                name: "hello",
+                failures: 0,
+                disabled: false,
+                source_chat_id: chat,
+              }),
+              expect.objectContaining({
+                name: missing,
+                failures: 3,
+                disabled: true,
+              }),
+              expect.objectContaining({
+                name: disabled,
+                failures: 3,
+                disabled: true,
+              }),
+            ]),
+          );
+        } finally {
+          await second.stop();
+        }
+      },
+      210_000,
+    );
 
     it("groups requests, upserts successes, and keeps packages when the source chat is deleted", async () => {
       expect(await list()).toEqual({ auto_packages: true, packages: [] });
@@ -4689,6 +5202,12 @@ esac
       }),
     ).toMatchObject({ statusCode: 401 });
   });
+  // These scenarios make several requests after the shared test client has
+  // exercised most of the API. Give them a separate rate-limit bucket.
+  function projectEnvironmentRequest(options: InjectOptions) {
+    return app.inject({ ...options, remoteAddress: "192.0.2.41" });
+  }
+
   it("reports project tool usage and clears only an idle project's tool directory", async () => {
     const project = (await chatWorkspace(chat)).project_id!;
     const otherProject = randomUUID();
@@ -4709,9 +5228,14 @@ esac
     );
 
     const url = "/api/projects/" + project.toUpperCase() + "/environment";
-    const read = async () => (await app.inject({ url, headers })).json();
+    const read = async () =>
+      (await projectEnvironmentRequest({ url, headers })).json();
     const clear = () =>
-      app.inject({ method: "POST", url: url + "/clear", headers });
+      projectEnvironmentRequest({
+        method: "POST",
+        url: url + "/clear",
+        headers,
+      });
     expect(await read()).toEqual({
       usedBytes: 9 * 1024 ** 3,
       limitBytes: 8 * 1024 ** 3,
@@ -4721,7 +5245,7 @@ esac
     });
     expect(
       (
-        await app.inject({
+        await projectEnvironmentRequest({
           url: "/api/projects/" + randomUUID() + "/environment",
           headers,
         })
@@ -4729,7 +5253,7 @@ esac
     ).toBe(404);
     expect(
       (
-        await app.inject({
+        await projectEnvironmentRequest({
           method: "POST",
           url: url + "/clear",
           headers: { origin },
@@ -4832,7 +5356,7 @@ esac
       const limit = 0.0001;
       expect(
         (
-          await app.inject({
+          await projectEnvironmentRequest({
             method: "POST",
             url: "/api/settings/environment",
             headers,
@@ -4880,7 +5404,7 @@ esac
         await vi.waitFor(() => expect(output).toMatch(/\$ /), {
           timeout: 15000,
         });
-        const blocked = await app.inject({
+        const blocked = await projectEnvironmentRequest({
           method: "POST",
           url: url + "/clear",
           headers,
@@ -4929,11 +5453,16 @@ esac
         await after.stop();
       }
       await writeFile(payload, randomBytes(512 * 1024));
-      expect((await app.inject({ url, headers })).json().state).toBe("ready");
-      const refreshed = await app.inject({ url: url + "?refresh=1", headers });
+      expect(
+        (await projectEnvironmentRequest({ url, headers })).json().state,
+      ).toBe("ready");
+      const refreshed = await projectEnvironmentRequest({
+        url: url + "?refresh=1",
+        headers,
+      });
       expect(refreshed.json()).toMatchObject({ state: "over-budget" });
       expect(refreshed.json().usedBytes).toBeGreaterThanOrEqual(512 * 1024);
-      const cleared = await app.inject({
+      const cleared = await projectEnvironmentRequest({
         method: "POST",
         url: url + "/clear",
         headers,
