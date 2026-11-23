@@ -5673,14 +5673,24 @@ esac
           "workspace-install ffmpeg",
           "ffmpeg -version | head -n 1",
           `node -e '${mcpClient}' '${mcpInstall}' | tee /dev/stderr | grep -Fq '"isError":false'`,
+          'test "$(command -v sudo)" = /usr/local/bin/sudo',
+          "if sudo id; then exit 1; fi",
+          "sudo -n apt update",
+          "sudo apt-get install -y jq",
+          "! command -v hello",
+          "sudo -- sh -c 'apt-get update&& apt-get install -y --no-install-recommends hello'",
+          "hello",
+          'test "$(id -u):$(id -g)" = 1000:1000',
           'touch /workspace/package-test && test "$(stat -c %u /workspace/package-test)" = 1000',
           "echo PACKAGE_CHECKS_PASSED",
         ].join(" && "),
-        "g++",
+        "hello",
       );
       expect(first.output).toMatch(/^ffmpeg version /m);
+      expect(first.output).toMatch(/^Workspace sudo supports only /m);
+      expect(first.output).toMatch(/^Hello, world!\r?$/m);
       expect(first.output).toMatch(/^PACKAGE_CHECKS_PASSED\r?$/m);
-      expect(first.packages).toEqual(["ffmpeg", "g++"]);
+      expect(first.packages).toEqual(["ffmpeg", "g++", "jq", "hello"]);
 
       const next = await execute(
         "test -f /workspace/package-test && ! command -v ffmpeg && echo CLEAN_NEXT_RUN",

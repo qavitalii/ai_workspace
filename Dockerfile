@@ -47,6 +47,7 @@ RUN ln -s /usr/local/aws-cli/v2/current/bin/aws /usr/local/bin/aws
 COPY --chmod=755 ops/git-askpass.sh /usr/local/bin/workspace-git-askpass
 COPY --chmod=755 ops/workspace-package-runner.sh /usr/local/bin/workspace-package-runner
 COPY --chmod=755 ops/workspace-install.sh /usr/local/bin/workspace-install
+COPY --chmod=755 ops/workspace-sudo.sh /usr/local/bin/sudo
 COPY --chmod=644 ops/workspace-project-path.sh /etc/profile.d/workspace-project-path.sh
 COPY ops/workspace-apt.conf /etc/workspace-install/apt.conf
 COPY ops/workspace-install-sandbox.c /tmp/workspace-install-sandbox.c
