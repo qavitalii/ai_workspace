@@ -62,6 +62,9 @@ CREATE TABLE IF NOT EXISTS project_packages(
   PRIMARY KEY(project_id,name)
 );
 CREATE INDEX IF NOT EXISTS project_packages_source_chat ON project_packages(source_chat_id) WHERE source_chat_id IS NOT NULL;
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS package_image_requested_at timestamptz;
+CREATE INDEX IF NOT EXISTS projects_pending_images ON projects(package_image_requested_at,id)
+  WHERE package_image_requested_at IS NOT NULL;
 CREATE TABLE IF NOT EXISTS project_images(
   project_id uuid PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
   hash text NOT NULL,

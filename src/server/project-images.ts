@@ -3,20 +3,27 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import Docker from "dockerode";
-import {
-  exactPackagePattern,
-  projectPackageNames,
-} from "../runner/package-request.js";
+import { packageBudgets } from "../runner/package-disk.js";
+import { projectPackageNames } from "../runner/package-request.js";
 import { config } from "./config.js";
 import { db, transaction } from "./db.js";
 import { docker } from "./docker.js";
 import { projectPackagePresets } from "./project-packages.js";
 import { redact } from "./security.js";
+import { concurrentTasks } from "./settings.js";
 
 const installerLabel = "ai.workspace.runner.package-installer";
+const builderLabel = "ai.workspace.runner.project-image-builder";
+const instanceLabel = "ai.workspace.instance";
+const ownerLabel = "ai.workspace.env-owner";
+const hashLabel = "ai.workspace.env-hash";
+const baseLabel = "ai.workspace.base-image";
+const imageIdPattern = /^sha256:[a-f0-9]{64}$/;
 const maxLogLength = 32 * 1024;
 const maxBuildEventLength = 1024 * 1024;
 const buildTimeout = 5 * 60_000;
+const retryDelay = 5_000;
+const pruneInterval = 60_000;
 const inspectOptions = { connectionTimeout: 10_000, timeout: 10_000 };
 const imageDocker = new Docker(inspectOptions);
 
@@ -26,6 +33,10 @@ function sha256(value: string) {
 
 function imageHash(base: string, packages: Iterable<string>) {
   return sha256(JSON.stringify([base, [...packages].sort()]));
+}
+
+function imageTag(hash: string, instance: string) {
+  return `ai-workspace-env:${hash.slice(0, 12)}-${sha256(instance).slice(0, 12)}`;
 }
 
 async function inspectImage(tag: string) {
@@ -41,32 +52,25 @@ async function buildImage(
   tag: string,
   base: string,
   packages: string[],
+  concurrency: number,
   labels: Record<string, string>,
   signal: AbortSignal,
   appendLog: (text: string) => void,
 ) {
-  if (!/^sha256:[a-f0-9]{64}$/.test(base))
+  if (!imageIdPattern.test(base))
     throw new Error("Invalid Workspace runner image ID.");
   if (!projectPackageNames(packages))
     throw new Error("Invalid project Debian package list.");
 
-  const sources =
-    "-o Dir::Etc::sourcelist=/etc/workspace-install/debian.sources -o Dir::Etc::sourceparts=-";
   const names = packages.map((name) => `'${name}'`).join(" ");
-  const patterns = packages
-    .map((name) => `'${exactPackagePattern(name)}'`)
-    .join(" ");
-  const status = "${db:Status-Status}";
-  const commands = [
-    `apt-get ${sources} -o APT::Update::Error-Mode=any update`,
-    `DEBIAN_FRONTEND=noninteractive apt-get ${sources} install -y --no-install-recommends --no-remove -- ${patterns}`,
-    `for name in ${names}; do test "$(dpkg-query -W -f '${status}' -- "$name")" = installed || { echo "Package was not installed: $name" >&2; exit 1; }; done`,
-    "rm -rf /var/lib/apt/lists/*",
-  ];
+  const { run: budget } = packageBudgets(process.env);
+  signal.throwIfAborted();
   const dockerfile = [
     `FROM ${base}`,
+    // The classic builder can keep untagged layers from a completed RUN.
+    `LABEL ${ownerLabel}=${labels[ownerLabel]} ${hashLabel}=${labels[hashLabel]} ${baseLabel}=${base}`,
     "USER root",
-    `RUN ${commands.join(" && " + "\\" + "\n    ")}`,
+    `RUN WORKSPACE_PACKAGE_RUN_BUDGET=${budget} node /app/dist/node/runner/project-image-install.js ${concurrency} ${names} && rm -rf /var/lib/apt/lists/*`,
     "USER node",
     "",
   ].join("\n");
@@ -121,6 +125,80 @@ type Build = {
   done: Promise<void>;
 };
 
+type ImageRequest = { projectId: string; requestedAt: string };
+
+async function clearRequest(
+  c: Pick<typeof db, "query">,
+  request: ImageRequest,
+) {
+  const { rowCount } = await c.query(
+    `UPDATE projects SET package_image_requested_at=NULL
+     WHERE id=$1 AND package_image_requested_at=$2::timestamptz`,
+    [request.projectId, request.requestedAt],
+  );
+  return !!rowCount;
+}
+
+async function pruneProjectImages(signal: AbortSignal) {
+  const instance = config.data;
+  const owner = sha256(instance);
+  const images = await imageDocker.listImages({
+    all: true,
+    filters: { label: [`${ownerLabel}=${owner}`] },
+    abortSignal: signal,
+  });
+  if (!images.length) return;
+  const { rows } = await db.query<{ hash: string }>(
+    "SELECT hash FROM project_images WHERE state IN ('building','ready')",
+  );
+  const retained = new Set(rows.map(({ hash }) => hash));
+  const candidates = new Map(
+    images
+      .filter(({ Labels }) => {
+        const hash = Labels?.[hashLabel];
+        return (
+          Labels?.[ownerLabel] === owner &&
+          /^[a-f0-9]{64}$/.test(hash) &&
+          imageIdPattern.test(Labels[baseLabel]) &&
+          !retained.has(hash)
+        );
+      })
+      .map((image) => [image.Id, image]),
+  );
+  if (!candidates.size) return;
+  signal.throwIfAborted();
+  const base = await inspectImage(config.image);
+  function depth(image: Docker.ImageInfo) {
+    let depth = 0;
+    let parent = candidates.get(image.ParentId);
+    while (parent) {
+      depth++;
+      parent = candidates.get(parent.ParentId);
+    }
+    return depth;
+  }
+  // Remove children first. Use only the managed tag on tagged images, and
+  // remove untagged build layers individually without pruning their parents.
+  const ordered = [...candidates.values()].sort((a, b) => depth(b) - depth(a));
+  for (const { Id, Labels, RepoTags, RepoDigests } of ordered) {
+    signal.throwIfAborted();
+    if (Id === base?.Id || Id === Labels[baseLabel]) continue;
+    const tag = imageTag(Labels[hashLabel], instance);
+    const managedTag = RepoTags?.includes(tag);
+    const untagged =
+      !RepoTags?.some((name) => name !== "<none>:<none>") &&
+      !RepoDigests?.some((name) => name !== "<none>@<none>");
+    if (!managedTag && !untagged) continue;
+    try {
+      await imageDocker
+        .getImage(managedTag ? tag : Id)
+        .remove({ force: false, noprune: true, abortSignal: signal });
+    } catch (error: any) {
+      if (error.statusCode !== 404 && error.statusCode !== 409) throw error;
+    }
+  }
+}
+
 async function foregroundBusy() {
   const { rows } = await db.query<{ busy: boolean }>(
     `SELECT EXISTS(SELECT 1 FROM jobs WHERE state IN ('queued','running','waiting_approval'))
@@ -130,30 +208,47 @@ async function foregroundBusy() {
 }
 
 export class ProjectImageBuilds {
-  private readonly pending = new Set<string>();
   private active?: Build;
+  private cleaning?: AbortController;
   private polling?: Promise<void>;
   private allowBuild = true;
   private stopped = false;
+  private retryAt = 0;
+  private pruneAt = 0;
 
-  request(projectId: string) {
-    if (!this.stopped && this.active?.projectId !== projectId)
-      this.pending.add(projectId);
+  async recover() {
+    // Reconcile existing projects and interrupted builds against the current
+    // runner at startup. Leave any queued requests in their original order.
+    await db.query(
+      `UPDATE projects p SET package_image_requested_at=clock_timestamp()
+       WHERE package_image_requested_at IS NULL AND (
+         EXISTS(SELECT 1 FROM project_packages pp WHERE pp.project_id=p.id AND NOT pp.disabled)
+         OR EXISTS(SELECT 1 FROM project_images i WHERE i.project_id=p.id)
+       )`,
+    );
   }
 
   async tick(allowBuild = true) {
     this.allowBuild = allowBuild;
-    if (!allowBuild) this.active?.abort.abort();
+    if (!allowBuild) {
+      this.active?.abort.abort();
+      this.cleaning?.abort();
+    }
     if (
       this.stopped ||
       !allowBuild ||
       this.polling ||
-      (!this.active && !this.pending.size)
+      (!this.active && Date.now() < this.retryAt)
     )
       return;
-    this.polling = this.poll().finally(() => {
-      this.polling = undefined;
-    });
+    this.polling = this.poll()
+      .catch((error) => {
+        this.retryAt = Date.now() + retryDelay;
+        throw error;
+      })
+      .finally(() => {
+        this.polling = undefined;
+      });
     await this.polling;
   }
 
@@ -170,37 +265,60 @@ export class ProjectImageBuilds {
       return;
     }
     if (busy || !this.allowBuild || this.stopped) return;
-    const projectId = this.pending.values().next().value;
-    if (projectId === undefined) return;
+    if (Date.now() >= this.pruneAt) {
+      this.pruneAt = Date.now() + pruneInterval;
+      const cleanup = new AbortController();
+      this.cleaning = cleanup;
+      try {
+        await pruneProjectImages(cleanup.signal);
+      } catch (error) {
+        if (!cleanup.signal.aborted)
+          console.error("Project image cleanup failed:", redact(String(error)));
+      } finally {
+        this.cleaning = undefined;
+      }
+    }
+    if (!this.allowBuild || this.stopped) return;
+    const { rows } = await db.query<ImageRequest>(
+      `SELECT id AS "projectId",package_image_requested_at::text AS "requestedAt"
+       FROM projects WHERE package_image_requested_at IS NOT NULL
+       ORDER BY package_image_requested_at,id LIMIT 1`,
+    );
+    const request = rows[0];
+    if (!request || !this.allowBuild || this.stopped) return;
+    const { projectId } = request;
     const packages = [
       ...(await projectPackagePresets(projectId)).keys(),
     ].sort();
     if (!packages.length) {
-      this.pending.delete(projectId);
-      await db.query("DELETE FROM project_images WHERE project_id=$1", [
-        projectId,
-      ]);
+      await transaction(async (c) => {
+        if (await clearRequest(c, request))
+          await c.query("DELETE FROM project_images WHERE project_id=$1", [
+            projectId,
+          ]);
+      });
+      this.pruneAt = 0;
       return;
     }
     const base = await imageDocker.getImage(config.image).inspect();
     if ((await foregroundBusy()) || this.stopped || !this.allowBuild) return;
     const hash = imageHash(base.Id, packages);
-    this.pending.delete(projectId);
     const abort = new AbortController();
     const done = this.build(
-      projectId,
+      request,
       base.Id,
       base.Config?.Labels,
       packages,
       hash,
       abort.signal,
     )
-      .then((retry) => {
-        if (retry && !this.stopped) this.pending.add(projectId);
+      .then(() => {
+        this.pruneAt = 0;
       })
-      .catch((error) =>
-        console.error("Project image build failed:", redact(String(error))),
-      )
+      .catch((error) => {
+        this.retryAt = Date.now() + retryDelay;
+        console.error("Project image build failed:", redact(String(error)));
+      })
       .finally(() => {
         this.active = undefined;
       });
@@ -209,26 +327,28 @@ export class ProjectImageBuilds {
 
   async stop() {
     this.stopped = true;
-    this.pending.clear();
     this.active?.abort.abort();
+    this.cleaning?.abort();
     await Promise.allSettled([this.polling, this.active?.done]);
   }
 
   private async build(
-    projectId: string,
+    request: ImageRequest,
     base: string,
     baseLabels: Record<string, string> | undefined,
     packages: string[],
     hash: string,
     signal: AbortSignal,
   ) {
+    const { projectId } = request;
     const instance = config.data;
     // Separate installations may share a Docker daemon and runner base.
-    const tag = `ai-workspace-env:${hash.slice(0, 12)}-${sha256(instance).slice(0, 12)}`;
+    const tag = imageTag(hash, instance);
     const labels = {
-      "ai.workspace.instance": instance,
-      "ai.workspace.env-hash": hash,
-      "ai.workspace.base-image": base,
+      [instanceLabel]: instance,
+      [ownerLabel]: sha256(instance),
+      [hashLabel]: hash,
+      [baseLabel]: base,
       [installerLabel]: "1",
     };
     let imageId: string | null = null;
@@ -238,29 +358,36 @@ export class ProjectImageBuilds {
     const appendLog = (text: string) => {
       log = (log + redact(text.replaceAll("\0", ""))).slice(-maxLogLength);
     };
+    if (signal.aborted) return;
+    const supported = baseLabels?.[builderLabel] === "1";
+    let image = supported ? await inspectImage(tag) : null;
+    let concurrency = 0;
+    if (supported && !image && !signal.aborted) {
+      concurrency = await concurrentTasks();
+      const { rowCount } = await db.query(
+        `INSERT INTO project_images(project_id,hash,state)
+         SELECT id,$3,'building' FROM projects
+         WHERE id=$1 AND package_image_requested_at=$2::timestamptz
+         FOR NO KEY UPDATE
+         ON CONFLICT(project_id) DO UPDATE SET hash=$3,state='building',image_id=NULL,error=NULL,log='',built_at=NULL`,
+        [projectId, request.requestedAt, hash],
+      );
+      if (!rowCount) return;
+    }
     try {
       signal.throwIfAborted();
-      if (baseLabels?.[installerLabel] !== "1")
+      if (!supported)
         throw new Error(
-          "The runner image does not support Debian package installation.",
+          "The runner image does not support building project images.",
         );
-      let image = await inspectImage(tag);
       if (!image) {
-        signal.throwIfAborted();
-        const requested = await db.query(
-          `INSERT INTO project_images(project_id,hash,state)
-           SELECT id,$2,'building' FROM projects WHERE id=$1
-           ON CONFLICT(project_id) DO UPDATE SET hash=$2,state='building',image_id=NULL,error=NULL,log='',built_at=NULL
-           RETURNING project_id`,
-          [projectId, hash],
-        );
-        if (!requested.rowCount) return false;
         const timeout = AbortSignal.timeout(buildTimeout);
         try {
           await buildImage(
             tag,
             base,
             packages,
+            concurrency,
             labels,
             AbortSignal.any([signal, timeout]),
             appendLog,
@@ -274,11 +401,12 @@ export class ProjectImageBuilds {
       } else {
         appendLog("Reused an existing project image.\n");
       }
+      const imageLabels = image?.Config.Labels;
       if (
         !image ||
         image.Config.User !== "node" ||
         Object.entries(labels).some(
-          ([name, value]) => image.Config.Labels?.[name] !== value,
+          ([name, value]) => imageLabels?.[name] !== value,
         )
       )
         throw new Error("Docker did not return the expected project image.");
@@ -294,22 +422,11 @@ export class ProjectImageBuilds {
       appendLog("\n" + failure);
     }
 
-    return transaction(async (c) => {
-      // Package edits lock the same project row. An obsolete result must never
-      // be published after the new list commits.
-      const project = await c.query(
-        "SELECT id FROM projects WHERE id=$1 FOR NO KEY UPDATE",
-        [projectId],
-      );
-      if (!project.rowCount) return false;
-      const current = await projectPackagePresets(projectId, c);
-      if (signal.aborted || imageHash(base, current.keys()) !== hash) {
-        await c.query(
-          "DELETE FROM project_images WHERE project_id=$1 AND hash=$2 AND state='building'",
-          [projectId, hash],
-        );
-        return current.size > 0;
-      }
+    if (signal.aborted) return;
+    await transaction(async (c) => {
+      // Clearing the exact request and publishing its result commit together.
+      // A package edit locks the same project and supersedes the old request.
+      if (!(await clearRequest(c, request))) return;
       await c.query(
         `INSERT INTO project_images(project_id,hash,image_id,state,error,log,built_at)
          VALUES($1,$2,$3,$4,$5,$6,$7)
@@ -325,7 +442,6 @@ export class ProjectImageBuilds {
           created,
         ],
       );
-      return false;
     });
   }
 }

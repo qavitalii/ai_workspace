@@ -799,7 +799,7 @@ export async function switchAccount(
 }
 export async function startWorker() {
   await recover();
-  await db.query("DELETE FROM project_images WHERE state='building'");
+  await projectImageBuilds.recover();
   function pollProjectImages(allowBuild: boolean) {
     void projectImageBuilds.tick(allowBuild).catch((error) => {
       console.error("Project image worker failed:", redact(String(error)));

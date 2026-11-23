@@ -22,7 +22,7 @@ import {
   expect,
   vi,
 } from "vitest";
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { once } from "node:events";
 import { PassThrough } from "node:stream";
 import Docker from "dockerode";
@@ -157,8 +157,52 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
       ).rows[0];
     }
 
+    function mockImageDaemon() {
+      let built: Partial<Docker.ImageInspectInfo> | undefined;
+      const realGetImage = Docker.prototype.getImage;
+      const list = vi
+        .spyOn(Docker.prototype, "listImages")
+        .mockResolvedValue([]);
+      const get = vi
+        .spyOn(Docker.prototype, "getImage")
+        .mockImplementation(function (this: Docker, name) {
+          const image = realGetImage.call(this, name);
+          const inspect = vi.spyOn(image, "inspect");
+          if (name === config.image)
+            inspect.mockResolvedValue({
+              Id: "sha256:" + "a".repeat(64),
+              Config: {
+                Labels: { "ai.workspace.runner.project-image-builder": "1" },
+              },
+            } as unknown as Docker.ImageInspectInfo);
+          else if (built)
+            inspect.mockResolvedValue(built as Docker.ImageInspectInfo);
+          else
+            inspect.mockRejectedValue(
+              Object.assign(new Error("Image not found"), { statusCode: 404 }),
+            );
+          return image;
+        });
+      return {
+        complete(labels: Record<string, string>) {
+          built = {
+            Id: "sha256:" + "b".repeat(64),
+            Created: new Date().toISOString(),
+            Config: {
+              User: "node",
+              Labels: labels,
+            } as Docker.ImageInspectInfo["Config"],
+          };
+        },
+        restore() {
+          list.mockRestore();
+          get.mockRestore();
+        },
+      };
+    }
+
     it.skipIf(process.env.DOCKER_TESTS !== "1")(
-      "builds and shares a project image, preserving the runner configuration and recording APT failures",
+      "builds, shares and cleans up project images, preserving runner configuration and recording failures",
       async () => {
         const builder = new ProjectImageBuilds();
         const buildImage = vi.spyOn(docker, "buildImage");
@@ -169,15 +213,21 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
           const first = await newProject();
           const second = await newProject();
           const failing = await newProject();
-          await addProjectPackage(first, "hello");
+          expect(
+            (
+              await app.inject({
+                method: "POST",
+                url: `/api/projects/${first}/packages`,
+                headers,
+                payload: { name: "hello" },
+              })
+            ).statusCode,
+          ).toBe(200);
           await addProjectPackage(first, "jq");
           await addProjectPackage(second, "jq");
           await addProjectPackage(second, "hello");
           const missing = "workspace-missing-" + randomUUID();
           await addProjectPackage(failing, missing);
-          builder.request(first);
-          builder.request(second);
-          builder.request(failing);
 
           const base = await docker.getImage(config.image).inspect();
           await builder.tick();
@@ -244,14 +294,79 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
           await builder.stop();
           const retry = new ProjectImageBuilds();
           try {
-            retry.request(first);
-            retry.request(failing);
+            await retry.recover();
             await vi.waitFor(async () => {
               await retry.tick();
               expect(buildImage).toHaveBeenCalledTimes(3);
             });
             expect(await imageState(first)).toEqual(built);
             await vi.waitFor(expectFailure, { timeout: 120_000 });
+
+            const limit = await newProject();
+            await addProjectPackage(limit, "hello");
+            vi.stubEnv(
+              "WORKSPACE_PACKAGE_RUN_BUDGET",
+              String(128 * 1024 * 1024),
+            );
+            try {
+              await vi.waitFor(
+                async () => {
+                  await retry.tick();
+                  expect(await imageState(limit)).toMatchObject({
+                    state: "failed",
+                    log: expect.stringContaining("system-package budget"),
+                  });
+                },
+                { timeout: 120_000 },
+              );
+            } finally {
+              vi.unstubAllEnvs();
+            }
+
+            await container.remove();
+            container = undefined;
+            for (const project of [first, second]) {
+              for (const name of ["hello", "jq"]) {
+                expect(
+                  (
+                    await app.inject({
+                      method: "DELETE",
+                      url: `/api/projects/${project}/packages/${name}`,
+                      headers,
+                    })
+                  ).statusCode,
+                ).toBe(200);
+              }
+              await vi.waitFor(async () => {
+                await retry.tick();
+                expect(await imageState(project)).toBeUndefined();
+              });
+              if (project === first)
+                expect((await docker.getImage(imageTag).inspect()).Id).toBe(
+                  built.image_id,
+                );
+            }
+            await vi.waitFor(async () => {
+              await retry.tick();
+              await expect(
+                docker.getImage(imageTag!).inspect(),
+              ).rejects.toMatchObject({ statusCode: 404 });
+              expect(
+                await docker.listImages({
+                  all: true,
+                  filters: {
+                    label: [
+                      `ai.workspace.env-hash=${built.hash}`,
+                      `ai.workspace.env-owner=${image.Config.Labels["ai.workspace.env-owner"]}`,
+                    ],
+                  },
+                }),
+              ).toEqual([]);
+            });
+            expect((await docker.getImage(config.image).inspect()).Id).toBe(
+              base.Id,
+            );
+            imageTag = undefined;
           } finally {
             await retry.stop();
           }
@@ -259,35 +374,22 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
           await builder.stop();
           buildImage.mockRestore();
           await container?.remove({ force: true });
-          if (imageTag) await docker.getImage(imageTag).remove();
+          if (imageTag)
+            await docker
+              .getImage(imageTag)
+              .remove()
+              .catch((error) => {
+                if (error.statusCode !== 404) throw error;
+              });
         }
       },
-      370_000,
+      500_000,
     );
 
     it("yields to a terminal and cancels a build when its package list changes", async () => {
       const builder = new ProjectImageBuilds();
       const signals: AbortSignal[] = [];
-      const realGetImage = Docker.prototype.getImage;
-      const getImage = vi
-        .spyOn(Docker.prototype, "getImage")
-        .mockImplementation(function (this: Docker, name) {
-          const image = realGetImage.call(this, name);
-          const inspect = vi.spyOn(image, "inspect");
-          if (name === config.image) {
-            inspect.mockResolvedValue({
-              Id: "sha256:" + "a".repeat(64),
-              Config: {
-                Labels: { "ai.workspace.runner.package-installer": "1" },
-              },
-            } as unknown as Docker.ImageInspectInfo);
-          } else {
-            inspect.mockRejectedValue(
-              Object.assign(new Error("Image not found"), { statusCode: 404 }),
-            );
-          }
-          return image;
-        });
+      const daemon = mockImageDaemon();
       const buildImage = vi
         .spyOn(docker, "buildImage")
         .mockImplementation(async (_file, options) => {
@@ -302,9 +404,10 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
           return stream;
         });
       try {
-        const project = await newProject();
-        await addProjectPackage(project, "hello");
-        builder.request(project);
+        const {
+          rows: [{ project_id: project }],
+        } = await db.query("SELECT project_id FROM chats WHERE id=$1", [chat]);
+        await rememberProjectPackages(project, chat, randomUUID(), ["hello"]);
         await db.query(
           "INSERT INTO workspace_leases(workspace_id,chat_id,kind) VALUES($1,$1,'terminal')",
           [chat],
@@ -337,7 +440,147 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
       } finally {
         await builder.stop();
         buildImage.mockRestore();
-        getImage.mockRestore();
+        daemon.restore();
+      }
+    });
+
+    it("retries database faults before and after a build without rebuilding the image", async () => {
+      const project = await newProject();
+      await addProjectPackage(project, "hello");
+      const builder = new ProjectImageBuilds();
+      const daemon = mockImageDaemon();
+      const log = vi.spyOn(console, "error").mockImplementation(() => {});
+      const now = Date.now.bind(Date);
+      const clock = vi.spyOn(Date, "now");
+      const build = vi
+        .spyOn(docker, "buildImage")
+        .mockImplementation(async (_context, options) => {
+          daemon.complete(options!.labels!);
+          const stream = new PassThrough();
+          stream.end('{"stream":"Built image."}\n');
+          return stream;
+        });
+      const realConnect = db.connect.bind(db);
+      const realQuery = db.query.bind(db);
+      let starts = 0;
+      let finalizations = 0;
+      const query = vi.spyOn(db, "query").mockImplementation((...args) => {
+        const [sql] = args;
+        if (
+          typeof sql === "string" &&
+          sql.includes("SELECT id,$3,'building'") &&
+          ++starts === 1
+        )
+          return Promise.reject(new Error("Could not mark image building"));
+        return Reflect.apply(realQuery, db, args);
+      });
+      const connect = vi.spyOn(db, "connect").mockImplementation((callback) => {
+        if (callback) return realConnect(callback);
+        if (++finalizations === 1)
+          return Promise.reject(new Error("Database temporarily unavailable"));
+        return realConnect();
+      });
+      try {
+        await builder.tick();
+        await vi.waitFor(() =>
+          expect(log).toHaveBeenCalledWith(
+            "Project image build failed:",
+            expect.stringContaining("Could not mark image building"),
+          ),
+        );
+        expect(await imageState(project)).toBeUndefined();
+        expect(build).not.toHaveBeenCalled();
+        clock.mockImplementation(() => now() + 10_000);
+        await builder.tick();
+        await vi.waitFor(() =>
+          expect(log).toHaveBeenCalledWith(
+            "Project image build failed:",
+            expect.stringContaining("Database temporarily unavailable"),
+          ),
+        );
+        expect((await imageState(project)).state).toBe("building");
+        await builder.tick();
+        expect(finalizations).toBe(1);
+        clock.mockImplementation(() => now() + 20_000);
+        await vi.waitFor(async () => {
+          await builder.tick();
+          expect(await imageState(project)).toMatchObject({
+            state: "ready",
+            image_id: "sha256:" + "b".repeat(64),
+          });
+        });
+        expect(build).toHaveBeenCalledTimes(1);
+      } finally {
+        await builder.stop();
+        connect.mockRestore();
+        query.mockRestore();
+        build.mockRestore();
+        clock.mockRestore();
+        log.mockRestore();
+        daemon.restore();
+      }
+    });
+
+    it("removes unreferenced classic build layers in order and preserves the base, shared images and foreign tags", async () => {
+      const builder = new ProjectImageBuilds();
+      const baseId = "sha256:" + "a".repeat(64);
+      const layerId = "sha256:" + "b".repeat(64);
+      const taggedId = "sha256:" + "c".repeat(64);
+      const referencedHash = "d".repeat(64);
+      const orphanHash = "e".repeat(64);
+      const owner = createHash("sha256").update(config.data).digest("hex");
+      const tag = `ai-workspace-env:${orphanHash.slice(0, 12)}-${owner.slice(0, 12)}`;
+      const project = await newProject();
+      await db.query(
+        "INSERT INTO project_images(project_id,hash,state) VALUES($1,$2,'ready')",
+        [project, referencedHash],
+      );
+      function image(
+        Id: string,
+        ParentId: string,
+        hash: string,
+        RepoTags?: string[],
+      ): Docker.ImageInfo {
+        return {
+          Id,
+          ParentId,
+          RepoTags,
+          Created: 0,
+          Size: 0,
+          VirtualSize: 0,
+          SharedSize: 0,
+          Containers: 0,
+          Labels: {
+            "ai.workspace.env-owner": owner,
+            "ai.workspace.env-hash": hash,
+            "ai.workspace.base-image": baseId,
+          },
+        };
+      }
+      const list = vi
+        .spyOn(Docker.prototype, "listImages")
+        .mockResolvedValue([
+          image(layerId, baseId, orphanHash),
+          image(taggedId, layerId, orphanHash, [tag]),
+          image(baseId, "", orphanHash),
+          image("shared", baseId, referencedHash),
+          image("foreign", baseId, orphanHash, ["manual:keep"]),
+        ]);
+      const remove = vi.fn().mockResolvedValue([]);
+      const get = vi.spyOn(Docker.prototype, "getImage").mockImplementation(
+        (name) =>
+          ({
+            inspect: async () => ({ Id: baseId }),
+            remove: async () => remove(name),
+          }) as unknown as Docker.Image,
+      );
+      try {
+        await builder.tick();
+        expect(remove.mock.calls).toEqual([[tag], [layerId]]);
+      } finally {
+        await builder.stop();
+        get.mockRestore();
+        list.mockRestore();
       }
     });
   });

@@ -11,6 +11,7 @@ await build({
     "src/runner/package-install.ts",
     "src/runner/package-sudo.ts",
     "src/runner/package-presets.ts",
+    "src/runner/project-image-install.ts",
     "src/runner/permissions.ts",
     "src/runner/package-tools.ts",
     "src/runner/github-sync-tool.ts",
