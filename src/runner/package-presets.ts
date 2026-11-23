@@ -1,6 +1,5 @@
 import { requestPackages } from "./package-client.js";
 import {
-  maxPackageNames,
   projectPackageNames,
   packagePresetResults,
   packagePresetSocket,
@@ -11,6 +10,7 @@ import {
 const results: PackagePresetResult[] = [];
 const skips = new Map<string, string[]>();
 const missingReason = "The package installer returned no reason.";
+const presetBatchSize = 64;
 
 function recordSkip(output: unknown, names: string[]) {
   const reason = typeof output === "string" && output ? output : missingReason;
@@ -30,7 +30,7 @@ try {
   if (!names) throw new Error("Invalid project package list.");
   pending = names;
   while (pending.length) {
-    const batch = pending.slice(0, maxPackageNames);
+    const batch = pending.slice(0, presetBatchSize);
     const reply = (await requestPackages(
       packagePresetSocket,
       batch,
