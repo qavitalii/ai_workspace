@@ -738,7 +738,6 @@ small,
   font-size: 12px;
 }
 .chat-table-scroll {
-  container-type: inline-size;
   max-width: 100%;
   overflow-x: auto;
   scrollbar-width: thin;
@@ -752,7 +751,7 @@ small,
   border-collapse: collapse;
   font-size: 13px;
 }
-@container (min-width: 40rem) {
+@media (min-width: 761px) {
   .chat-table-scroll table {
     width: auto;
   }
