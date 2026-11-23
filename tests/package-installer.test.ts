@@ -155,7 +155,9 @@ function fakeInstaller(budgets = packageBudgets({}), failAfterDpkg = false) {
       if (command === "apt-cache") {
         if (name === "apt-start-error")
           throw new Error("spawn apt-cache failed");
-        if (name && name !== "missing") onLine?.(`Package: ${name}`);
+        if (name === "missing")
+          return { ok: false, output: "E: No packages found" };
+        if (name) onLine?.(`Package: ${name}`);
         if (!name) {
           for (const line of [
             "Package: sized",
@@ -217,10 +219,14 @@ describe("Debian package presets", () => {
 
   it("reports each failure and continues with the remaining packages", async () => {
     const { install, recordInstalled } = fakeInstaller();
-    expect(
-      await install("preset", ["missing", "download-failed", "curl"], signal),
-    ).toMatchObject({
+    const result = await install(
+      "preset",
+      ["missing", "download-failed", "curl"],
+      signal,
+    );
+    expect(result).toMatchObject({
       ok: false,
+      incomplete: false,
       results: [
         {
           name: "missing",
@@ -231,6 +237,7 @@ describe("Debian package presets", () => {
         { name: "curl", ok: true },
       ],
     });
+    expect(result).not.toHaveProperty("results.0.skipped");
     expect(recordInstalled).not.toHaveBeenCalled();
     expect(await install("run", ["zip"], signal)).toMatchObject({ ok: true });
     expect(recordInstalled).toHaveBeenCalledWith([["zip"]]);

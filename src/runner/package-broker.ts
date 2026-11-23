@@ -166,18 +166,27 @@ const apt: RunApt = (command, args, deadline, signal, onLine, trackDpkg) => {
       release();
       reject(error);
     });
-    child.once("close", (code) => {
+    child.once("close", (code, exitSignal) => {
       release();
       const ok = !interruption && code === 0;
+      // A broken executable or a killed APT process affects the whole preset.
+      const processFailure =
+        exitSignal !== null || code === 126 || code === 127;
       resolve({
         ok,
         output:
-          interruption || (!ok && spaceError) || output.toString("utf8").trim(),
-        skip: interruption
-          ? "startup"
-          : !ok && spaceError
-            ? "space"
-            : undefined,
+          interruption ||
+          (!ok && spaceError) ||
+          output.toString("utf8").trim() ||
+          (processFailure
+            ? `${command} exited before completing (${exitSignal ?? `exit code ${code}`}).`
+            : ""),
+        skip:
+          interruption || processFailure
+            ? "startup"
+            : !ok && spaceError
+              ? "space"
+              : undefined,
         interrupted: Boolean(interruption),
         dpkgStarted,
         dpkgFailed:

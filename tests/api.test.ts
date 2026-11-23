@@ -450,33 +450,63 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
     it.skipIf(process.env.DOCKER_TESTS !== "1").each([
       {
         scenario: "the installer cannot start",
-        target: "/usr/local/lib/workspace-install/sandbox",
-        script: "#!/bin/sh\nexit 1\n",
+        scripts: [
+          ["/usr/local/lib/workspace-install/sandbox", "#!/bin/sh\nexit 1\n"],
+        ],
         reason: "The Debian package installer is unavailable in this runner.",
       },
       {
         scenario: "the preset helper exits with an error",
-        target: "/app/dist/node/runner/package-presets.js",
-        script: "process.exitCode = 1;\n",
+        scripts: [
+          [
+            "/app/dist/node/runner/package-presets.js",
+            "process.exitCode = 1;\n",
+          ],
+        ],
         reason: "The package preset helper exited without a result.",
       },
       {
         scenario: "the preset helper exits successfully without output",
-        target: "/app/dist/node/runner/package-presets.js",
-        script: "process.exitCode = 0;\n",
+        scripts: [
+          [
+            "/app/dist/node/runner/package-presets.js",
+            "process.exitCode = 0;\n",
+          ],
+        ],
         reason: "The package preset helper exited without a result.",
+      },
+      {
+        scenario: "apt-cache exits with code 127",
+        scripts: [
+          ["/usr/bin/apt-get", "#!/bin/sh\nexit 0\n"],
+          [
+            "/usr/bin/apt-cache",
+            "#!/bin/sh\necho 'apt-cache: error while loading shared libraries' >&2\nexit 127\n",
+          ],
+        ],
+        reason: "apt-cache: error while loading shared libraries",
       },
     ])(
       "logs all skipped package names when $scenario",
-      async ({ target, script, reason }) => {
+      async ({ scripts, reason }) => {
         for (const name of ["hello", "sl"])
           expect((await add(name)).statusCode).toBe(200);
         await db.query(
           "UPDATE project_packages SET failures=2 WHERE project_id=$1",
           [project],
         );
-        const fixture = path.join(data, "package-startup-failure");
-        await writeFile(fixture, script, { mode: 0o755 });
+        const mounts = await Promise.all(
+          scripts.map(async ([target, script], index) => {
+            const fixture = path.join(data, `package-startup-failure-${index}`);
+            await writeFile(fixture, script, { mode: 0o755 });
+            return {
+              Type: "bind",
+              Source: fixture,
+              Target: target,
+              ReadOnly: true,
+            } as const;
+          }),
+        );
         const createContainer = docker.createContainer.bind(docker);
         const containers = vi
           .spyOn(docker, "createContainer")
@@ -485,12 +515,7 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
               options.Entrypoint?.[0] ===
               "/usr/local/bin/workspace-package-runner"
             )
-              options.HostConfig?.Mounts?.push({
-                Type: "bind",
-                Source: fixture,
-                Target: target,
-                ReadOnly: true,
-              });
+              options.HostConfig?.Mounts?.push(...mounts);
             return createContainer(options);
           });
         let runner;

@@ -303,7 +303,8 @@ export function createPackageInstaller({
         signal,
       ).catch(() => couldNotStart);
       const { ok, output, skip } = result;
-      if (skip === "startup") stopReason = output;
+      if (skip === "startup")
+        stopReason = output.slice(0, maxPresetPackageOutput);
       results.push({
         name,
         ok,
