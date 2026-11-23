@@ -22,6 +22,7 @@ import { event, notify, bus } from "./events.js";
 import { githubSyncMessage, type AgentEvent } from "../shared.js";
 import { packageNames } from "../runner/package-request.js";
 import { rememberProjectPackages } from "./project-packages.js";
+import { projectImageBuilds } from "./project-images.js";
 export const active = new Map<string, Running>();
 const maxPackageStartupNotices = 4;
 const maxPackageStartupNoticeBytes = 32 * 1024;
@@ -798,12 +799,21 @@ export async function switchAccount(
 }
 export async function startWorker() {
   await recover();
+  await db.query("DELETE FROM project_images WHERE state='building'");
+  function pollProjectImages(allowBuild: boolean) {
+    void projectImageBuilds.tick(allowBuild).catch((error) => {
+      console.error("Project image worker failed:", redact(String(error)));
+    });
+  }
   const timer = setInterval(async () => {
     if (ticking || shutting) return;
     ticking = true;
     try {
       const phase = await updatePhase();
-      if (phase === "waiting" || phase === "updating") return;
+      if (phase === "waiting" || phase === "updating") {
+        pollProjectImages(false);
+        return;
+      }
       await db.query(
         "UPDATE accounts SET status='ready',reset_at=NULL WHERE status='limited' AND reset_at IS NOT NULL AND reset_at<=now()",
       );
@@ -829,6 +839,7 @@ export async function startWorker() {
         void runJob(j);
       }
       await db.query("DELETE FROM sessions WHERE expires_at<now()");
+      pollProjectImages(true);
     } catch (e: any) {
       console.error("Worker tick failed:", e.message);
     } finally {
@@ -838,6 +849,7 @@ export async function startWorker() {
   return async () => {
     shutting = true;
     clearInterval(timer);
+    await projectImageBuilds.stop();
     for (const r of active.values()) await r.stop();
   };
 }

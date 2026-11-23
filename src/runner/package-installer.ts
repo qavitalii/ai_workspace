@@ -6,7 +6,11 @@ import {
   type InstallMode,
   type PackageBudgets,
 } from "./package-disk.js";
-import { maxPackageRequests, packagePresetTimeout } from "./package-request.js";
+import {
+  exactPackagePattern,
+  maxPackageRequests,
+  packagePresetTimeout,
+} from "./package-request.js";
 
 type InstallResult = {
   ok: boolean;
@@ -145,9 +149,7 @@ export function createPackageInstaller({
     if (Date.now() >= deadline) return timedOut;
     // APT can also match foreign-architecture placeholders without an
     // installable version when a dependency mentions the same package name.
-    const patterns = names.map(
-      (name) => `?and(?exact-name(${name}),?not(?virtual))`,
-    );
+    const patterns = names.map(exactPackagePattern);
     const found = new Set<string>();
     const checked = await apt(
       "apt-cache",

@@ -40,8 +40,11 @@ export async function listProjectPackages(projectId: string) {
   return rows[0];
 }
 
-export async function projectPackagePresets(projectId: string) {
-  const { rows } = await db.query<{ name: string; request_id: string }>(
+export async function projectPackagePresets(
+  projectId: string,
+  connection: Pick<PoolClient, "query"> = db,
+) {
+  const { rows } = await connection.query<{ name: string; request_id: string }>(
     `SELECT name,request_id FROM project_packages
      WHERE project_id=$1 AND NOT disabled
      ORDER BY added_at,name LIMIT $2`,

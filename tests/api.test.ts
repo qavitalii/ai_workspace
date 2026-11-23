@@ -24,6 +24,8 @@ import {
 } from "vitest";
 import { randomBytes, randomUUID } from "node:crypto";
 import { once } from "node:events";
+import { PassThrough } from "node:stream";
+import Docker from "dockerode";
 import WebSocket from "ws";
 import {
   mkdtemp,
@@ -66,7 +68,9 @@ import {
   projectPackagePresets,
   recordPackagePresetResults,
   rememberProjectPackages,
+  addProjectPackage,
 } from "../src/server/project-packages";
+import { ProjectImageBuilds } from "../src/server/project-images";
 const enabled = process.env.INTEGRATION_TESTS === "1";
 describe.skipIf(!enabled)("PostgreSQL API integration", () => {
   let app: Awaited<ReturnType<typeof createApp>>,
@@ -133,6 +137,209 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
       "INSERT INTO chats(id,project_id,workspace_id,title,provider,account_id,branch) VALUES($1,$2,$1,'Test','codex',$3,'workspace/test')",
       [chat, project, account],
     );
+  });
+
+  describe("project images", () => {
+    async function newProject() {
+      const id = randomUUID();
+      await db.query(
+        "INSERT INTO projects(id,name,repo) VALUES($1,'Image test','')",
+        [id],
+      );
+      return id;
+    }
+
+    async function imageState(project: string) {
+      return (
+        await db.query("SELECT * FROM project_images WHERE project_id=$1", [
+          project,
+        ])
+      ).rows[0];
+    }
+
+    it.skipIf(process.env.DOCKER_TESTS !== "1")(
+      "builds and shares a project image, preserving the runner configuration and recording APT failures",
+      async () => {
+        const builder = new ProjectImageBuilds();
+        const buildImage = vi.spyOn(docker, "buildImage");
+        let container:
+          Awaited<ReturnType<typeof docker.createContainer>> | undefined;
+        let imageTag: string | undefined;
+        try {
+          const first = await newProject();
+          const second = await newProject();
+          const failing = await newProject();
+          await addProjectPackage(first, "hello");
+          await addProjectPackage(first, "jq");
+          await addProjectPackage(second, "jq");
+          await addProjectPackage(second, "hello");
+          const missing = "workspace-missing-" + randomUUID();
+          await addProjectPackage(failing, missing);
+          builder.request(first);
+          builder.request(second);
+          builder.request(failing);
+
+          const base = await docker.getImage(config.image).inspect();
+          await builder.tick();
+          const built = await vi.waitFor(
+            async () => {
+              const state = await imageState(first);
+              expect(state?.state, state?.log).toBe("ready");
+              return state;
+            },
+            { timeout: 120_000 },
+          );
+          const image = await docker.getImage(built.image_id).inspect();
+          imageTag = image.RepoTags[0];
+          expect(image.Config.Labels).toMatchObject({
+            "ai.workspace.instance": config.data,
+            "ai.workspace.env-hash": built.hash,
+            "ai.workspace.base-image": base.Id,
+            "ai.workspace.runner.package-installer": "1",
+            "ai.workspace.runner.package-presets": "1",
+          });
+          expect(image.Config.User).toBe("node");
+          expect(image.Config.Cmd).toEqual(base.Config.Cmd);
+          expect(image.Config.Entrypoint).toEqual(base.Config.Entrypoint);
+          expect(built.built_at).toBeInstanceOf(Date);
+          container = await docker.createContainer({
+            Image: built.image_id,
+            NetworkDisabled: true,
+            Entrypoint: ["/bin/sh", "-c"],
+            Cmd: [
+              'test "$(id -u)" = 1000 && test "$(command -v hello)" = /usr/bin/hello',
+            ],
+          });
+          await container.start();
+          expect((await container.wait()).StatusCode).toBe(0);
+
+          await vi.waitFor(async () => {
+            await builder.tick();
+            expect(await imageState(second)).toMatchObject({
+              state: "ready",
+              hash: built.hash,
+              image_id: built.image_id,
+              built_at: built.built_at,
+            });
+          });
+          expect(buildImage).toHaveBeenCalledTimes(1);
+          async function expectFailure() {
+            expect(await imageState(failing)).toMatchObject({
+              state: "failed",
+              image_id: null,
+              built_at: null,
+              log: expect.stringContaining(missing),
+              error: expect.any(String),
+            });
+          }
+          await vi.waitFor(
+            async () => {
+              await builder.tick();
+              await expectFailure();
+            },
+            { timeout: 120_000 },
+          );
+          expect(buildImage).toHaveBeenCalledTimes(2);
+
+          await builder.stop();
+          const retry = new ProjectImageBuilds();
+          try {
+            retry.request(first);
+            retry.request(failing);
+            await vi.waitFor(async () => {
+              await retry.tick();
+              expect(buildImage).toHaveBeenCalledTimes(3);
+            });
+            expect(await imageState(first)).toEqual(built);
+            await vi.waitFor(expectFailure, { timeout: 120_000 });
+          } finally {
+            await retry.stop();
+          }
+        } finally {
+          await builder.stop();
+          buildImage.mockRestore();
+          await container?.remove({ force: true });
+          if (imageTag) await docker.getImage(imageTag).remove();
+        }
+      },
+      370_000,
+    );
+
+    it("yields to a terminal and cancels a build when its package list changes", async () => {
+      const builder = new ProjectImageBuilds();
+      const signals: AbortSignal[] = [];
+      const realGetImage = Docker.prototype.getImage;
+      const getImage = vi
+        .spyOn(Docker.prototype, "getImage")
+        .mockImplementation(function (this: Docker, name) {
+          const image = realGetImage.call(this, name);
+          const inspect = vi.spyOn(image, "inspect");
+          if (name === config.image) {
+            inspect.mockResolvedValue({
+              Id: "sha256:" + "a".repeat(64),
+              Config: {
+                Labels: { "ai.workspace.runner.package-installer": "1" },
+              },
+            } as unknown as Docker.ImageInspectInfo);
+          } else {
+            inspect.mockRejectedValue(
+              Object.assign(new Error("Image not found"), { statusCode: 404 }),
+            );
+          }
+          return image;
+        });
+      const buildImage = vi
+        .spyOn(docker, "buildImage")
+        .mockImplementation(async (_file, options) => {
+          const signal = options!.abortSignal!;
+          signals.push(signal);
+          const stream = new PassThrough();
+          signal.addEventListener(
+            "abort",
+            () => stream.destroy(signal.reason),
+            { once: true },
+          );
+          return stream;
+        });
+      try {
+        const project = await newProject();
+        await addProjectPackage(project, "hello");
+        builder.request(project);
+        await db.query(
+          "INSERT INTO workspace_leases(workspace_id,chat_id,kind) VALUES($1,$1,'terminal')",
+          [chat],
+        );
+        await builder.tick();
+        expect(buildImage).not.toHaveBeenCalled();
+        await db.query("DELETE FROM workspace_leases WHERE chat_id=$1", [chat]);
+
+        await Promise.all([builder.tick(), builder.tick()]);
+        await vi.waitFor(() => expect(signals).toHaveLength(1));
+        const initial = await imageState(project);
+        expect(initial.state).toBe("building");
+        await addProjectPackage(project, "jq");
+        await builder.tick();
+        expect(signals[0].aborted).toBe(true);
+        await vi.waitFor(async () => {
+          await builder.tick();
+          expect(signals).toHaveLength(2);
+        });
+        expect(await imageState(project)).toMatchObject({
+          state: "building",
+          hash: expect.not.stringMatching(initial.hash),
+        });
+        await db.query(
+          "INSERT INTO workspace_leases(workspace_id,chat_id,kind) VALUES($1,$1,'terminal')",
+          [chat],
+        );
+        await builder.tick();
+        expect(signals[1].aborted).toBe(true);
+      } finally {
+        await builder.stop();
+        buildImage.mockRestore();
+        getImage.mockRestore();
+      }
+    });
   });
 
   describe("project Debian packages", () => {
