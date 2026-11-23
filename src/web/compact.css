@@ -3095,9 +3095,11 @@ input[type="file"]::file-selector-button {
   color: #515151;
   padding: 2px 4px;
 }
+.messages .chat-table {
+  margin: 12px 0;
+}
 .messages .markdown table {
   font-size: 12px;
-  margin: 12px 0;
 }
 .messages .markdown th,
 .messages .markdown td {
@@ -3397,6 +3399,9 @@ input[type="file"]::file-selector-button {
   }
   .messages .markdown {
     font-size: 14px;
+  }
+  .messages .markdown table {
+    font-size: 13px;
   }
   .message.user .markdown {
     padding: 10px 12px;
