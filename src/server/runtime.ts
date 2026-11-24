@@ -21,11 +21,17 @@ import { cleanAwsCredentials, awsForRun } from "./aws.js";
 import { cleanSkillSnapshots, prepareSkills } from "./skills.js";
 import { measureProjectEnv, prepareProjectEnv } from "./project-env.js";
 import {
+  findProjectImage,
+  queueProjectImage,
+  supportsProjectImages,
+} from "./project-images.js";
+import {
   projectPackagePresets,
   recordPackagePresetResults,
 } from "./project-packages.js";
 import { packageBudgets } from "../runner/package-disk.js";
 import { packagePresetResults } from "../runner/package-request.js";
+import { redact } from "./security.js";
 import {
   prepareProfile,
   recoverRunProfiles,
@@ -106,6 +112,9 @@ export async function launch(
   let projectEnvWarning: string | undefined;
   let packagePresetWarning: string | undefined;
   let packagePresetLog: string | undefined;
+  let projectImage: string | undefined;
+  let projectPackages: string[] = [];
+  const presetEnv: Record<string, string> = {};
   let presets: Map<string, string> | undefined;
   if (projectEnv && projectEnvId) {
     // Cached measurements can describe read-only runs. A launch that would
@@ -122,50 +131,65 @@ export async function launch(
       projectEnvWarning = `Project tools exceed the ${limitGib} GiB limit. /env is mounted read-only for this session.`;
     if (projectEnvWarning) projectEnv.mount.ReadOnly = true;
     mounts.push(projectEnv.mount);
-    if (installPackages && options.projectEnv === "read-write") {
-      presets = await projectPackagePresets(projectEnvId).catch((error) => {
-        console.error("Could not load project Debian packages", error);
-        packagePresetWarning =
-          "Workspace could not load the saved project Debian packages.";
-        return undefined;
-      });
-      if (presets?.size) {
+    const installPresets =
+      installPackages && options.projectEnv === "read-write";
+    const useProjectImage = image && supportsProjectImages(image);
+    if (installPresets || useProjectImage) {
+      const packages = await projectPackagePresets(projectEnvId).catch(
+        (error) => {
+          console.error("Could not load project Debian packages", error);
+          if (installPresets)
+            packagePresetWarning =
+              "Workspace could not load the saved project Debian packages.";
+          return undefined;
+        },
+      );
+      if (packages?.size) {
+        projectPackages = [...packages.keys()];
         const projectLimit = Math.round(limitGib * GiB);
         const remaining = projectLimit - (bytes ?? Infinity);
-        if (
-          image?.Config?.Labels?.["ai.workspace.runner.package-presets"] !== "1"
-        )
-          packagePresetWarning =
-            "This runner image does not support preinstalling project Debian packages. Rebuild it from the current Workspace runner.";
-        else if (remaining <= 0)
-          packagePresetWarning =
-            "Skipped project Debian packages because no project tool storage was available.";
-        else {
-          const presetCap = Math.min(
-            projectLimit,
-            packageBudgets(process.env, projectLimit).preset,
-          );
-          const budget = Math.min(remaining, presetCap);
-          if (budget === 0)
+        const presetCap = Math.min(
+          projectLimit,
+          packageBudgets(process.env, projectLimit).preset,
+        );
+        const budget = Math.min(remaining, presetCap);
+        if (useProjectImage && budget > 0)
+          projectImage = await findProjectImage(
+            projectEnvId,
+            image,
+            projectPackages,
+            budget,
+          ).catch((error) => {
+            console.error(
+              "Could not select the project runner image:",
+              redact(String(error)),
+            );
+            return undefined;
+          });
+        if (installPresets) {
+          presets = packages;
+          if (
+            image?.Config?.Labels?.["ai.workspace.runner.package-presets"] !==
+            "1"
+          )
+            packagePresetWarning =
+              "This runner image does not support preinstalling project Debian packages. Rebuild it from the current Workspace runner.";
+          else if (remaining <= 0)
+            packagePresetWarning =
+              "Skipped project Debian packages because no project tool storage was available.";
+          else if (budget === 0)
             packagePresetWarning =
               "Skipped project Debian packages because the preset budget is zero.";
           else {
-            packageEnv.WORKSPACE_PROJECT_PACKAGES = JSON.stringify([
-              ...presets.keys(),
-            ]);
-            packageEnv.WORKSPACE_PACKAGE_PRESET_BUDGET = String(budget);
+            presetEnv.WORKSPACE_PROJECT_PACKAGES =
+              JSON.stringify(projectPackages);
+            presetEnv.WORKSPACE_PACKAGE_PRESET_BUDGET = String(budget);
             // Another project may have more space left in its budget than this one.
-            packageEnv.WORKSPACE_PACKAGE_PEER_PRESET_BUDGET = String(presetCap);
+            presetEnv.WORKSPACE_PACKAGE_PEER_PRESET_BUDGET = String(presetCap);
           }
         }
       }
     }
-  }
-  if (packagePresetWarning) {
-    if (presets?.size)
-      packagePresetLog =
-        packagePresetWarning + "\nPackages: " + [...presets.keys()].join(", ");
-    presets = undefined;
   }
   if (chatId && w) {
     mounts.push(...workspaceGitMounts(w));
@@ -243,12 +267,11 @@ export async function launch(
   if (ssh) mounts.push(ssh.mount);
   if (skills) mounts.push(skills.mount);
   if (aws) mounts.push(aws.mount);
-  let c: Docker.Container;
-  try {
-    c = await docker.createContainer({
+  function createRunner(projectImage: string | undefined) {
+    return docker.createContainer({
       // A concurrently retagged image must not inherit the inspected image's
       // permission to start the broker.
-      Image: image?.Id ?? config.image,
+      Image: projectImage ?? image?.Id ?? config.image,
       User: installPackages ? "0:0" : "1000:1000",
       WorkingDir: installPackages ? "/" : "/workspace",
       ...(installPackages
@@ -279,6 +302,14 @@ export async function launch(
           ...aws?.env,
           ...projectEnv?.env,
           ...packageEnv,
+          ...(projectImage
+            ? {
+                WORKSPACE_PROJECT_PACKAGE_RESULT: JSON.stringify({
+                  results: projectPackages.map((name) => ({ name, ok: true })),
+                  incomplete: false,
+                }),
+              }
+            : presetEnv),
         }).map(([key, value]) => key + "=" + value),
       ],
       HostConfig: {
@@ -316,9 +347,32 @@ export async function launch(
       },
       StopTimeout: 10,
     });
+  }
+  let c: Docker.Container;
+  try {
+    c = await createRunner(projectImage).catch(async (error) => {
+      // Docker can remove a cached image between inspection and creation.
+      if (!projectImage || !projectEnvId || error.statusCode !== 404)
+        throw error;
+      projectImage = undefined;
+      await queueProjectImage(projectEnvId).catch((error) => {
+        console.error(
+          "Could not queue the project runner image:",
+          redact(String(error)),
+        );
+      });
+      return createRunner(undefined);
+    });
   } catch (error) {
     await cleanMounts();
     throw error;
+  }
+  if (projectImage) packagePresetWarning = undefined;
+  if (packagePresetWarning) {
+    if (presets?.size)
+      packagePresetLog =
+        packagePresetWarning + "\nPackages: " + projectPackages.join(", ");
+    presets = undefined;
   }
   let stream: Duplex;
   try {

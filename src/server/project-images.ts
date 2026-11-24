@@ -5,15 +5,16 @@ import path from "node:path";
 import Docker from "dockerode";
 import { packageBudgets } from "../runner/package-disk.js";
 import { projectPackageNames } from "../runner/package-request.js";
-import { config } from "./config.js";
+import { config, GiB } from "./config.js";
 import { db, transaction } from "./db.js";
 import { docker } from "./docker.js";
+import { measureProjectEnv } from "./project-env.js";
 import {
   pendingProjectPackageNames,
   projectPackagePresets,
 } from "./project-packages.js";
 import { redact } from "./security.js";
-import { concurrentTasks } from "./settings.js";
+import { concurrentTasks, projectEnvLimitGib } from "./settings.js";
 
 const installerLabel = "ai.workspace.runner.package-installer";
 const builderLabel = "ai.workspace.runner.project-image-builder";
@@ -53,6 +54,74 @@ function imageTag(hash: string, instance: string) {
   return `ai-workspace-env:${hash.slice(0, 12)}-${sha256(instance).slice(0, 12)}`;
 }
 
+function imageLabels(base: string, hash: string) {
+  return {
+    [instanceLabel]: config.data,
+    [ownerLabel]: sha256(config.data),
+    [hashLabel]: hash,
+    [baseLabel]: base,
+    [installerLabel]: "1",
+  };
+}
+
+function matchesProjectImage(
+  image: Docker.ImageInspectInfo | null,
+  base: string,
+  hash: string,
+) {
+  return (
+    image?.Config?.User === "node" &&
+    Object.entries(imageLabels(base, hash)).every(
+      ([name, value]) => image.Config.Labels?.[name] === value,
+    )
+  );
+}
+
+export function supportsProjectImages(base: Docker.ImageInspectInfo) {
+  return base.Config?.Labels?.[builderLabel] === "1";
+}
+
+export async function queueProjectImage(projectId: string) {
+  // Keep the original queue position and leave an active build's request intact.
+  await db.query(
+    `UPDATE projects SET package_image_requested_at=clock_timestamp()
+     WHERE id=$1 AND package_image_requested_at IS NULL`,
+    [projectId],
+  );
+}
+
+export async function findProjectImage(
+  projectId: string,
+  base: Docker.ImageInspectInfo,
+  packages: Iterable<string>,
+  budget: number,
+) {
+  const hash = imageHash(base.Id, packages);
+  const { rows } = await db.query<{
+    image_id: string | null;
+    state: "building" | "ready" | "failed";
+  }>(
+    "SELECT image_id,state FROM project_images WHERE project_id=$1 AND hash=$2",
+    [projectId, hash],
+  );
+  const cached = rows[0];
+  // Package edits and recovery can request a retry. A permanent build failure
+  // should not schedule another apt installation after every foreground run.
+  if (cached?.state === "failed") return;
+  const id = cached?.state === "ready" ? cached.image_id : null;
+  if (id && imageIdPattern.test(id) && id !== base.Id) {
+    const image = await inspectImage(id);
+    if (image?.Id === id && matchesProjectImage(image, base.Id, hash)) {
+      // The base layers are shared. Only the additional layers count towards
+      // the project's package storage, including for an image shared by projects.
+      const bytes = image.Size - base.Size;
+      if (Number.isSafeInteger(bytes) && bytes >= 0)
+        return bytes <= budget ? id : undefined;
+    }
+  }
+  await queueProjectImage(projectId);
+}
+
 async function inspectImage(tag: string) {
   try {
     return await imageDocker.getImage(tag).inspect();
@@ -81,6 +150,7 @@ async function buildImage(
   base: string,
   packages: string[],
   concurrency: number,
+  budget: number,
   labels: Record<string, string>,
   signal: AbortSignal,
   appendLog: (text: string) => void,
@@ -91,7 +161,6 @@ async function buildImage(
     throw new Error("Invalid project Debian package list.");
 
   const names = packages.map((name) => `'${name}'`).join(" ");
-  const { run: budget } = packageBudgets(process.env);
   signal.throwIfAborted();
   const dockerfile = [
     `FROM ${base}`,
@@ -410,13 +479,7 @@ export class ProjectImageBuilds {
     const instance = config.data;
     // Separate installations may share a Docker daemon and runner base.
     const tag = imageTag(hash, instance);
-    const labels = {
-      [instanceLabel]: instance,
-      [ownerLabel]: sha256(instance),
-      [hashLabel]: hash,
-      [baseLabel]: base,
-      [installerLabel]: "1",
-    };
+    const labels = imageLabels(base, hash);
     let imageId: string | null = null;
     let created: string | null = null;
     let failure: string | null = null;
@@ -447,13 +510,33 @@ export class ProjectImageBuilds {
           "The runner image does not support building project images.",
         );
       if (!image) {
+        const [envBytes, limitGib] = await Promise.all([
+          measureProjectEnv(projectId, { fresh: true, image: base }),
+          projectEnvLimitGib(),
+        ]);
+        const projectLimit = Math.round(limitGib * GiB);
+        const { run, preset } = packageBudgets(process.env, projectLimit);
+        const budget = Math.min(run, preset, projectLimit - envBytes);
+        if (budget <= 0)
+          throw new Error(
+            "No project tool storage is available for Debian packages.",
+          );
+        if (signal.aborted || (await foregroundBusy())) return;
+        // The runner reserves its build budget per slot. Round up to preserve
+        // the full run budget for each foreground slot when the build cap is lower.
+        const buildBudget = BigInt(budget);
+        const reservedSlots =
+          (BigInt(concurrency) * BigInt(run) + buildBudget - 1n) / buildBudget;
+        if (reservedSlots >= BigInt(Number.MAX_SAFE_INTEGER))
+          throw new Error("The project image disk reservation is too large.");
         const timeout = AbortSignal.timeout(buildTimeout);
         try {
           await buildImage(
             tag,
             base,
             packages,
-            concurrency,
+            Number(reservedSlots),
+            budget,
             labels,
             AbortSignal.any([signal, timeout]),
             appendLog,
@@ -482,13 +565,7 @@ export class ProjectImageBuilds {
       // An Engine error here leaves the request pending so the next tick can
       // inspect and reuse the already-built image.
       image ??= await inspectImage(tag);
-      const imageLabels = image?.Config?.Labels;
-      if (
-        image?.Config?.User === "node" &&
-        Object.entries(labels).every(
-          ([name, value]) => imageLabels?.[name] === value,
-        )
-      ) {
+      if (image && matchesProjectImage(image, base, hash)) {
         imageId = image.Id;
         created = image.Created;
       } else {

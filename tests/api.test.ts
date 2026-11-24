@@ -161,6 +161,170 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
       return `ai-workspace-env:${hash.slice(0, 12)}-${owner.slice(0, 12)}`;
     }
 
+    it.skipIf(process.env.DOCKER_TESTS !== "1")(
+      "launches cached project packages and falls back when the image is missing or stale",
+      async () => {
+        const project = (await chatWorkspace(chat)).project_id!;
+        const base = await docker.getImage(config.image).inspect();
+        const builder = new ProjectImageBuilds();
+        let runner: Running | undefined;
+        let tag: string | undefined;
+        let output = "";
+        const options = {
+          installPackages: true,
+          projectEnv: "read-write",
+        } as const;
+        const preset = `WORKSPACE_PROJECT_PACKAGES=${JSON.stringify(["hello"])}`;
+        const clearRequest = () =>
+          db.query(
+            "UPDATE projects SET package_image_requested_at=NULL WHERE id=$1",
+            [project],
+          );
+        async function queuedAt() {
+          const { rows } = await db.query(
+            "SELECT package_image_requested_at FROM projects WHERE id=$1",
+            [project],
+          );
+          return rows[0].package_image_requested_at;
+        }
+        async function start(
+          launchOptions: Parameters<typeof launch>[3] = options,
+        ) {
+          output = "";
+          runner = await launch(
+            chat,
+            null,
+            (e) => {
+              if (e.type === "terminal") output += e.data;
+            },
+            launchOptions,
+          );
+          return docker.getContainer(runner.id).inspect();
+        }
+        async function expectHello() {
+          runner!.send({
+            type: "terminal",
+            data: "test \"$(id -u)\" = 1000 && hello && printf '\\nPROJECT_''HELLO\\n'\r",
+          });
+          await vi.waitFor(
+            () => expect(output).toMatch(/^PROJECT_HELLO\r?$/m),
+            {
+              timeout: 90_000,
+            },
+          );
+        }
+        try {
+          await addProjectPackage(project, "hello");
+          await clearRequest();
+          const missing = await start();
+          expect(missing.Image).toBe(base.Id);
+          expect(missing.Config.Env).toContain(preset);
+          expect(await queuedAt()).toBeInstanceOf(Date);
+          expect(await imageState(project)).toBeUndefined();
+          await expectHello();
+          await runner?.stop();
+
+          await builder.tick();
+          const built = await vi.waitFor(
+            async () => {
+              const state = await imageState(project);
+              expect(state?.state, state?.log).toBe("ready");
+              return state;
+            },
+            { timeout: 120_000 },
+          );
+          tag = (await docker.getImage(built.image_id).inspect()).RepoTags[0];
+          expect(await queuedAt()).toBeNull();
+          const cached = await start();
+          expect(cached.Image).toBe(built.image_id);
+          expect(cached.Config.Env).not.toContain(preset);
+          expect(cached.Config.Env).toContain(
+            'WORKSPACE_PROJECT_PACKAGE_RESULT={"results":[{"name":"hello","ok":true}],"incomplete":false}',
+          );
+          await expectHello();
+          await runner?.stop();
+          expect(await queuedAt()).toBeNull();
+
+          const readOnly = await start({ projectEnv: "read-only" });
+          expect(readOnly.Image).toBe(built.image_id);
+          expect(readOnly.HostConfig.ReadonlyRootfs).toBe(true);
+          await expectHello();
+          await runner?.stop();
+
+          vi.stubEnv("WORKSPACE_PACKAGE_PRESET_BUDGET", "1");
+          const overBudget = await start();
+          expect(overBudget.Image).toBe(base.Id);
+          expect(overBudget.Config.Env).toContain(preset);
+          expect(await queuedAt()).toBeNull();
+          await runner?.stop();
+          vi.unstubAllEnvs();
+
+          await db.query(
+            "UPDATE project_images SET state='failed' WHERE project_id=$1",
+            [project],
+          );
+          const failed = await start();
+          expect(failed.Image).toBe(base.Id);
+          expect(failed.Config.Env).toContain(preset);
+          expect(await queuedAt()).toBeNull();
+          await runner?.stop();
+          await db.query(
+            "UPDATE project_images SET state='ready' WHERE project_id=$1",
+            [project],
+          );
+
+          const create = docker.createContainer.bind(docker);
+          const container = vi
+            .spyOn(docker, "createContainer")
+            .mockImplementation((options) => {
+              if (options?.Image === built.image_id)
+                return Promise.reject(
+                  Object.assign(new Error("Image not found"), {
+                    statusCode: 404,
+                  }),
+                );
+              return create(options);
+            });
+          try {
+            const removed = await start();
+            expect(removed.Image).toBe(base.Id);
+            expect(removed.Config.Env).toContain(preset);
+            expect(await queuedAt()).toBeInstanceOf(Date);
+            expect(
+              container.mock.calls.map(([options]) => options?.Image),
+            ).toEqual([
+              base.Id, // The /env measurement helper.
+              built.image_id,
+              base.Id,
+            ]);
+            await runner?.stop();
+          } finally {
+            container.mockRestore();
+          }
+
+          await addProjectPackage(project, "jq");
+          await clearRequest();
+          const stale = await start();
+          expect(stale.Image).toBe(base.Id);
+          expect(stale.Config.Env).toContain(
+            'WORKSPACE_PROJECT_PACKAGES=["hello","jq"]',
+          );
+          expect(await queuedAt()).toBeInstanceOf(Date);
+          expect(await imageState(project)).toEqual(built);
+        } finally {
+          vi.unstubAllEnvs();
+          await runner?.stop();
+          await builder.stop();
+          if (tag)
+            await docker
+              .getImage(tag)
+              .remove()
+              .catch(() => {});
+        }
+      },
+      260_000,
+    );
+
     function mockImageDaemon() {
       const built = new Map<string, Partial<Docker.ImageInspectInfo>>();
       let baseId = "sha256:" + "a".repeat(64);
