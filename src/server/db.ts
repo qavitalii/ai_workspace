@@ -62,6 +62,18 @@ CREATE TABLE IF NOT EXISTS project_packages(
   PRIMARY KEY(project_id,name)
 );
 CREATE INDEX IF NOT EXISTS project_packages_source_chat ON project_packages(source_chat_id) WHERE source_chat_id IS NOT NULL;
+ALTER TABLE projects ADD COLUMN IF NOT EXISTS package_image_requested_at timestamptz;
+CREATE INDEX IF NOT EXISTS projects_pending_images ON projects(package_image_requested_at,id)
+  WHERE package_image_requested_at IS NOT NULL;
+CREATE TABLE IF NOT EXISTS project_images(
+  project_id uuid PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+  hash text NOT NULL,
+  image_id text,
+  state text NOT NULL CHECK(state IN ('building','ready','failed')),
+  error text,
+  log text NOT NULL DEFAULT '',
+  built_at timestamptz
+);
 CREATE TABLE IF NOT EXISTS ssh_links(id uuid PRIMARY KEY,server_id uuid NOT NULL REFERENCES ssh_servers(id) ON DELETE CASCADE,project_id uuid REFERENCES projects(id) ON DELETE CASCADE,chat_id uuid REFERENCES chats(id) ON DELETE CASCADE,CHECK((project_id IS NULL) <> (chat_id IS NULL)));
 CREATE UNIQUE INDEX IF NOT EXISTS ssh_link_project ON ssh_links(project_id,server_id) WHERE project_id IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS ssh_link_chat ON ssh_links(chat_id,server_id) WHERE chat_id IS NOT NULL;

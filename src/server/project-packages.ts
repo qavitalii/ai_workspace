@@ -23,6 +23,15 @@ async function lockProject(c: PoolClient, projectId: string) {
   return rows[0];
 }
 
+async function requestImage(c: PoolClient, projectId: string) {
+  await c.query(
+    `UPDATE projects SET package_image_requested_at=
+       GREATEST(clock_timestamp(),package_image_requested_at + interval '1 microsecond')
+     WHERE id=$1`,
+    [projectId],
+  );
+}
+
 export async function listProjectPackages(projectId: string) {
   const { rows } = await db.query<ProjectPackages>(
     `SELECT p.auto_packages, COALESCE((
@@ -54,6 +63,18 @@ export async function projectPackagePresets(projectId: string) {
   );
 }
 
+export async function pendingProjectPackageNames() {
+  const { rows } = await db.query<{ names: string[] }>(
+    `SELECT ARRAY(
+       SELECT pp.name FROM project_packages pp
+       WHERE pp.project_id=p.id AND NOT pp.disabled
+       ORDER BY pp.added_at,pp.name LIMIT $1
+     ) AS names FROM projects p WHERE p.package_image_requested_at IS NOT NULL`,
+    [packageLimit],
+  );
+  return rows.map(({ names }) => names.filter(validPackageName));
+}
+
 export async function recordPackagePresetResults(
   projectId: string,
   presets: ReadonlyMap<string, string>,
@@ -67,15 +88,19 @@ export async function recordPackagePresetResults(
   await transaction(async (c) => {
     await lockProject(c, projectId);
     // The owner may have removed or replaced a package while apt was running.
-    await c.query(
+    const { rows } = await c.query<{ changed: boolean }>(
       `UPDATE project_packages pp
        SET failures=CASE WHEN result.ok THEN 0 ELSE pp.failures+1 END,
            disabled=NOT result.ok AND pp.failures+1>=3
-       FROM json_to_recordset($2::json) AS result(name text,ok boolean,request_id uuid)
+       FROM project_packages previous,
+            json_to_recordset($2::json) AS result(name text,ok boolean,request_id uuid)
        WHERE pp.project_id=$1 AND pp.name=result.name
-         AND pp.request_id=result.request_id AND (result.ok OR NOT pp.disabled)`,
+         AND pp.request_id=result.request_id AND (result.ok OR NOT pp.disabled)
+         AND previous.project_id=pp.project_id AND previous.name=pp.name
+       RETURNING previous.disabled IS DISTINCT FROM pp.disabled AS changed`,
       [projectId, JSON.stringify(reported)],
     );
+    if (rows.some(({ changed }) => changed)) await requestImage(c, projectId);
   });
 }
 
@@ -103,7 +128,7 @@ async function savePackages(
     if (accepted.length) {
       // Keep the original request group. A successful agent install clears a
       // previously recorded failure even when the package was added by the owner.
-      await c.query(
+      const { rowCount } = await c.query(
         `INSERT INTO project_packages(project_id,name,source,source_chat_id,request_id)
          SELECT $1,pkg.name,$3,$4,$5 FROM unnest($2::text[]) AS pkg(name)
          ON CONFLICT(project_id,name) DO UPDATE SET failures=0,disabled=false
@@ -111,6 +136,7 @@ async function savePackages(
            AND (project_packages.failures<>0 OR project_packages.disabled)`,
         [projectId, accepted, chatId ? "agent" : "owner", chatId, requestId],
       );
+      if (rowCount || !chatId) await requestImage(c, projectId);
     }
     return {
       skipped,
@@ -150,16 +176,17 @@ export async function removeProjectPackages(
 ) {
   return transaction(async (c) => {
     await lockProject(c, projectId);
-    if ("name" in target)
-      await c.query(
-        "DELETE FROM project_packages WHERE project_id=$1 AND name=$2",
-        [projectId, target.name],
-      );
-    else
-      await c.query(
-        "DELETE FROM project_packages WHERE project_id=$1 AND request_id=$2",
-        [projectId, target.requestId],
-      );
+    const { rowCount } =
+      "name" in target
+        ? await c.query(
+            "DELETE FROM project_packages WHERE project_id=$1 AND name=$2",
+            [projectId, target.name],
+          )
+        : await c.query(
+            "DELETE FROM project_packages WHERE project_id=$1 AND request_id=$2",
+            [projectId, target.requestId],
+          );
+    if (rowCount) await requestImage(c, projectId);
     return { ok: true };
   });
 }

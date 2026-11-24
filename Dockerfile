@@ -64,6 +64,7 @@ RUN mkdir -p /run/workspace-ssh /private && chown node:node /run/workspace-ssh /
 ENV HOME=/profile CODEX_HOME=/profile/.codex CLAUDE_CONFIG_DIR=/profile/.claude
 LABEL ai.workspace.runner.package-installer="1"
 LABEL ai.workspace.runner.package-presets="1"
+LABEL ai.workspace.runner.project-image-builder="1"
 USER node
 WORKDIR /workspace
 CMD ["node","/app/dist/node/runner/main.js"]

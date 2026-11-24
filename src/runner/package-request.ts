@@ -15,6 +15,10 @@ export function validPackageName(name: unknown): name is string {
   return typeof name === "string" && packageName.test(name);
 }
 
+export function exactPackagePattern(name: string) {
+  return `?and(?exact-name(${name}),?not(?virtual))`;
+}
+
 function validPackageNames(value: unknown): value is string[] {
   return (
     Array.isArray(value) && value.length > 0 && value.every(validPackageName)
