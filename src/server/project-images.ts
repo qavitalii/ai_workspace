@@ -8,7 +8,10 @@ import { projectPackageNames } from "../runner/package-request.js";
 import { config, GiB } from "./config.js";
 import { db, transaction } from "./db.js";
 import { docker } from "./docker.js";
-import { measureProjectEnv } from "./project-env.js";
+import {
+  measureProjectEnv,
+  ProjectEnvMeasurementError,
+} from "./project-env.js";
 import {
   pendingProjectPackageNames,
   projectPackagePresets,
@@ -106,21 +109,36 @@ export async function findProjectImage(
     [projectId, hash],
   );
   const cached = rows[0];
+  const id = cached?.state === "ready" ? cached.image_id : null;
+  const candidates = [
+    ...(id && imageIdPattern.test(id) && id !== base.Id ? [id] : []),
+    imageTag(hash, config.data),
+  ];
+  for (const candidate of candidates) {
+    const image = await inspectImage(candidate);
+    if (
+      image &&
+      imageIdPattern.test(image.Id) &&
+      image.Id !== base.Id &&
+      (candidate !== id || image.Id === id) &&
+      matchesProjectImage(image, base.Id, hash)
+    ) {
+      // Only the additional layers count towards project storage. A shared
+      // image can fit even when this project's build needed too much APT space.
+      const bytes = image.Size - base.Size;
+      if (Number.isSafeInteger(bytes) && bytes >= 0) {
+        if (bytes > budget) return;
+        // Publish the shared image for this project on the next worker tick.
+        // The queued package list also protects it from image cleanup.
+        if (candidate !== id) await queueProjectImage(projectId);
+        return image.Id;
+      }
+    }
+  }
   if (cached?.state === "failed") {
     if (cached.failed_budget_bytes === null) return;
     const buildBudget = Math.min(budget, packageBudgets(process.env).run);
     if (buildBudget <= Number(cached.failed_budget_bytes)) return;
-  }
-  const id = cached?.state === "ready" ? cached.image_id : null;
-  if (id && imageIdPattern.test(id) && id !== base.Id) {
-    const image = await inspectImage(id);
-    if (image?.Id === id && matchesProjectImage(image, base.Id, hash)) {
-      // The base layers are shared. Only the additional layers count towards
-      // the project's package storage, including for an image shared by projects.
-      const bytes = image.Size - base.Size;
-      if (Number.isSafeInteger(bytes) && bytes >= 0)
-        return bytes <= budget ? id : undefined;
-    }
   }
   await queueProjectImage(projectId);
 }
@@ -496,6 +514,9 @@ export class ProjectImageBuilds {
     let image = supported ? await inspectImage(tag) : null;
     if (!matchesProjectImage(image, base, hash)) image = null;
     let concurrency = 0;
+    let runBudget = 0;
+    let budget = 0;
+    let measurementFailure: ProjectEnvMeasurementError | undefined;
     if (supported && !image && !signal.aborted) {
       concurrency = await concurrentTasks();
       const { rowCount } = await db.query(
@@ -507,33 +528,44 @@ export class ProjectImageBuilds {
         [projectId, request.requestedAt, hash],
       );
       if (!rowCount) return;
+      // Preparation failures leave the request pending for the worker retry.
+      // Deterministic measurement failures below still clear the request.
+      const [envBytes, limitGib] = await Promise.all([
+        measureProjectEnv(projectId, { fresh: true, image: base }).catch(
+          (error) => {
+            if (!(error instanceof ProjectEnvMeasurementError)) throw error;
+            measurementFailure = error;
+            return 0;
+          },
+        ),
+        projectEnvLimitGib(),
+      ]);
+      const projectLimit = Math.round(limitGib * GiB);
+      const { run, preset } = packageBudgets(process.env, projectLimit);
+      runBudget = run;
+      budget = Math.min(run, preset, projectLimit - envBytes);
+      if (signal.aborted || (await foregroundBusy())) return;
     }
     try {
       signal.throwIfAborted();
+      if (measurementFailure) throw measurementFailure;
       if (!supported)
         throw new Error(
           "The runner image does not support building project images.",
         );
       if (!image) {
-        const [envBytes, limitGib] = await Promise.all([
-          measureProjectEnv(projectId, { fresh: true, image: base }),
-          projectEnvLimitGib(),
-        ]);
-        const projectLimit = Math.round(limitGib * GiB);
-        const { run, preset } = packageBudgets(process.env, projectLimit);
-        const budget = Math.min(run, preset, projectLimit - envBytes);
         if (budget <= 0) {
           failedBudget = 0;
           throw new Error(
             "No project tool storage is available for Debian packages.",
           );
         }
-        if (signal.aborted || (await foregroundBusy())) return;
         // The runner reserves its build budget per slot. Round up to preserve
         // the full run budget for each foreground slot when the build cap is lower.
         const buildBudget = BigInt(budget);
         const reservedSlots =
-          (BigInt(concurrency) * BigInt(run) + buildBudget - 1n) / buildBudget;
+          (BigInt(concurrency) * BigInt(runBudget) + buildBudget - 1n) /
+          buildBudget;
         if (reservedSlots >= BigInt(Number.MAX_SAFE_INTEGER))
           throw new Error("The project image disk reservation is too large.");
         const timeout = AbortSignal.timeout(buildTimeout);
