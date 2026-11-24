@@ -941,6 +941,61 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
       }
     });
 
+    it("rebuilds an invalid project image under the expected tag", async () => {
+      const project = await newProject();
+      const builder = new ProjectImageBuilds();
+      const daemon = mockImageDaemon();
+      const build = vi
+        .spyOn(docker, "buildImage")
+        .mockImplementation(async (_context, options) => {
+          daemon.complete(options!.labels!);
+          return new PassThrough().end('{"stream":"Built image."}\n');
+        });
+      try {
+        await addProjectPackage(project, "hello");
+        const base = await docker.getImage(config.image).inspect();
+        const hash = createHash("sha256")
+          .update(JSON.stringify([base.Id, ["hello"]]))
+          .digest("hex");
+        const owner = createHash("sha256").update(config.data).digest("hex");
+        const tag = managedImageTag(hash, owner);
+        const staleImage = "sha256:" + "c".repeat(64);
+        daemon.complete(
+          {
+            "ai.workspace.instance": config.data,
+            "ai.workspace.env-owner": owner,
+            "ai.workspace.env-hash": hash,
+            "ai.workspace.base-image": "sha256:" + "d".repeat(64),
+            "ai.workspace.runner.package-installer": "1",
+          },
+          staleImage,
+        );
+        expect((await docker.getImage(tag).inspect()).Id).toBe(staleImage);
+
+        await builder.tick();
+        const ready = await vi.waitFor(async () => {
+          const state = await imageState(project);
+          expect(state?.state, state?.log).toBe("ready");
+          return state;
+        });
+        expect(build).toHaveBeenCalledExactlyOnceWith(
+          expect.anything(),
+          expect.objectContaining({ t: tag }),
+        );
+        expect(ready).toMatchObject({
+          hash,
+          image_id: "sha256:" + "b".repeat(64),
+          error: null,
+        });
+        expect((await docker.getImage(tag).inspect()).Id).toBe(ready.image_id);
+        expect(await queuedImageAt(project)).toBeNull();
+      } finally {
+        await builder.stop();
+        build.mockRestore();
+        daemon.restore();
+      }
+    });
+
     it("retries a failed post-build inspection and reuses the completed image", async () => {
       const project = await newProject();
       await addProjectPackage(project, "hello");

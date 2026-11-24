@@ -494,6 +494,7 @@ export class ProjectImageBuilds {
     if (signal.aborted) return;
     const supported = baseLabels?.[builderLabel] === "1";
     let image = supported ? await inspectImage(tag) : null;
+    if (!matchesProjectImage(image, base, hash)) image = null;
     let concurrency = 0;
     if (supported && !image && !signal.aborted) {
       concurrency = await concurrentTasks();
