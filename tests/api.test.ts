@@ -63,7 +63,7 @@ import { docker, launch, type Running } from "../src/server/runtime";
 import { initializeWorkspace, projectToken } from "../src/server/git";
 import { hash, seal, unseal } from "../src/server/security";
 import { projectToolEnvironment } from "../src/project-tool-environment";
-import { measureProjectEnv } from "../src/server/project-env";
+import { clearProjectEnv, measureProjectEnv } from "../src/server/project-env";
 import {
   projectPackagePresets,
   recordPackagePresetResults,
@@ -220,12 +220,25 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
         }
         try {
           await addProjectPackage(project, "hello");
-          await clearRequest();
+          await mkdir(path.join(data, "project-env"), { recursive: true });
+          await writeFile(
+            path.join(data, "project-env", project),
+            "Invalid environment",
+          );
+          await builder.tick();
+          await vi.waitFor(async () => {
+            expect(await imageState(project)).toMatchObject({
+              state: "failed",
+              error: "Invalid project environment directory",
+            });
+            expect(await queuedAt()).toBeNull();
+          });
+          await clearProjectEnv(project);
           const missing = await start();
           expect(missing.Image).toBe(base.Id);
           expect(missing.Config.Env).toContain(preset);
           expect(await queuedAt()).toBeInstanceOf(Date);
-          expect(await imageState(project)).toBeUndefined();
+          expect((await imageState(project)).state).toBe("failed");
           await expectHello();
           await runner?.stop();
 
@@ -1027,11 +1040,11 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
       },
     );
 
-    it("fails an invalid project environment and continues with the next queued project", async () => {
+    it("continues past an invalid environment and retries it after recovery", async () => {
       const invalid = await newProject();
       await addProjectPackage(invalid, "hello");
       const next = await newProject();
-      await addProjectPackage(next, "hello");
+      await addProjectPackage(next, "jq");
       await mkdir(path.join(data, "project-env"), { recursive: true });
       const invalidPath = path.join(data, "project-env", invalid);
       await writeFile(invalidPath, "This environment path is a file.");
@@ -1059,6 +1072,22 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
         });
         expect(await queuedImageAt(next)).toBeNull();
         expect(build).toHaveBeenCalledTimes(1);
+        await rm(invalidPath);
+        const base = await docker.getImage(config.image).inspect();
+        expect(await measureProjectEnv(invalid, { fresh: true })).toBe(0);
+        expect(
+          await findProjectImage(invalid, base, ["hello"], 64 * 1024 ** 2),
+        ).toBeUndefined();
+        expect(await queuedImageAt(invalid)).toBeInstanceOf(Date);
+        await vi.waitFor(async () => {
+          await builder.tick();
+          expect(await imageState(invalid)).toMatchObject({
+            state: "ready",
+            failed_env_measurement: false,
+          });
+        });
+        expect(build).toHaveBeenCalledTimes(2);
+        expect(await queuedImageAt(invalid)).toBeNull();
       } finally {
         await builder.stop();
         build.mockRestore();
@@ -1132,6 +1161,32 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
             image_id: ready.image_id,
             failed_budget_bytes: null,
           });
+        });
+        expect(await queuedImageAt(project)).toBeNull();
+        expect(build).toHaveBeenCalledTimes(1);
+
+        const oversizedId = "sha256:" + "e".repeat(64);
+        await db.query(
+          "UPDATE project_images SET image_id=$2 WHERE project_id=$1",
+          [project, oversizedId],
+        );
+        daemon.get.mockImplementationOnce((candidate) => {
+          expect(candidate).toBe(oversizedId);
+          return {
+            inspect: async () => ({
+              Id: oversizedId,
+              Size: base.Size + budget + 1,
+              Config: { User: "node", Labels: labels },
+            }),
+          } as unknown as Docker.Image;
+        });
+        expect(await findProjectImage(project, base, ["hello"], budget)).toBe(
+          ready.image_id,
+        );
+        expect(await queuedImageAt(project)).toBeInstanceOf(Date);
+        await vi.waitFor(async () => {
+          await builder.tick();
+          expect((await imageState(project)).image_id).toBe(ready.image_id);
         });
         expect(await queuedImageAt(project)).toBeNull();
         expect(build).toHaveBeenCalledTimes(1);

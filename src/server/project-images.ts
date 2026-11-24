@@ -104,8 +104,9 @@ export async function findProjectImage(
     image_id: string | null;
     state: "building" | "ready" | "failed";
     failed_budget_bytes: string | null;
+    failed_env_measurement: boolean;
   }>(
-    "SELECT image_id,state,failed_budget_bytes FROM project_images WHERE project_id=$1 AND hash=$2",
+    "SELECT image_id,state,failed_budget_bytes,failed_env_measurement FROM project_images WHERE project_id=$1 AND hash=$2",
     [projectId, hash],
   );
   const cached = rows[0];
@@ -114,6 +115,7 @@ export async function findProjectImage(
     ...(id && imageIdPattern.test(id) && id !== base.Id ? [id] : []),
     imageTag(hash, config.data),
   ];
+  let oversized = false;
   for (const candidate of candidates) {
     const image = await inspectImage(candidate);
     if (
@@ -127,7 +129,10 @@ export async function findProjectImage(
       // image can fit even when this project's build needed too much APT space.
       const bytes = image.Size - base.Size;
       if (Number.isSafeInteger(bytes) && bytes >= 0) {
-        if (bytes > budget) return;
+        if (bytes > budget) {
+          oversized = true;
+          continue;
+        }
         // Publish the shared image for this project on the next worker tick.
         // The queued package list also protects it from image cleanup.
         if (candidate !== id) await queueProjectImage(projectId);
@@ -135,7 +140,10 @@ export async function findProjectImage(
       }
     }
   }
-  if (cached?.state === "failed") {
+  if (oversized) return;
+  // Launches only reach selection after successfully measuring /env. Retry a
+  // failed measurement now that the environment is readable again.
+  if (cached?.state === "failed" && !cached.failed_env_measurement) {
     if (cached.failed_budget_bytes === null) return;
     const buildBudget = Math.min(budget, packageBudgets(process.env).run);
     if (buildBudget <= Number(cached.failed_budget_bytes)) return;
@@ -524,12 +532,13 @@ export class ProjectImageBuilds {
          SELECT id,$3,'building' FROM projects
          WHERE id=$1 AND package_image_requested_at=$2::timestamptz
          FOR NO KEY UPDATE
-         ON CONFLICT(project_id) DO UPDATE SET hash=$3,state='building',image_id=NULL,error=NULL,log='',built_at=NULL,failed_budget_bytes=NULL`,
+         ON CONFLICT(project_id) DO UPDATE SET hash=$3,state='building',image_id=NULL,error=NULL,log='',built_at=NULL,failed_budget_bytes=NULL,failed_env_measurement=false`,
         [projectId, request.requestedAt, hash],
       );
       if (!rowCount) return;
       // Preparation failures leave the request pending for the worker retry.
-      // Deterministic measurement failures below still clear the request.
+      // Measurement failures clear the request so other projects can proceed.
+      // A later launch can queue it again after a successful measurement.
       const [envBytes, limitGib] = await Promise.all([
         measureProjectEnv(projectId, { fresh: true, image: base }).catch(
           (error) => {
@@ -622,9 +631,9 @@ export class ProjectImageBuilds {
       // A package edit locks the same project and supersedes the old request.
       if (!(await clearRequest(c, request))) return;
       await c.query(
-        `INSERT INTO project_images(project_id,hash,image_id,state,error,log,built_at,failed_budget_bytes)
-         VALUES($1,$2,$3,$4,$5,$6,$7,$8)
-         ON CONFLICT(project_id) DO UPDATE SET hash=$2,image_id=$3,state=$4,error=$5,log=$6,built_at=$7,failed_budget_bytes=$8
+        `INSERT INTO project_images(project_id,hash,image_id,state,error,log,built_at,failed_budget_bytes,failed_env_measurement)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
+         ON CONFLICT(project_id) DO UPDATE SET hash=$2,image_id=$3,state=$4,error=$5,log=$6,built_at=$7,failed_budget_bytes=$8,failed_env_measurement=$9
          WHERE project_images.state<>'ready' OR project_images.hash<>$2 OR project_images.image_id IS DISTINCT FROM $3`,
         [
           projectId,
@@ -635,6 +644,7 @@ export class ProjectImageBuilds {
           log,
           created,
           failedBudget,
+          Boolean(measurementFailure),
         ],
       );
     });
