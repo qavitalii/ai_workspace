@@ -161,6 +161,14 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
       return `ai-workspace-env:${hash.slice(0, 12)}-${owner.slice(0, 12)}`;
     }
 
+    async function queuedImageAt(project: string) {
+      const { rows } = await db.query(
+        "SELECT package_image_requested_at FROM projects WHERE id=$1",
+        [project],
+      );
+      return rows[0].package_image_requested_at;
+    }
+
     it.skipIf(process.env.DOCKER_TESTS !== "1")(
       "launches cached project packages and falls back when the image is missing or stale",
       async () => {
@@ -180,13 +188,7 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
             "UPDATE projects SET package_image_requested_at=NULL WHERE id=$1",
             [project],
           );
-        async function queuedAt() {
-          const { rows } = await db.query(
-            "SELECT package_image_requested_at FROM projects WHERE id=$1",
-            [project],
-          );
-          return rows[0].package_image_requested_at;
-        }
+        const queuedAt = () => queuedImageAt(project);
         async function start(
           launchOptions: Parameters<typeof launch>[3] = options,
         ) {
@@ -250,6 +252,31 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
           expect(readOnly.HostConfig.ReadonlyRootfs).toBe(true);
           await expectHello();
           await runner?.stop();
+
+          const { Size: imageSize } = await docker
+            .getImage(built.image_id)
+            .inspect();
+          const imageBytes = imageSize - base.Size;
+          const envBytes = await measureProjectEnv(project, { fresh: true });
+          const addedBytes = Math.min(1024 * 1024, Math.floor(imageBytes / 2));
+          const limitBytes = envBytes + imageBytes + Math.floor(addedBytes / 4);
+          const payload = path.join(data, "project-env", project, "new-tool");
+          const previousLimit = config.projectEnvLimitGib;
+          config.projectEnvLimitGib = limitBytes / 1024 ** 3;
+          try {
+            await writeFile(payload, randomBytes(addedBytes));
+            expect(await measureProjectEnv(project)).toBe(envBytes);
+            const plan = await start({ projectEnv: "read-only" });
+            expect(plan.Image).toBe(base.Id);
+            expect(plan.HostConfig.ReadonlyRootfs).toBe(true);
+            const actual = await measureProjectEnv(project);
+            expect(actual).toBeLessThan(limitBytes);
+            expect(actual + imageBytes).toBeGreaterThan(limitBytes);
+            await runner?.stop();
+          } finally {
+            config.projectEnvLimitGib = previousLimit;
+            await rm(payload, { force: true });
+          }
 
           vi.stubEnv("WORKSPACE_PACKAGE_PRESET_BUDGET", "1");
           const overBudget = await start();
@@ -323,6 +350,93 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
         }
       },
       260_000,
+    );
+
+    it.skipIf(process.env.DOCKER_TESTS !== "1")(
+      "retries budget-blocked project image builds when more storage becomes available",
+      async () => {
+        const project = (await chatWorkspace(chat)).project_id!;
+        const base = await docker.getImage(config.image).inspect();
+        const builder = new ProjectImageBuilds();
+        let runner: Running | undefined;
+        let tag: string | undefined;
+        async function planningImage() {
+          runner = await launch(chat, null, () => {}, {
+            projectEnv: "read-only",
+          });
+          try {
+            return (await docker.getContainer(runner.id).inspect()).Image;
+          } finally {
+            await runner.stop();
+            runner = undefined;
+          }
+        }
+        try {
+          const envPath = path.join(data, "project-env", project);
+          await mkdir(envPath, { recursive: true });
+          await writeFile(path.join(envPath, "tool"), randomBytes(4096));
+          config.projectEnvLimitGib = 1 / 1024 ** 3;
+          await addProjectPackage(project, "hello");
+          await builder.tick();
+          await vi.waitFor(
+            async () => {
+              expect(await imageState(project)).toMatchObject({
+                state: "failed",
+                error:
+                  "No project tool storage is available for Debian packages.",
+                failed_budget_bytes: "0",
+              });
+            },
+            { timeout: 10_000 },
+          );
+          expect(await queuedImageAt(project)).toBeNull();
+
+          const smallLimit = 128 * 1024 ** 2;
+          config.projectEnvLimitGib = smallLimit / 1024 ** 3;
+          expect(await planningImage()).toBe(base.Id);
+          expect(await queuedImageAt(project)).toBeInstanceOf(Date);
+          await builder.tick();
+          const smallBudget = smallLimit - (await measureProjectEnv(project));
+          await vi.waitFor(
+            async () => {
+              expect(await imageState(project)).toMatchObject({
+                state: "failed",
+                log: expect.stringContaining("system-package budget"),
+                failed_budget_bytes: String(smallBudget),
+              });
+            },
+            { timeout: 60_000 },
+          );
+          expect(await planningImage()).toBe(base.Id);
+          expect(await queuedImageAt(project)).toBeNull();
+
+          config.projectEnvLimitGib = 8;
+          expect(await planningImage()).toBe(base.Id);
+          expect(await queuedImageAt(project)).toBeInstanceOf(Date);
+          await builder.tick();
+          const built = await vi.waitFor(
+            async () => {
+              const state = await imageState(project);
+              expect(state?.state, state?.log).toBe("ready");
+              expect(state.failed_budget_bytes).toBeNull();
+              return state;
+            },
+            { timeout: 120_000 },
+          );
+          tag = (await docker.getImage(built.image_id).inspect()).RepoTags[0];
+          expect(await planningImage()).toBe(built.image_id);
+          expect(await queuedImageAt(project)).toBeNull();
+        } finally {
+          await runner?.stop();
+          await builder.stop();
+          if (tag)
+            await docker
+              .getImage(tag)
+              .remove()
+              .catch(() => {});
+        }
+      },
+      240_000,
     );
 
     function mockImageDaemon() {

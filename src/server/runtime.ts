@@ -117,10 +117,24 @@ export async function launch(
   const presetEnv: Record<string, string> = {};
   let presets: Map<string, string> | undefined;
   if (projectEnv && projectEnvId) {
-    // Cached measurements can describe read-only runs. A launch that would
-    // allow writes must account for installations since the last measurement.
+    const installPresets =
+      installPackages && options.projectEnv === "read-write";
+    const useProjectImage = image && supportsProjectImages(image);
+    const packages =
+      installPresets || useProjectImage
+        ? await projectPackagePresets(projectEnvId).catch((error) => {
+            console.error("Could not load project Debian packages", error);
+            if (installPresets)
+              packagePresetWarning =
+                "Workspace could not load the saved project Debian packages.";
+            return undefined;
+          })
+        : undefined;
+    // A launch that can write to /env or use a cached image needs current usage.
     const bytes = await measureProjectEnv(projectEnvId, {
-      fresh: !projectEnv.mount.ReadOnly,
+      fresh:
+        !projectEnv.mount.ReadOnly ||
+        Boolean(useProjectImage && packages?.size),
       image: image?.Id,
     }).catch(() => null);
     const limitGib = await projectEnvLimitGib();
@@ -131,62 +145,47 @@ export async function launch(
       projectEnvWarning = `Project tools exceed the ${limitGib} GiB limit. /env is mounted read-only for this session.`;
     if (projectEnvWarning) projectEnv.mount.ReadOnly = true;
     mounts.push(projectEnv.mount);
-    const installPresets =
-      installPackages && options.projectEnv === "read-write";
-    const useProjectImage = image && supportsProjectImages(image);
-    if (installPresets || useProjectImage) {
-      const packages = await projectPackagePresets(projectEnvId).catch(
-        (error) => {
-          console.error("Could not load project Debian packages", error);
-          if (installPresets)
-            packagePresetWarning =
-              "Workspace could not load the saved project Debian packages.";
-          return undefined;
-        },
+    if (packages?.size) {
+      projectPackages = [...packages.keys()];
+      const projectLimit = Math.round(limitGib * GiB);
+      const remaining = projectLimit - (bytes ?? Infinity);
+      const presetCap = Math.min(
+        projectLimit,
+        packageBudgets(process.env, projectLimit).preset,
       );
-      if (packages?.size) {
-        projectPackages = [...packages.keys()];
-        const projectLimit = Math.round(limitGib * GiB);
-        const remaining = projectLimit - (bytes ?? Infinity);
-        const presetCap = Math.min(
-          projectLimit,
-          packageBudgets(process.env, projectLimit).preset,
-        );
-        const budget = Math.min(remaining, presetCap);
-        if (useProjectImage && budget > 0)
-          projectImage = await findProjectImage(
-            projectEnvId,
-            image,
-            projectPackages,
-            budget,
-          ).catch((error) => {
-            console.error(
-              "Could not select the project runner image:",
-              redact(String(error)),
-            );
-            return undefined;
-          });
-        if (installPresets) {
-          presets = packages;
-          if (
-            image?.Config?.Labels?.["ai.workspace.runner.package-presets"] !==
-            "1"
-          )
-            packagePresetWarning =
-              "This runner image does not support preinstalling project Debian packages. Rebuild it from the current Workspace runner.";
-          else if (remaining <= 0)
-            packagePresetWarning =
-              "Skipped project Debian packages because no project tool storage was available.";
-          else if (budget === 0)
-            packagePresetWarning =
-              "Skipped project Debian packages because the preset budget is zero.";
-          else {
-            presetEnv.WORKSPACE_PROJECT_PACKAGES =
-              JSON.stringify(projectPackages);
-            presetEnv.WORKSPACE_PACKAGE_PRESET_BUDGET = String(budget);
-            // Another project may have more space left in its budget than this one.
-            presetEnv.WORKSPACE_PACKAGE_PEER_PRESET_BUDGET = String(presetCap);
-          }
+      const budget = Math.min(remaining, presetCap);
+      if (useProjectImage && budget > 0)
+        projectImage = await findProjectImage(
+          projectEnvId,
+          image,
+          projectPackages,
+          budget,
+        ).catch((error) => {
+          console.error(
+            "Could not select the project runner image:",
+            redact(String(error)),
+          );
+          return undefined;
+        });
+      if (installPresets) {
+        presets = packages;
+        if (
+          image?.Config?.Labels?.["ai.workspace.runner.package-presets"] !== "1"
+        )
+          packagePresetWarning =
+            "This runner image does not support preinstalling project Debian packages. Rebuild it from the current Workspace runner.";
+        else if (remaining <= 0)
+          packagePresetWarning =
+            "Skipped project Debian packages because no project tool storage was available.";
+        else if (budget === 0)
+          packagePresetWarning =
+            "Skipped project Debian packages because the preset budget is zero.";
+        else {
+          presetEnv.WORKSPACE_PROJECT_PACKAGES =
+            JSON.stringify(projectPackages);
+          presetEnv.WORKSPACE_PACKAGE_PRESET_BUDGET = String(budget);
+          // Another project may have more space left in its budget than this one.
+          presetEnv.WORKSPACE_PACKAGE_PEER_PRESET_BUDGET = String(presetCap);
         }
       }
     }

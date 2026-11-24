@@ -3,7 +3,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import Docker from "dockerode";
-import { packageBudgets } from "../runner/package-disk.js";
+import { packageBudgetError, packageBudgets } from "../runner/package-disk.js";
 import { projectPackageNames } from "../runner/package-request.js";
 import { config, GiB } from "./config.js";
 import { db, transaction } from "./db.js";
@@ -100,14 +100,17 @@ export async function findProjectImage(
   const { rows } = await db.query<{
     image_id: string | null;
     state: "building" | "ready" | "failed";
+    failed_budget_bytes: string | null;
   }>(
-    "SELECT image_id,state FROM project_images WHERE project_id=$1 AND hash=$2",
+    "SELECT image_id,state,failed_budget_bytes FROM project_images WHERE project_id=$1 AND hash=$2",
     [projectId, hash],
   );
   const cached = rows[0];
-  // Package edits and recovery can request a retry. A permanent build failure
-  // should not schedule another apt installation after every foreground run.
-  if (cached?.state === "failed") return;
+  if (cached?.state === "failed") {
+    if (cached.failed_budget_bytes === null) return;
+    const buildBudget = Math.min(budget, packageBudgets(process.env).run);
+    if (buildBudget <= Number(cached.failed_budget_bytes)) return;
+  }
   const id = cached?.state === "ready" ? cached.image_id : null;
   if (id && imageIdPattern.test(id) && id !== base.Id) {
     const image = await inspectImage(id);
@@ -483,6 +486,7 @@ export class ProjectImageBuilds {
     let imageId: string | null = null;
     let created: string | null = null;
     let failure: string | null = null;
+    let failedBudget: number | null = null;
     let log = "";
     const appendLog = (text: string) => {
       log = (log + redact(text.replaceAll("\0", ""))).slice(-maxLogLength);
@@ -498,7 +502,7 @@ export class ProjectImageBuilds {
          SELECT id,$3,'building' FROM projects
          WHERE id=$1 AND package_image_requested_at=$2::timestamptz
          FOR NO KEY UPDATE
-         ON CONFLICT(project_id) DO UPDATE SET hash=$3,state='building',image_id=NULL,error=NULL,log='',built_at=NULL`,
+         ON CONFLICT(project_id) DO UPDATE SET hash=$3,state='building',image_id=NULL,error=NULL,log='',built_at=NULL,failed_budget_bytes=NULL`,
         [projectId, request.requestedAt, hash],
       );
       if (!rowCount) return;
@@ -517,10 +521,12 @@ export class ProjectImageBuilds {
         const projectLimit = Math.round(limitGib * GiB);
         const { run, preset } = packageBudgets(process.env, projectLimit);
         const budget = Math.min(run, preset, projectLimit - envBytes);
-        if (budget <= 0)
+        if (budget <= 0) {
+          failedBudget = 0;
           throw new Error(
             "No project tool storage is available for Debian packages.",
           );
+        }
         if (signal.aborted || (await foregroundBusy())) return;
         // The runner reserves its build budget per slot. Round up to preserve
         // the full run budget for each foreground slot when the build cap is lower.
@@ -544,6 +550,10 @@ export class ProjectImageBuilds {
         } catch (error) {
           if (timeout.aborted)
             throw new Error("The project image build timed out.");
+          // The installer in the base image reports its budget rejection in
+          // the Docker build stream. Other build errors require a manual retry.
+          if (log.includes(packageBudgetError("run", budget)))
+            failedBudget = budget;
           throw error;
         }
       } else {
@@ -579,9 +589,9 @@ export class ProjectImageBuilds {
       // A package edit locks the same project and supersedes the old request.
       if (!(await clearRequest(c, request))) return;
       await c.query(
-        `INSERT INTO project_images(project_id,hash,image_id,state,error,log,built_at)
-         VALUES($1,$2,$3,$4,$5,$6,$7)
-         ON CONFLICT(project_id) DO UPDATE SET hash=$2,image_id=$3,state=$4,error=$5,log=$6,built_at=$7
+        `INSERT INTO project_images(project_id,hash,image_id,state,error,log,built_at,failed_budget_bytes)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8)
+         ON CONFLICT(project_id) DO UPDATE SET hash=$2,image_id=$3,state=$4,error=$5,log=$6,built_at=$7,failed_budget_bytes=$8
          WHERE project_images.state<>'ready' OR project_images.hash<>$2 OR project_images.image_id IS DISTINCT FROM $3`,
         [
           projectId,
@@ -591,6 +601,7 @@ export class ProjectImageBuilds {
           failure,
           log,
           created,
+          failedBudget,
         ],
       );
     });
