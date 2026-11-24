@@ -63,14 +63,17 @@ import { docker, launch, type Running } from "../src/server/runtime";
 import { initializeWorkspace, projectToken } from "../src/server/git";
 import { hash, seal, unseal } from "../src/server/security";
 import { projectToolEnvironment } from "../src/project-tool-environment";
-import { measureProjectEnv } from "../src/server/project-env";
+import { clearProjectEnv, measureProjectEnv } from "../src/server/project-env";
 import {
   projectPackagePresets,
   recordPackagePresetResults,
   rememberProjectPackages,
   addProjectPackage,
 } from "../src/server/project-packages";
-import { ProjectImageBuilds } from "../src/server/project-images";
+import {
+  findProjectImage,
+  ProjectImageBuilds,
+} from "../src/server/project-images";
 const enabled = process.env.INTEGRATION_TESTS === "1";
 describe.skipIf(!enabled)("PostgreSQL API integration", () => {
   let app: Awaited<ReturnType<typeof createApp>>,
@@ -161,6 +164,298 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
       return `ai-workspace-env:${hash.slice(0, 12)}-${owner.slice(0, 12)}`;
     }
 
+    async function queuedImageAt(project: string) {
+      const { rows } = await db.query(
+        "SELECT package_image_requested_at FROM projects WHERE id=$1",
+        [project],
+      );
+      return rows[0].package_image_requested_at;
+    }
+
+    it.skipIf(process.env.DOCKER_TESTS !== "1")(
+      "launches cached project packages and falls back when the image is missing or stale",
+      async () => {
+        const project = (await chatWorkspace(chat)).project_id!;
+        const base = await docker.getImage(config.image).inspect();
+        const builder = new ProjectImageBuilds();
+        let runner: Running | undefined;
+        let tag: string | undefined;
+        let output = "";
+        const options = {
+          installPackages: true,
+          projectEnv: "read-write",
+        } as const;
+        const preset = `WORKSPACE_PROJECT_PACKAGES=${JSON.stringify(["hello"])}`;
+        const clearRequest = () =>
+          db.query(
+            "UPDATE projects SET package_image_requested_at=NULL WHERE id=$1",
+            [project],
+          );
+        const queuedAt = () => queuedImageAt(project);
+        async function start(
+          launchOptions: Parameters<typeof launch>[3] = options,
+        ) {
+          output = "";
+          runner = await launch(
+            chat,
+            null,
+            (e) => {
+              if (e.type === "terminal") output += e.data;
+            },
+            launchOptions,
+          );
+          return docker.getContainer(runner.id).inspect();
+        }
+        async function expectHello() {
+          runner!.send({
+            type: "terminal",
+            data: "test \"$(id -u)\" = 1000 && hello && printf '\\nPROJECT_''HELLO\\n'\r",
+          });
+          await vi.waitFor(
+            () => expect(output).toMatch(/^PROJECT_HELLO\r?$/m),
+            {
+              timeout: 90_000,
+            },
+          );
+        }
+        try {
+          await addProjectPackage(project, "hello");
+          await mkdir(path.join(data, "project-env"), { recursive: true });
+          await writeFile(
+            path.join(data, "project-env", project),
+            "Invalid environment",
+          );
+          await builder.tick();
+          await vi.waitFor(async () => {
+            expect(await imageState(project)).toMatchObject({
+              state: "failed",
+              error: "Invalid project environment directory",
+            });
+            expect(await queuedAt()).toBeNull();
+          });
+          await clearProjectEnv(project);
+          const missing = await start();
+          expect(missing.Image).toBe(base.Id);
+          expect(missing.Config.Env).toContain(preset);
+          expect(await queuedAt()).toBeInstanceOf(Date);
+          expect((await imageState(project)).state).toBe("failed");
+          await expectHello();
+          await runner?.stop();
+
+          await builder.tick();
+          const built = await vi.waitFor(
+            async () => {
+              const state = await imageState(project);
+              expect(state?.state, state?.log).toBe("ready");
+              return state;
+            },
+            { timeout: 120_000 },
+          );
+          tag = (await docker.getImage(built.image_id).inspect()).RepoTags[0];
+          expect(await queuedAt()).toBeNull();
+          const cached = await start();
+          expect(cached.Image).toBe(built.image_id);
+          expect(cached.Config.Env).not.toContain(preset);
+          expect(cached.Config.Env).toContain(
+            'WORKSPACE_PROJECT_PACKAGE_RESULT={"results":[{"name":"hello","ok":true}],"incomplete":false}',
+          );
+          await expectHello();
+          await runner?.stop();
+          expect(await queuedAt()).toBeNull();
+
+          const readOnly = await start({ projectEnv: "read-only" });
+          expect(readOnly.Image).toBe(built.image_id);
+          expect(readOnly.HostConfig.ReadonlyRootfs).toBe(true);
+          await expectHello();
+          await runner?.stop();
+
+          const { Size: imageSize } = await docker
+            .getImage(built.image_id)
+            .inspect();
+          const imageBytes = imageSize - base.Size;
+          const envBytes = await measureProjectEnv(project, { fresh: true });
+          const addedBytes = Math.min(1024 * 1024, Math.floor(imageBytes / 2));
+          const limitBytes = envBytes + imageBytes + Math.floor(addedBytes / 4);
+          const payload = path.join(data, "project-env", project, "new-tool");
+          const previousLimit = config.projectEnvLimitGib;
+          config.projectEnvLimitGib = limitBytes / 1024 ** 3;
+          try {
+            await writeFile(payload, randomBytes(addedBytes));
+            expect(await measureProjectEnv(project)).toBe(envBytes);
+            const plan = await start({ projectEnv: "read-only" });
+            expect(plan.Image).toBe(base.Id);
+            expect(plan.HostConfig.ReadonlyRootfs).toBe(true);
+            const actual = await measureProjectEnv(project);
+            expect(actual).toBeLessThan(limitBytes);
+            expect(actual + imageBytes).toBeGreaterThan(limitBytes);
+            await runner?.stop();
+          } finally {
+            config.projectEnvLimitGib = previousLimit;
+            await rm(payload, { force: true });
+          }
+
+          vi.stubEnv("WORKSPACE_PACKAGE_PRESET_BUDGET", "1");
+          const overBudget = await start();
+          expect(overBudget.Image).toBe(base.Id);
+          expect(overBudget.Config.Env).toContain(preset);
+          expect(await queuedAt()).toBeNull();
+          await runner?.stop();
+          vi.unstubAllEnvs();
+
+          await db.query(
+            "UPDATE project_images SET state='failed' WHERE project_id=$1",
+            [project],
+          );
+          const failed = await start();
+          expect(failed.Image).toBe(built.image_id);
+          expect(failed.Config.Env).not.toContain(preset);
+          expect(await queuedAt()).toBeInstanceOf(Date);
+          await runner?.stop();
+          await clearRequest();
+          await db.query(
+            "UPDATE project_images SET state='ready' WHERE project_id=$1",
+            [project],
+          );
+
+          const create = docker.createContainer.bind(docker);
+          const container = vi
+            .spyOn(docker, "createContainer")
+            .mockImplementation((options) => {
+              if (options?.Image === built.image_id)
+                return Promise.reject(
+                  Object.assign(new Error("Image not found"), {
+                    statusCode: 404,
+                  }),
+                );
+              return create(options);
+            });
+          try {
+            const removed = await start();
+            expect(removed.Image).toBe(base.Id);
+            expect(removed.Config.Env).toContain(preset);
+            expect(await queuedAt()).toBeInstanceOf(Date);
+            expect(
+              container.mock.calls.map(([options]) => options?.Image),
+            ).toEqual([
+              base.Id, // The /env measurement helper.
+              built.image_id,
+              base.Id,
+            ]);
+            await runner?.stop();
+          } finally {
+            container.mockRestore();
+          }
+
+          await addProjectPackage(project, "jq");
+          await clearRequest();
+          const stale = await start();
+          expect(stale.Image).toBe(base.Id);
+          expect(stale.Config.Env).toContain(
+            'WORKSPACE_PROJECT_PACKAGES=["hello","jq"]',
+          );
+          expect(await queuedAt()).toBeInstanceOf(Date);
+          expect(await imageState(project)).toEqual(built);
+        } finally {
+          vi.unstubAllEnvs();
+          await runner?.stop();
+          await builder.stop();
+          if (tag)
+            await docker
+              .getImage(tag)
+              .remove()
+              .catch(() => {});
+        }
+      },
+      260_000,
+    );
+
+    it.skipIf(process.env.DOCKER_TESTS !== "1")(
+      "retries budget-blocked project image builds when more storage becomes available",
+      async () => {
+        const project = (await chatWorkspace(chat)).project_id!;
+        const base = await docker.getImage(config.image).inspect();
+        const builder = new ProjectImageBuilds();
+        let runner: Running | undefined;
+        let tag: string | undefined;
+        async function planningImage() {
+          runner = await launch(chat, null, () => {}, {
+            projectEnv: "read-only",
+          });
+          try {
+            return (await docker.getContainer(runner.id).inspect()).Image;
+          } finally {
+            await runner.stop();
+            runner = undefined;
+          }
+        }
+        try {
+          const envPath = path.join(data, "project-env", project);
+          await mkdir(envPath, { recursive: true });
+          await writeFile(path.join(envPath, "tool"), randomBytes(4096));
+          config.projectEnvLimitGib = 1 / 1024 ** 3;
+          await addProjectPackage(project, "hello");
+          await builder.tick();
+          await vi.waitFor(
+            async () => {
+              expect(await imageState(project)).toMatchObject({
+                state: "failed",
+                error:
+                  "No project tool storage is available for Debian packages.",
+                failed_budget_bytes: "0",
+              });
+            },
+            { timeout: 10_000 },
+          );
+          expect(await queuedImageAt(project)).toBeNull();
+
+          const smallLimit = 128 * 1024 ** 2;
+          config.projectEnvLimitGib = smallLimit / 1024 ** 3;
+          expect(await planningImage()).toBe(base.Id);
+          expect(await queuedImageAt(project)).toBeInstanceOf(Date);
+          await builder.tick();
+          const smallBudget = smallLimit - (await measureProjectEnv(project));
+          await vi.waitFor(
+            async () => {
+              expect(await imageState(project)).toMatchObject({
+                state: "failed",
+                log: expect.stringContaining("system-package budget"),
+                failed_budget_bytes: String(smallBudget),
+              });
+            },
+            { timeout: 60_000 },
+          );
+          expect(await planningImage()).toBe(base.Id);
+          expect(await queuedImageAt(project)).toBeNull();
+
+          config.projectEnvLimitGib = 8;
+          expect(await planningImage()).toBe(base.Id);
+          expect(await queuedImageAt(project)).toBeInstanceOf(Date);
+          await builder.tick();
+          const built = await vi.waitFor(
+            async () => {
+              const state = await imageState(project);
+              expect(state?.state, state?.log).toBe("ready");
+              expect(state.failed_budget_bytes).toBeNull();
+              return state;
+            },
+            { timeout: 120_000 },
+          );
+          tag = (await docker.getImage(built.image_id).inspect()).RepoTags[0];
+          expect(await planningImage()).toBe(built.image_id);
+          expect(await queuedImageAt(project)).toBeNull();
+        } finally {
+          await runner?.stop();
+          await builder.stop();
+          if (tag)
+            await docker
+              .getImage(tag)
+              .remove()
+              .catch(() => {});
+        }
+      },
+      240_000,
+    );
+
     function mockImageDaemon() {
       const built = new Map<string, Partial<Docker.ImageInspectInfo>>();
       let baseId = "sha256:" + "a".repeat(64);
@@ -181,6 +476,7 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
           else if (name === config.image)
             inspect.mockResolvedValue({
               Id: baseId,
+              Size: 1024 ** 3,
               Config: {
                 Labels: { "ai.workspace.runner.project-image-builder": "1" },
               },
@@ -207,6 +503,7 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
         complete(
           labels: Record<string, string>,
           id = "sha256:" + "b".repeat(64),
+          size = 1024 ** 3 + 154 * 1024,
         ) {
           const tag = managedImageTag(
             labels["ai.workspace.env-hash"],
@@ -214,6 +511,7 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
           );
           built.set(tag, {
             Id: id,
+            Size: size,
             Created: new Date().toISOString(),
             Config: {
               User: "node",
@@ -659,6 +957,297 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
         build.mockRestore();
         clock.mockRestore();
         log.mockRestore();
+        daemon.restore();
+      }
+    });
+
+    it.each(["budget", "foreground"])(
+      "retries a database fault during %s preparation without losing the image request",
+      async (stage) => {
+        const project = await newProject();
+        await addProjectPackage(project, "hello");
+        const requestedAt = await queuedImageAt(project);
+        const builder = new ProjectImageBuilds();
+        const daemon = mockImageDaemon();
+        const log = vi.spyOn(console, "error").mockImplementation(() => {});
+        const now = Date.now.bind(Date);
+        const clock = vi.spyOn(Date, "now");
+        const build = vi
+          .spyOn(docker, "buildImage")
+          .mockImplementation(async (_context, options) => {
+            daemon.complete(options!.labels!);
+            return new PassThrough().end('{"stream":"Built image."}\n');
+          });
+        const realQuery = db.query.bind(db);
+        let prepared = false;
+        let injected = false;
+        const query = vi.spyOn(db, "query").mockImplementation((...args) => {
+          const [sql] = args;
+          if (typeof sql === "string") {
+            const budgetQuery = sql.includes("key='project_env_limit_gib'");
+            const foregroundQuery = prepared && sql.includes("AS busy");
+            if (
+              !injected &&
+              (stage === "budget" ? budgetQuery : foregroundQuery)
+            ) {
+              injected = true;
+              return Promise.reject(
+                Object.assign(
+                  new Error("canceling statement due to statement timeout"),
+                  {
+                    code: "57014",
+                  },
+                ),
+              );
+            }
+            if (budgetQuery) prepared = true;
+          }
+          return Reflect.apply(realQuery, db, args);
+        });
+        try {
+          await builder.tick();
+          await vi.waitFor(() =>
+            expect(log).toHaveBeenCalledWith(
+              "Project image build failed:",
+              expect.stringContaining("statement timeout"),
+            ),
+          );
+          expect(injected).toBe(true);
+          expect(await queuedImageAt(project)).toEqual(requestedAt);
+          expect((await imageState(project)).state).toBe("building");
+          expect(build).not.toHaveBeenCalled();
+          await builder.tick();
+          expect(build).not.toHaveBeenCalled();
+          clock.mockImplementation(() => now() + 10_000);
+          await vi.waitFor(async () => {
+            await builder.tick();
+            expect(await imageState(project)).toMatchObject({
+              state: "ready",
+              error: null,
+              failed_budget_bytes: null,
+            });
+          });
+          expect(build).toHaveBeenCalledTimes(1);
+          expect(await queuedImageAt(project)).toBeNull();
+        } finally {
+          await builder.stop();
+          query.mockRestore();
+          build.mockRestore();
+          clock.mockRestore();
+          log.mockRestore();
+          daemon.restore();
+        }
+      },
+    );
+
+    it("continues past an invalid environment and retries it after recovery", async () => {
+      const invalid = await newProject();
+      await addProjectPackage(invalid, "hello");
+      const next = await newProject();
+      await addProjectPackage(next, "jq");
+      await mkdir(path.join(data, "project-env"), { recursive: true });
+      const invalidPath = path.join(data, "project-env", invalid);
+      await writeFile(invalidPath, "This environment path is a file.");
+      const builder = new ProjectImageBuilds();
+      const daemon = mockImageDaemon();
+      const build = vi
+        .spyOn(docker, "buildImage")
+        .mockImplementation(async (_context, options) => {
+          daemon.complete(options!.labels!);
+          return new PassThrough().end('{"stream":"Built image."}\n');
+        });
+      try {
+        await builder.tick();
+        await vi.waitFor(async () => {
+          expect(await imageState(invalid)).toMatchObject({
+            state: "failed",
+            error: "Invalid project environment directory",
+          });
+          expect(await queuedImageAt(invalid)).toBeNull();
+        });
+        expect(build).not.toHaveBeenCalled();
+        await vi.waitFor(async () => {
+          await builder.tick();
+          expect((await imageState(next))?.state).toBe("ready");
+        });
+        expect(await queuedImageAt(next)).toBeNull();
+        expect(build).toHaveBeenCalledTimes(1);
+        await rm(invalidPath);
+        const base = await docker.getImage(config.image).inspect();
+        expect(await measureProjectEnv(invalid, { fresh: true })).toBe(0);
+        expect(
+          await findProjectImage(invalid, base, ["hello"], 64 * 1024 ** 2),
+        ).toBeUndefined();
+        expect(await queuedImageAt(invalid)).toBeInstanceOf(Date);
+        await vi.waitFor(async () => {
+          await builder.tick();
+          expect(await imageState(invalid)).toMatchObject({
+            state: "ready",
+            failed_env_measurement: false,
+          });
+        });
+        expect(build).toHaveBeenCalledTimes(2);
+        expect(await queuedImageAt(invalid)).toBeNull();
+      } finally {
+        await builder.stop();
+        build.mockRestore();
+        daemon.restore();
+        await rm(invalidPath, { force: true });
+      }
+    });
+
+    it("reuses a shared image after a budget failure without repeating the failed build", async () => {
+      const project = await newProject();
+      await addProjectPackage(project, "hello");
+      const builder = new ProjectImageBuilds();
+      const daemon = mockImageDaemon();
+      const build = vi
+        .spyOn(docker, "buildImage")
+        .mockImplementation(async (_context, options) => {
+          daemon.complete(options!.labels!);
+          return new PassThrough().end('{"stream":"Built image."}\n');
+        });
+      try {
+        const base = await docker.getImage(config.image).inspect();
+        const hash = createHash("sha256")
+          .update(JSON.stringify([base.Id, ["hello"]]))
+          .digest("hex");
+        const budget = 64 * 1024 ** 2;
+        await db.query(
+          "INSERT INTO project_images(project_id,hash,state,failed_budget_bytes) VALUES($1,$2,'failed',$3)",
+          [project, hash, budget],
+        );
+        await db.query(
+          "UPDATE projects SET package_image_requested_at=NULL WHERE id=$1",
+          [project],
+        );
+        expect(
+          await findProjectImage(project, base, ["hello"], budget),
+        ).toBeUndefined();
+        expect(await queuedImageAt(project)).toBeNull();
+
+        const other = await newProject();
+        await addProjectPackage(other, "hello");
+        await builder.tick();
+        const ready = await vi.waitFor(async () => {
+          const state = await imageState(other);
+          expect(state?.state).toBe("ready");
+          return state;
+        });
+        expect(build).toHaveBeenCalledTimes(1);
+        const labels = build.mock.calls[0][1]!.labels!;
+        daemon.complete({
+          ...labels,
+          "ai.workspace.base-image": "sha256:" + "d".repeat(64),
+        });
+        expect(
+          await findProjectImage(project, base, ["hello"], budget),
+        ).toBeUndefined();
+        expect(await queuedImageAt(project)).toBeNull();
+        daemon.complete(labels, ready.image_id, base.Size + budget + 1);
+        expect(
+          await findProjectImage(project, base, ["hello"], budget),
+        ).toBeUndefined();
+        expect(await queuedImageAt(project)).toBeNull();
+        daemon.complete(labels, ready.image_id);
+        expect(await findProjectImage(project, base, ["hello"], budget)).toBe(
+          ready.image_id,
+        );
+        expect(await queuedImageAt(project)).toBeInstanceOf(Date);
+        await vi.waitFor(async () => {
+          await builder.tick();
+          expect(await imageState(project)).toMatchObject({
+            state: "ready",
+            image_id: ready.image_id,
+            failed_budget_bytes: null,
+          });
+        });
+        expect(await queuedImageAt(project)).toBeNull();
+        expect(build).toHaveBeenCalledTimes(1);
+
+        const oversizedId = "sha256:" + "e".repeat(64);
+        await db.query(
+          "UPDATE project_images SET image_id=$2 WHERE project_id=$1",
+          [project, oversizedId],
+        );
+        daemon.get.mockImplementationOnce((candidate) => {
+          expect(candidate).toBe(oversizedId);
+          return {
+            inspect: async () => ({
+              Id: oversizedId,
+              Size: base.Size + budget + 1,
+              Config: { User: "node", Labels: labels },
+            }),
+          } as unknown as Docker.Image;
+        });
+        expect(await findProjectImage(project, base, ["hello"], budget)).toBe(
+          ready.image_id,
+        );
+        expect(await queuedImageAt(project)).toBeInstanceOf(Date);
+        await vi.waitFor(async () => {
+          await builder.tick();
+          expect((await imageState(project)).image_id).toBe(ready.image_id);
+        });
+        expect(await queuedImageAt(project)).toBeNull();
+        expect(build).toHaveBeenCalledTimes(1);
+      } finally {
+        await builder.stop();
+        build.mockRestore();
+        daemon.restore();
+      }
+    });
+
+    it("rebuilds an invalid project image under the expected tag", async () => {
+      const project = await newProject();
+      const builder = new ProjectImageBuilds();
+      const daemon = mockImageDaemon();
+      const build = vi
+        .spyOn(docker, "buildImage")
+        .mockImplementation(async (_context, options) => {
+          daemon.complete(options!.labels!);
+          return new PassThrough().end('{"stream":"Built image."}\n');
+        });
+      try {
+        await addProjectPackage(project, "hello");
+        const base = await docker.getImage(config.image).inspect();
+        const hash = createHash("sha256")
+          .update(JSON.stringify([base.Id, ["hello"]]))
+          .digest("hex");
+        const owner = createHash("sha256").update(config.data).digest("hex");
+        const tag = managedImageTag(hash, owner);
+        const staleImage = "sha256:" + "c".repeat(64);
+        daemon.complete(
+          {
+            "ai.workspace.instance": config.data,
+            "ai.workspace.env-owner": owner,
+            "ai.workspace.env-hash": hash,
+            "ai.workspace.base-image": "sha256:" + "d".repeat(64),
+            "ai.workspace.runner.package-installer": "1",
+          },
+          staleImage,
+        );
+        expect((await docker.getImage(tag).inspect()).Id).toBe(staleImage);
+
+        await builder.tick();
+        const ready = await vi.waitFor(async () => {
+          const state = await imageState(project);
+          expect(state?.state, state?.log).toBe("ready");
+          return state;
+        });
+        expect(build).toHaveBeenCalledExactlyOnceWith(
+          expect.anything(),
+          expect.objectContaining({ t: tag }),
+        );
+        expect(ready).toMatchObject({
+          hash,
+          image_id: "sha256:" + "b".repeat(64),
+          error: null,
+        });
+        expect((await docker.getImage(tag).inspect()).Id).toBe(ready.image_id);
+        expect(await queuedImageAt(project)).toBeNull();
+      } finally {
+        await builder.stop();
+        build.mockRestore();
         daemon.restore();
       }
     });

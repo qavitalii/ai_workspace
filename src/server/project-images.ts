@@ -3,17 +3,21 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import Docker from "dockerode";
-import { packageBudgets } from "../runner/package-disk.js";
+import { packageBudgetError, packageBudgets } from "../runner/package-disk.js";
 import { projectPackageNames } from "../runner/package-request.js";
-import { config } from "./config.js";
+import { config, GiB } from "./config.js";
 import { db, transaction } from "./db.js";
 import { docker } from "./docker.js";
+import {
+  measureProjectEnv,
+  ProjectEnvMeasurementError,
+} from "./project-env.js";
 import {
   pendingProjectPackageNames,
   projectPackagePresets,
 } from "./project-packages.js";
 import { redact } from "./security.js";
-import { concurrentTasks } from "./settings.js";
+import { concurrentTasks, projectEnvLimitGib } from "./settings.js";
 
 const installerLabel = "ai.workspace.runner.package-installer";
 const builderLabel = "ai.workspace.runner.project-image-builder";
@@ -53,6 +57,100 @@ function imageTag(hash: string, instance: string) {
   return `ai-workspace-env:${hash.slice(0, 12)}-${sha256(instance).slice(0, 12)}`;
 }
 
+function imageLabels(base: string, hash: string) {
+  return {
+    [instanceLabel]: config.data,
+    [ownerLabel]: sha256(config.data),
+    [hashLabel]: hash,
+    [baseLabel]: base,
+    [installerLabel]: "1",
+  };
+}
+
+function matchesProjectImage(
+  image: Docker.ImageInspectInfo | null,
+  base: string,
+  hash: string,
+) {
+  return (
+    image?.Config?.User === "node" &&
+    Object.entries(imageLabels(base, hash)).every(
+      ([name, value]) => image.Config.Labels?.[name] === value,
+    )
+  );
+}
+
+export function supportsProjectImages(base: Docker.ImageInspectInfo) {
+  return base.Config?.Labels?.[builderLabel] === "1";
+}
+
+export async function queueProjectImage(projectId: string) {
+  // Keep the original queue position and leave an active build's request intact.
+  await db.query(
+    `UPDATE projects SET package_image_requested_at=clock_timestamp()
+     WHERE id=$1 AND package_image_requested_at IS NULL`,
+    [projectId],
+  );
+}
+
+export async function findProjectImage(
+  projectId: string,
+  base: Docker.ImageInspectInfo,
+  packages: Iterable<string>,
+  budget: number,
+) {
+  const hash = imageHash(base.Id, packages);
+  const { rows } = await db.query<{
+    image_id: string | null;
+    state: "building" | "ready" | "failed";
+    failed_budget_bytes: string | null;
+    failed_env_measurement: boolean;
+  }>(
+    "SELECT image_id,state,failed_budget_bytes,failed_env_measurement FROM project_images WHERE project_id=$1 AND hash=$2",
+    [projectId, hash],
+  );
+  const cached = rows[0];
+  const id = cached?.state === "ready" ? cached.image_id : null;
+  const candidates = [
+    ...(id && imageIdPattern.test(id) && id !== base.Id ? [id] : []),
+    imageTag(hash, config.data),
+  ];
+  let oversized = false;
+  for (const candidate of candidates) {
+    const image = await inspectImage(candidate);
+    if (
+      image &&
+      imageIdPattern.test(image.Id) &&
+      image.Id !== base.Id &&
+      (candidate !== id || image.Id === id) &&
+      matchesProjectImage(image, base.Id, hash)
+    ) {
+      // Only the additional layers count towards project storage. A shared
+      // image can fit even when this project's build needed too much APT space.
+      const bytes = image.Size - base.Size;
+      if (Number.isSafeInteger(bytes) && bytes >= 0) {
+        if (bytes > budget) {
+          oversized = true;
+          continue;
+        }
+        // Publish the shared image for this project on the next worker tick.
+        // The queued package list also protects it from image cleanup.
+        if (candidate !== id) await queueProjectImage(projectId);
+        return image.Id;
+      }
+    }
+  }
+  if (oversized) return;
+  // Launches only reach selection after successfully measuring /env. Retry a
+  // failed measurement now that the environment is readable again.
+  if (cached?.state === "failed" && !cached.failed_env_measurement) {
+    if (cached.failed_budget_bytes === null) return;
+    const buildBudget = Math.min(budget, packageBudgets(process.env).run);
+    if (buildBudget <= Number(cached.failed_budget_bytes)) return;
+  }
+  await queueProjectImage(projectId);
+}
+
 async function inspectImage(tag: string) {
   try {
     return await imageDocker.getImage(tag).inspect();
@@ -81,6 +179,7 @@ async function buildImage(
   base: string,
   packages: string[],
   concurrency: number,
+  budget: number,
   labels: Record<string, string>,
   signal: AbortSignal,
   appendLog: (text: string) => void,
@@ -91,7 +190,6 @@ async function buildImage(
     throw new Error("Invalid project Debian package list.");
 
   const names = packages.map((name) => `'${name}'`).join(" ");
-  const { run: budget } = packageBudgets(process.env);
   signal.throwIfAborted();
   const dockerfile = [
     `FROM ${base}`,
@@ -410,16 +508,11 @@ export class ProjectImageBuilds {
     const instance = config.data;
     // Separate installations may share a Docker daemon and runner base.
     const tag = imageTag(hash, instance);
-    const labels = {
-      [instanceLabel]: instance,
-      [ownerLabel]: sha256(instance),
-      [hashLabel]: hash,
-      [baseLabel]: base,
-      [installerLabel]: "1",
-    };
+    const labels = imageLabels(base, hash);
     let imageId: string | null = null;
     let created: string | null = null;
     let failure: string | null = null;
+    let failedBudget: number | null = null;
     let log = "";
     const appendLog = (text: string) => {
       log = (log + redact(text.replaceAll("\0", ""))).slice(-maxLogLength);
@@ -427,7 +520,11 @@ export class ProjectImageBuilds {
     if (signal.aborted) return;
     const supported = baseLabels?.[builderLabel] === "1";
     let image = supported ? await inspectImage(tag) : null;
+    if (!matchesProjectImage(image, base, hash)) image = null;
     let concurrency = 0;
+    let runBudget = 0;
+    let budget = 0;
+    let measurementFailure: ProjectEnvMeasurementError | undefined;
     if (supported && !image && !signal.aborted) {
       concurrency = await concurrentTasks();
       const { rowCount } = await db.query(
@@ -435,25 +532,59 @@ export class ProjectImageBuilds {
          SELECT id,$3,'building' FROM projects
          WHERE id=$1 AND package_image_requested_at=$2::timestamptz
          FOR NO KEY UPDATE
-         ON CONFLICT(project_id) DO UPDATE SET hash=$3,state='building',image_id=NULL,error=NULL,log='',built_at=NULL`,
+         ON CONFLICT(project_id) DO UPDATE SET hash=$3,state='building',image_id=NULL,error=NULL,log='',built_at=NULL,failed_budget_bytes=NULL,failed_env_measurement=false`,
         [projectId, request.requestedAt, hash],
       );
       if (!rowCount) return;
+      // Preparation failures leave the request pending for the worker retry.
+      // Measurement failures clear the request so other projects can proceed.
+      // A later launch can queue it again after a successful measurement.
+      const [envBytes, limitGib] = await Promise.all([
+        measureProjectEnv(projectId, { fresh: true, image: base }).catch(
+          (error) => {
+            if (!(error instanceof ProjectEnvMeasurementError)) throw error;
+            measurementFailure = error;
+            return 0;
+          },
+        ),
+        projectEnvLimitGib(),
+      ]);
+      const projectLimit = Math.round(limitGib * GiB);
+      const { run, preset } = packageBudgets(process.env, projectLimit);
+      runBudget = run;
+      budget = Math.min(run, preset, projectLimit - envBytes);
+      if (signal.aborted || (await foregroundBusy())) return;
     }
     try {
       signal.throwIfAborted();
+      if (measurementFailure) throw measurementFailure;
       if (!supported)
         throw new Error(
           "The runner image does not support building project images.",
         );
       if (!image) {
+        if (budget <= 0) {
+          failedBudget = 0;
+          throw new Error(
+            "No project tool storage is available for Debian packages.",
+          );
+        }
+        // The runner reserves its build budget per slot. Round up to preserve
+        // the full run budget for each foreground slot when the build cap is lower.
+        const buildBudget = BigInt(budget);
+        const reservedSlots =
+          (BigInt(concurrency) * BigInt(runBudget) + buildBudget - 1n) /
+          buildBudget;
+        if (reservedSlots >= BigInt(Number.MAX_SAFE_INTEGER))
+          throw new Error("The project image disk reservation is too large.");
         const timeout = AbortSignal.timeout(buildTimeout);
         try {
           await buildImage(
             tag,
             base,
             packages,
-            concurrency,
+            Number(reservedSlots),
+            budget,
             labels,
             AbortSignal.any([signal, timeout]),
             appendLog,
@@ -461,6 +592,10 @@ export class ProjectImageBuilds {
         } catch (error) {
           if (timeout.aborted)
             throw new Error("The project image build timed out.");
+          // The installer in the base image reports its budget rejection in
+          // the Docker build stream. Other build errors require a manual retry.
+          if (log.includes(packageBudgetError("run", budget)))
+            failedBudget = budget;
           throw error;
         }
       } else {
@@ -482,13 +617,7 @@ export class ProjectImageBuilds {
       // An Engine error here leaves the request pending so the next tick can
       // inspect and reuse the already-built image.
       image ??= await inspectImage(tag);
-      const imageLabels = image?.Config?.Labels;
-      if (
-        image?.Config?.User === "node" &&
-        Object.entries(labels).every(
-          ([name, value]) => imageLabels?.[name] === value,
-        )
-      ) {
+      if (image && matchesProjectImage(image, base, hash)) {
         imageId = image.Id;
         created = image.Created;
       } else {
@@ -502,9 +631,9 @@ export class ProjectImageBuilds {
       // A package edit locks the same project and supersedes the old request.
       if (!(await clearRequest(c, request))) return;
       await c.query(
-        `INSERT INTO project_images(project_id,hash,image_id,state,error,log,built_at)
-         VALUES($1,$2,$3,$4,$5,$6,$7)
-         ON CONFLICT(project_id) DO UPDATE SET hash=$2,image_id=$3,state=$4,error=$5,log=$6,built_at=$7
+        `INSERT INTO project_images(project_id,hash,image_id,state,error,log,built_at,failed_budget_bytes,failed_env_measurement)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
+         ON CONFLICT(project_id) DO UPDATE SET hash=$2,image_id=$3,state=$4,error=$5,log=$6,built_at=$7,failed_budget_bytes=$8,failed_env_measurement=$9
          WHERE project_images.state<>'ready' OR project_images.hash<>$2 OR project_images.image_id IS DISTINCT FROM $3`,
         [
           projectId,
@@ -514,6 +643,8 @@ export class ProjectImageBuilds {
           failure,
           log,
           created,
+          failedBudget,
+          Boolean(measurementFailure),
         ],
       );
     });

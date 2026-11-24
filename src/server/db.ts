@@ -74,6 +74,8 @@ CREATE TABLE IF NOT EXISTS project_images(
   log text NOT NULL DEFAULT '',
   built_at timestamptz
 );
+ALTER TABLE project_images ADD COLUMN IF NOT EXISTS failed_budget_bytes bigint;
+ALTER TABLE project_images ADD COLUMN IF NOT EXISTS failed_env_measurement boolean NOT NULL DEFAULT false;
 CREATE TABLE IF NOT EXISTS ssh_links(id uuid PRIMARY KEY,server_id uuid NOT NULL REFERENCES ssh_servers(id) ON DELETE CASCADE,project_id uuid REFERENCES projects(id) ON DELETE CASCADE,chat_id uuid REFERENCES chats(id) ON DELETE CASCADE,CHECK((project_id IS NULL) <> (chat_id IS NULL)));
 CREATE UNIQUE INDEX IF NOT EXISTS ssh_link_project ON ssh_links(project_id,server_id) WHERE project_id IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS ssh_link_chat ON ssh_links(chat_id,server_id) WHERE chat_id IS NOT NULL;

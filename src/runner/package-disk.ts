@@ -125,11 +125,7 @@ export function diskLimitError(
   mode: InstallMode = "run",
 ): string | undefined {
   const budget = budgets[mode];
-  if (requested > budget - used) {
-    const label = mode === "run" ? "run" : "preset";
-    const size = budget === packageRunBudget ? "1 GiB" : `${budget} bytes`;
-    return `This installation would exceed the ${size} system-package budget for this ${label}.`;
-  }
+  if (requested > budget - used) return packageBudgetError(mode, budget);
   if (!requested) return;
   const peerBudget =
     BigInt(budgets.run) +
@@ -138,4 +134,9 @@ export function diskLimitError(
     BigInt(filesystemReserve) + BigInt(concurrency - 1) * peerBudget;
   if (available < reserve + BigInt(requested))
     return "Not enough space on the Docker disk to install system packages and keep space available for other tasks.";
+}
+
+export function packageBudgetError(mode: InstallMode, budget: number) {
+  const size = budget === packageRunBudget ? "1 GiB" : `${budget} bytes`;
+  return `This installation would exceed the ${size} system-package budget for this ${mode}.`;
 }

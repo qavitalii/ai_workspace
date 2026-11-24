@@ -10,6 +10,8 @@ import { docker } from "./docker.js";
 import { removeDockerResource } from "./docker-cleanup.js";
 import { projectEnvLimitGib } from "./settings.js";
 
+export class ProjectEnvMeasurementError extends Error {}
+
 const bundledSystemPath =
   "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const projectBinaries = [
@@ -93,7 +95,9 @@ async function measureDirectory(source: string, image: string) {
     await container.start();
     timeout = setTimeout(() => void container.kill().catch(() => {}), 30_000);
     if ((await container.wait()).StatusCode !== 0)
-      throw new Error("Project environment measurement failed");
+      throw new ProjectEnvMeasurementError(
+        "Project environment measurement failed",
+      );
     const output = await container.logs({
       stdout: true,
       stderr: false,
@@ -102,7 +106,9 @@ async function measureDirectory(source: string, image: string) {
     const match = /^(\d+)\t\/env$/.exec(output.toString().trim());
     const bytes = match ? Number(match[1]) : NaN;
     if (!Number.isSafeInteger(bytes))
-      throw new Error("Invalid project environment measurement");
+      throw new ProjectEnvMeasurementError(
+        "Invalid project environment measurement",
+      );
     return bytes;
   } finally {
     clearTimeout(timeout);
@@ -125,7 +131,9 @@ export async function measureProjectEnv(
   });
   if (!directory) return 0;
   if (!directory.isDirectory())
-    throw new Error("Invalid project environment directory");
+    throw new ProjectEnvMeasurementError(
+      "Invalid project environment directory",
+    );
   if (!fresh) {
     const { rows } = await db.query(
       "SELECT env_size_bytes FROM projects WHERE id=$1 AND env_measured_at >= now() - interval '30 seconds'",
