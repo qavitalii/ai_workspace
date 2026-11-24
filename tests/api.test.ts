@@ -157,8 +157,14 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
       ).rows[0];
     }
 
+    function managedImageTag(hash: string, owner: string) {
+      return `ai-workspace-env:${hash.slice(0, 12)}-${owner.slice(0, 12)}`;
+    }
+
     function mockImageDaemon() {
-      let built: Partial<Docker.ImageInspectInfo> | undefined;
+      const built = new Map<string, Partial<Docker.ImageInspectInfo>>();
+      let baseId = "sha256:" + "a".repeat(64);
+      let baseInspectError: Error | undefined;
       let inspectError: Error | undefined;
       const realGetImage = Docker.prototype.getImage;
       const list = vi
@@ -169,18 +175,21 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
         .mockImplementation(function (this: Docker, name) {
           const image = realGetImage.call(this, name);
           const inspect = vi.spyOn(image, "inspect");
-          if (name === config.image)
+          const cached = built.get(name);
+          if (name === config.image && baseInspectError)
+            inspect.mockRejectedValue(baseInspectError);
+          else if (name === config.image)
             inspect.mockResolvedValue({
-              Id: "sha256:" + "a".repeat(64),
+              Id: baseId,
               Config: {
                 Labels: { "ai.workspace.runner.project-image-builder": "1" },
               },
             } as unknown as Docker.ImageInspectInfo);
-          else if (built && inspectError) {
+          else if (cached && inspectError) {
             inspect.mockRejectedValue(inspectError);
             inspectError = undefined;
-          } else if (built)
-            inspect.mockResolvedValue(built as Docker.ImageInspectInfo);
+          } else if (cached)
+            inspect.mockResolvedValue(cached as Docker.ImageInspectInfo);
           else
             inspect.mockRejectedValue(
               Object.assign(new Error("Image not found"), { statusCode: 404 }),
@@ -189,15 +198,28 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
         });
       return {
         get,
-        complete(labels: Record<string, string>) {
-          built = {
-            Id: "sha256:" + "b".repeat(64),
+        replaceBase(id: string) {
+          baseId = id;
+        },
+        failBaseInspect(error: Error) {
+          baseInspectError = error;
+        },
+        complete(
+          labels: Record<string, string>,
+          id = "sha256:" + "b".repeat(64),
+        ) {
+          const tag = managedImageTag(
+            labels["ai.workspace.env-hash"],
+            labels["ai.workspace.env-owner"],
+          );
+          built.set(tag, {
+            Id: id,
             Created: new Date().toISOString(),
             Config: {
               User: "node",
               Labels: labels,
             } as Docker.ImageInspectInfo["Config"],
-          };
+          });
         },
         failNextBuiltImageInspect(error: Error) {
           inspectError = error;
@@ -689,7 +711,145 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
       }
     });
 
-    it("removes unreferenced layers in order and preserves images for pending projects", async () => {
+    it.each([{ statusCode: 503 }, { code: "ECONNRESET" }])(
+      "keeps the build queued after a transient Docker failure (%j)",
+      async (details) => {
+        const project = await newProject();
+        await addProjectPackage(project, "hello");
+        const builder = new ProjectImageBuilds();
+        const daemon = mockImageDaemon();
+        const log = vi.spyOn(console, "error").mockImplementation(() => {});
+        const now = Date.now.bind(Date);
+        const clock = vi.spyOn(Date, "now");
+        const build = vi
+          .spyOn(docker, "buildImage")
+          .mockRejectedValueOnce(
+            Object.assign(new Error("Build connection failed"), details),
+          )
+          .mockImplementation(async (_context, options) => {
+            daemon.complete(options!.labels!);
+            return new PassThrough().end('{"stream":"Built image."}\n');
+          });
+        try {
+          await builder.tick();
+          await vi.waitFor(() =>
+            expect(log).toHaveBeenCalledWith(
+              "Project image build failed:",
+              expect.stringContaining("Build connection failed"),
+            ),
+          );
+          expect((await imageState(project)).state).toBe("building");
+          await builder.tick();
+          expect(build).toHaveBeenCalledTimes(1);
+          clock.mockImplementation(() => now() + 10_000);
+          await vi.waitFor(async () => {
+            await builder.tick();
+            expect((await imageState(project)).state).toBe("ready");
+          });
+          expect(build).toHaveBeenCalledTimes(2);
+        } finally {
+          await builder.stop();
+          build.mockRestore();
+          clock.mockRestore();
+          log.mockRestore();
+          daemon.restore();
+        }
+      },
+    );
+
+    it("rebuilds a ready project when the base runner tag changes while idle", async () => {
+      const project = await newProject();
+      await addProjectPackage(project, "hello");
+      const builder = new ProjectImageBuilds();
+      const daemon = mockImageDaemon();
+      const nextBase = "sha256:" + "c".repeat(64);
+      const nextImage = "sha256:" + "d".repeat(64);
+      const now = Date.now.bind(Date);
+      const clock = vi.spyOn(Date, "now");
+      const build = vi
+        .spyOn(docker, "buildImage")
+        .mockImplementation(async (_context, options) => {
+          const labels = options!.labels!;
+          daemon.complete(
+            labels,
+            labels["ai.workspace.base-image"] === nextBase
+              ? nextImage
+              : undefined,
+          );
+          return new PassThrough().end('{"stream":"Built image."}\n');
+        });
+      try {
+        await builder.tick();
+        const original = await vi.waitFor(async () => {
+          const state = await imageState(project);
+          expect(state?.state).toBe("ready");
+          return state;
+        });
+        await builder.tick();
+        expect(build).toHaveBeenCalledTimes(1);
+
+        daemon.replaceBase(nextBase);
+        clock.mockImplementation(() => now() + 120_000);
+        await vi.waitFor(async () => {
+          await builder.tick();
+          expect(await imageState(project)).toMatchObject({
+            state: "ready",
+            image_id: nextImage,
+          });
+        });
+        expect((await imageState(project)).hash).not.toBe(original.hash);
+        expect(build).toHaveBeenCalledTimes(2);
+      } finally {
+        await builder.stop();
+        build.mockRestore();
+        clock.mockRestore();
+        daemon.restore();
+      }
+    });
+
+    it("clears an empty package request even when Docker inspection fails", async () => {
+      const project = await newProject();
+      await addProjectPackage(project, "hello");
+      await db.query(
+        "INSERT INTO project_images(project_id,hash,image_id,state) VALUES($1,'previous','image','ready')",
+        [project],
+      );
+      expect(
+        (
+          await app.inject({
+            method: "DELETE",
+            url: `/api/projects/${project}/packages/hello`,
+            headers,
+          })
+        ).statusCode,
+      ).toBe(200);
+      const builder = new ProjectImageBuilds();
+      const daemon = mockImageDaemon();
+      const log = vi.spyOn(console, "error").mockImplementation(() => {});
+      daemon.failBaseInspect(
+        Object.assign(new Error("Docker temporarily unavailable"), {
+          statusCode: 503,
+        }),
+      );
+      try {
+        await builder.tick();
+        expect(await imageState(project)).toBeUndefined();
+        expect(
+          (
+            await db.query(
+              "SELECT package_image_requested_at FROM projects WHERE id=$1",
+              [project],
+            )
+          ).rows[0].package_image_requested_at,
+        ).toBeNull();
+      } finally {
+        await builder.stop();
+        log.mockRestore();
+        daemon.restore();
+      }
+    });
+
+    it("preserves ready and reusable pending image chains and removes detached layers", async () => {
       const builder = new ProjectImageBuilds();
       const baseId = "sha256:" + "a".repeat(64);
       const layerId = "sha256:" + "b".repeat(64);
@@ -700,10 +860,10 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
         .update(JSON.stringify([baseId, ["hello", "jq"]]))
         .digest("hex");
       const owner = createHash("sha256").update(config.data).digest("hex");
-      const tag = `ai-workspace-env:${orphanHash.slice(0, 12)}-${owner.slice(0, 12)}`;
+      const tag = managedImageTag(orphanHash, owner);
       const project = await newProject();
       await db.query(
-        "INSERT INTO project_images(project_id,hash,state) VALUES($1,$2,'ready')",
+        "INSERT INTO project_images(project_id,hash,image_id,state) VALUES($1,$2,'shared','ready')",
         [project, referencedHash],
       );
       const pending = await newProject();
@@ -737,9 +897,15 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
           image(layerId, baseId, orphanHash),
           image(taggedId, layerId, orphanHash, [tag]),
           image(baseId, "", orphanHash),
-          image("shared", baseId, referencedHash),
+          image("shared", "shared-layer", referencedHash),
+          image("shared-layer", baseId, referencedHash),
+          image("detached-ready-layer", baseId, referencedHash),
           image("foreign", baseId, orphanHash, ["manual:keep"]),
-          image("pending", baseId, pendingHash),
+          image("pending", "pending-layer", pendingHash, [
+            managedImageTag(pendingHash, owner),
+          ]),
+          image("pending-layer", baseId, pendingHash),
+          image("detached-pending-layer", baseId, pendingHash),
         ]);
       const remove = vi.fn().mockResolvedValue([]);
       const get = vi.spyOn(Docker.prototype, "getImage").mockImplementation(
@@ -751,7 +917,12 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
       );
       try {
         await builder.tick();
-        expect(remove.mock.calls).toEqual([[tag], [layerId]]);
+        expect(remove.mock.calls).toEqual([
+          [tag],
+          [layerId],
+          ["detached-ready-layer"],
+          ["detached-pending-layer"],
+        ]);
       } finally {
         await builder.stop();
         get.mockRestore();

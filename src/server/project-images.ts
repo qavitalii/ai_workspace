@@ -27,6 +27,17 @@ const maxBuildEventLength = 1024 * 1024;
 const buildTimeout = 5 * 60_000;
 const retryDelay = 5_000;
 const pruneInterval = 60_000;
+const transientDockerCodes = new Set([
+  "EAI_AGAIN",
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "ENOENT",
+  "EPIPE",
+  "ERR_STREAM_PREMATURE_CLOSE",
+  "ETIMEDOUT",
+]);
 const inspectOptions = { connectionTimeout: 10_000, timeout: 10_000 };
 const imageDocker = new Docker(inspectOptions);
 
@@ -49,6 +60,20 @@ async function inspectImage(tag: string) {
     if (error.statusCode !== 404) throw error;
     return null;
   }
+}
+
+function isTransientDockerError(error: unknown) {
+  if (!(error instanceof Error)) return false;
+  const { statusCode, code } = error as Error & {
+    statusCode?: number;
+    code?: string;
+  };
+  return (
+    statusCode === 408 ||
+    statusCode === 429 ||
+    (statusCode !== undefined && statusCode >= 500 && statusCode < 600) ||
+    (code !== undefined && transientDockerCodes.has(code))
+  );
 }
 
 async function buildImage(
@@ -142,7 +167,7 @@ async function clearRequest(
   return !!rowCount;
 }
 
-async function pruneProjectImages(signal: AbortSignal) {
+async function pruneProjectImages(baseId: string, signal: AbortSignal) {
   const instance = config.data;
   const owner = sha256(instance);
   const images = await imageDocker.listImages({
@@ -152,25 +177,46 @@ async function pruneProjectImages(signal: AbortSignal) {
   });
   if (!images.length) return;
   signal.throwIfAborted();
-  const base = await inspectImage(config.image);
-  const { rows } = await db.query<{ hash: string }>(
-    "SELECT hash FROM project_images WHERE state IN ('building','ready')",
+  const { rows } = await db.query<{
+    hash: string;
+    image_id: string | null;
+    state: "building" | "ready";
+  }>(
+    "SELECT hash,image_id,state FROM project_images WHERE state IN ('building','ready')",
   );
-  const retained = new Set(rows.map(({ hash }) => hash));
-  if (base) {
-    for (const names of await pendingProjectPackageNames()) {
-      if (names.length) retained.add(imageHash(base.Id, names));
+  const pending = new Set<string>();
+  const retained = new Set<string>();
+  const byId = new Map(images.map((image) => [image.Id, image]));
+  function retain(id: string) {
+    while (id && !retained.has(id)) {
+      retained.add(id);
+      id = byId.get(id)?.ParentId ?? "";
     }
+  }
+  retain(baseId);
+  for (const { hash, image_id, state } of rows) {
+    if (state === "building") pending.add(hash);
+    if (image_id) retain(image_id);
+  }
+  for (const names of await pendingProjectPackageNames()) {
+    if (names.length) pending.add(imageHash(baseId, names));
+  }
+  // A request can reuse a tagged image left by an interrupted build. An
+  // untagged layer with the same hash may belong to a different build.
+  for (const { Id, Labels, RepoTags } of images) {
+    const hash = Labels?.[hashLabel];
+    if (pending.has(hash) && RepoTags?.includes(imageTag(hash, instance)))
+      retain(Id);
   }
   const candidates = new Map(
     images
-      .filter(({ Labels }) => {
+      .filter(({ Id, Labels }) => {
         const hash = Labels?.[hashLabel];
         return (
           Labels?.[ownerLabel] === owner &&
           /^[a-f0-9]{64}$/.test(hash) &&
           imageIdPattern.test(Labels[baseLabel]) &&
-          !retained.has(hash)
+          !retained.has(Id)
         );
       })
       .map((image) => [image.Id, image]),
@@ -190,7 +236,7 @@ async function pruneProjectImages(signal: AbortSignal) {
   const ordered = [...candidates.values()].sort((a, b) => depth(b) - depth(a));
   for (const { Id, Labels, RepoTags, RepoDigests } of ordered) {
     signal.throwIfAborted();
-    if (Id === base?.Id || Id === Labels[baseLabel]) continue;
+    if (Id === Labels[baseLabel]) continue;
     const tag = imageTag(Labels[hashLabel], instance);
     const managedTag = RepoTags?.includes(tag);
     const untagged =
@@ -222,10 +268,11 @@ export class ProjectImageBuilds {
   private stopped = false;
   private retryAt = 0;
   private pruneAt = 0;
+  private baseId?: string;
 
   async recover() {
-    // Reconcile existing projects and interrupted builds against the current
-    // runner at startup. Leave any queued requests in their original order.
+    // Reconcile existing projects after startup or a runner replacement.
+    // Leave any queued requests in their original order.
     await db.query(
       `UPDATE projects p SET package_image_requested_at=clock_timestamp()
        WHERE package_image_requested_at IS NULL AND (
@@ -233,6 +280,15 @@ export class ProjectImageBuilds {
          OR EXISTS(SELECT 1 FROM project_images i WHERE i.project_id=p.id)
        )`,
     );
+  }
+
+  private async inspectBase(signal: AbortSignal) {
+    const base = await inspectImage(config.image);
+    if (base && !signal.aborted && base.Id !== this.baseId) {
+      if (this.baseId !== undefined) await this.recover();
+      this.baseId = base.Id;
+    }
+    return base;
   }
 
   async tick(allowBuild = true) {
@@ -274,10 +330,12 @@ export class ProjectImageBuilds {
       return;
     }
     if (busy) return;
+    let base: Docker.ImageInspectInfo | null | undefined;
     if (Date.now() >= this.pruneAt) {
       this.pruneAt = Date.now() + pruneInterval;
       try {
-        await pruneProjectImages(signal);
+        base = await this.inspectBase(signal);
+        if (base && !signal.aborted) await pruneProjectImages(base.Id, signal);
       } catch (error) {
         if (!signal.aborted)
           console.error("Project image cleanup failed:", redact(String(error)));
@@ -306,8 +364,9 @@ export class ProjectImageBuilds {
       this.pruneAt = 0;
       return;
     }
-    const base = await imageDocker.getImage(config.image).inspect();
+    if (base === undefined) base = await this.inspectBase(signal);
     if (signal.aborted) return;
+    if (!base) throw new Error("The Workspace runner image is missing.");
     if ((await foregroundBusy()) || signal.aborted) return;
     const hash = imageHash(base.Id, packages);
     const abort = new AbortController();
@@ -408,6 +467,8 @@ export class ProjectImageBuilds {
         appendLog("Reused an existing project image.\n");
       }
     } catch (error) {
+      if (signal.aborted) return;
+      if (isTransientDockerError(error)) throw error;
       failure = redact(
         (error instanceof Error ? error.message : String(error)).replaceAll(
           "\0",
