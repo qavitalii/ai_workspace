@@ -836,6 +836,7 @@ export async function startWorker() {
       for (let i = 0; i < capacity && !shutting; i++) {
         const j = await claim();
         if (!j) break;
+        pollProjectImages(false);
         void runJob(j);
       }
       await db.query("DELETE FROM sessions WHERE expires_at<now()");

@@ -63,6 +63,18 @@ export async function projectPackagePresets(projectId: string) {
   );
 }
 
+export async function pendingProjectPackageNames() {
+  const { rows } = await db.query<{ names: string[] }>(
+    `SELECT ARRAY(
+       SELECT pp.name FROM project_packages pp
+       WHERE pp.project_id=p.id AND NOT pp.disabled
+       ORDER BY pp.added_at,pp.name LIMIT $1
+     ) AS names FROM projects p WHERE p.package_image_requested_at IS NOT NULL`,
+    [packageLimit],
+  );
+  return rows.map(({ names }) => names.filter(validPackageName));
+}
+
 export async function recordPackagePresetResults(
   projectId: string,
   presets: ReadonlyMap<string, string>,

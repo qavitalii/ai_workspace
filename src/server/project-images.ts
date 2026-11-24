@@ -8,7 +8,10 @@ import { projectPackageNames } from "../runner/package-request.js";
 import { config } from "./config.js";
 import { db, transaction } from "./db.js";
 import { docker } from "./docker.js";
-import { projectPackagePresets } from "./project-packages.js";
+import {
+  pendingProjectPackageNames,
+  projectPackagePresets,
+} from "./project-packages.js";
 import { redact } from "./security.js";
 import { concurrentTasks } from "./settings.js";
 
@@ -148,10 +151,17 @@ async function pruneProjectImages(signal: AbortSignal) {
     abortSignal: signal,
   });
   if (!images.length) return;
+  signal.throwIfAborted();
+  const base = await inspectImage(config.image);
   const { rows } = await db.query<{ hash: string }>(
     "SELECT hash FROM project_images WHERE state IN ('building','ready')",
   );
   const retained = new Set(rows.map(({ hash }) => hash));
+  if (base) {
+    for (const names of await pendingProjectPackageNames()) {
+      if (names.length) retained.add(imageHash(base.Id, names));
+    }
+  }
   const candidates = new Map(
     images
       .filter(({ Labels }) => {
@@ -166,8 +176,6 @@ async function pruneProjectImages(signal: AbortSignal) {
       .map((image) => [image.Id, image]),
   );
   if (!candidates.size) return;
-  signal.throwIfAborted();
-  const base = await inspectImage(config.image);
   function depth(image: Docker.ImageInfo) {
     let depth = 0;
     let parent = candidates.get(image.ParentId);
@@ -200,8 +208,9 @@ async function pruneProjectImages(signal: AbortSignal) {
 }
 
 async function foregroundBusy() {
+  // The scheduler preempts builds as soon as it claims a runnable task.
   const { rows } = await db.query<{ busy: boolean }>(
-    `SELECT EXISTS(SELECT 1 FROM jobs WHERE state IN ('queued','running','waiting_approval'))
+    `SELECT EXISTS(SELECT 1 FROM jobs WHERE state IN ('running','waiting_approval'))
          OR EXISTS(SELECT 1 FROM workspace_leases WHERE kind='terminal') AS busy`,
   );
   return rows[0].busy;
@@ -209,9 +218,7 @@ async function foregroundBusy() {
 
 export class ProjectImageBuilds {
   private active?: Build;
-  private cleaning?: AbortController;
-  private polling?: Promise<void>;
-  private allowBuild = true;
+  private polling?: { abort: AbortController; done: Promise<void> };
   private stopped = false;
   private retryAt = 0;
   private pruneAt = 0;
@@ -229,10 +236,9 @@ export class ProjectImageBuilds {
   }
 
   async tick(allowBuild = true) {
-    this.allowBuild = allowBuild;
     if (!allowBuild) {
       this.active?.abort.abort();
-      this.cleaning?.abort();
+      this.polling?.abort.abort();
     }
     if (
       this.stopped ||
@@ -241,7 +247,8 @@ export class ProjectImageBuilds {
       (!this.active && Date.now() < this.retryAt)
     )
       return;
-    this.polling = this.poll()
+    const abort = new AbortController();
+    const done = this.poll(abort.signal)
       .catch((error) => {
         this.retryAt = Date.now() + retryDelay;
         throw error;
@@ -249,11 +256,13 @@ export class ProjectImageBuilds {
       .finally(() => {
         this.polling = undefined;
       });
-    await this.polling;
+    this.polling = { abort, done };
+    await done;
   }
 
-  private async poll() {
+  private async poll(signal: AbortSignal) {
     const busy = await foregroundBusy();
+    if (signal.aborted) return;
     if (this.active) {
       const { projectId, base, hash, abort } = this.active;
       if (
@@ -264,32 +273,29 @@ export class ProjectImageBuilds {
         abort.abort();
       return;
     }
-    if (busy || !this.allowBuild || this.stopped) return;
+    if (busy) return;
     if (Date.now() >= this.pruneAt) {
       this.pruneAt = Date.now() + pruneInterval;
-      const cleanup = new AbortController();
-      this.cleaning = cleanup;
       try {
-        await pruneProjectImages(cleanup.signal);
+        await pruneProjectImages(signal);
       } catch (error) {
-        if (!cleanup.signal.aborted)
+        if (!signal.aborted)
           console.error("Project image cleanup failed:", redact(String(error)));
-      } finally {
-        this.cleaning = undefined;
       }
     }
-    if (!this.allowBuild || this.stopped) return;
+    if (signal.aborted) return;
     const { rows } = await db.query<ImageRequest>(
       `SELECT id AS "projectId",package_image_requested_at::text AS "requestedAt"
        FROM projects WHERE package_image_requested_at IS NOT NULL
        ORDER BY package_image_requested_at,id LIMIT 1`,
     );
     const request = rows[0];
-    if (!request || !this.allowBuild || this.stopped) return;
+    if (!request || signal.aborted) return;
     const { projectId } = request;
     const packages = [
       ...(await projectPackagePresets(projectId)).keys(),
     ].sort();
+    if (signal.aborted) return;
     if (!packages.length) {
       await transaction(async (c) => {
         if (await clearRequest(c, request))
@@ -301,7 +307,8 @@ export class ProjectImageBuilds {
       return;
     }
     const base = await imageDocker.getImage(config.image).inspect();
-    if ((await foregroundBusy()) || this.stopped || !this.allowBuild) return;
+    if (signal.aborted) return;
+    if ((await foregroundBusy()) || signal.aborted) return;
     const hash = imageHash(base.Id, packages);
     const abort = new AbortController();
     const done = this.build(
@@ -328,8 +335,8 @@ export class ProjectImageBuilds {
   async stop() {
     this.stopped = true;
     this.active?.abort.abort();
-    this.cleaning?.abort();
-    await Promise.allSettled([this.polling, this.active?.done]);
+    this.polling?.abort.abort();
+    await Promise.allSettled([this.polling?.done, this.active?.done]);
   }
 
   private async build(
@@ -397,21 +404,9 @@ export class ProjectImageBuilds {
             throw new Error("The project image build timed out.");
           throw error;
         }
-        image = await inspectImage(tag);
       } else {
         appendLog("Reused an existing project image.\n");
       }
-      const imageLabels = image?.Config.Labels;
-      if (
-        !image ||
-        image.Config.User !== "node" ||
-        Object.entries(labels).some(
-          ([name, value]) => imageLabels?.[name] !== value,
-        )
-      )
-        throw new Error("Docker did not return the expected project image.");
-      imageId = image.Id;
-      created = image.Created;
     } catch (error) {
       failure = redact(
         (error instanceof Error ? error.message : String(error)).replaceAll(
@@ -419,9 +414,27 @@ export class ProjectImageBuilds {
           "",
         ),
       ).slice(-2048);
-      appendLog("\n" + failure);
     }
 
+    if (signal.aborted) return;
+    if (failure === null) {
+      // An Engine error here leaves the request pending so the next tick can
+      // inspect and reuse the already-built image.
+      image ??= await inspectImage(tag);
+      const imageLabels = image?.Config?.Labels;
+      if (
+        image?.Config?.User === "node" &&
+        Object.entries(labels).every(
+          ([name, value]) => imageLabels?.[name] === value,
+        )
+      ) {
+        imageId = image.Id;
+        created = image.Created;
+      } else {
+        failure = "Docker did not return the expected project image.";
+      }
+    }
+    if (failure) appendLog("\n" + failure);
     if (signal.aborted) return;
     await transaction(async (c) => {
       // Clearing the exact request and publishing its result commit together.
