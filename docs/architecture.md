@@ -44,6 +44,8 @@ The installer requires Landlock ABI 3 or newer in the Docker host kernel. When t
 
 Installed files live in the disposable runner container. For project chats, the server also remembers the requested package names in PostgreSQL unless automatic remembering is off. The project settings expose the list and its first successful request, including the source chat when it is still available. Manual additions and removals edit the saved list.
 
+Projects with the same base runner and Debian package list can share a cached image within an installation. The idle worker rebuilds the image when the base runner changes or the image reaches seven days old. While a replacement is pending, execution tasks can install their saved packages in the base runner. A failed build becomes eligible for another scheduled attempt after seven days. A browser update pauses image work and waits for it to finish cancelling. Cleanup retains images referenced by running or stopped containers.
+
 ## Project tools
 
 `DATA_ROOT/project-env/<project-id>` backs the `/env` mount shared by project chats, terminals and working copies. The runner adds project tool directories to the end of `PATH` and places supported user-level installations and caches under `/env`. Planning and read-only operations mount it read-only. Personal chats and account-management containers have no project environment.
