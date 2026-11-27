@@ -72,6 +72,16 @@ function imageLabels(base: string, hash: string) {
   };
 }
 
+function buildInstructions(labels: Record<string, string>, run: string | null) {
+  return [
+    // The classic builder can keep untagged layers from a completed RUN.
+    `LABEL ${ownerLabel}=${labels[ownerLabel]} ${hashLabel}=${labels[hashLabel]} ${baseLabel}=${labels[baseLabel]}`,
+    "USER root",
+    run,
+    "USER node",
+  ];
+}
+
 function matchesFreshProjectImage(
   image: Docker.ImageInspectInfo | null,
   base: string,
@@ -201,11 +211,10 @@ async function buildImage(
   signal.throwIfAborted();
   const dockerfile = [
     `FROM ${base}`,
-    // The classic builder can keep untagged layers from a completed RUN.
-    `LABEL ${ownerLabel}=${labels[ownerLabel]} ${hashLabel}=${labels[hashLabel]} ${baseLabel}=${base}`,
-    "USER root",
-    `RUN WORKSPACE_PACKAGE_RUN_BUDGET=${budget} ${installProgram} ${concurrency} ${names} && rm -rf /var/lib/apt/lists/*`,
-    "USER node",
+    ...buildInstructions(
+      labels,
+      `RUN WORKSPACE_PACKAGE_RUN_BUDGET=${budget} ${installProgram} ${concurrency} ${names} && rm -rf /var/lib/apt/lists/*`,
+    ),
     "",
   ].join("\n");
   const context = await mkdtemp(
@@ -235,9 +244,9 @@ async function buildImage(
         nocache: true,
         forcerm: true,
         labels,
-        // Keep the response open during preemption. It acknowledges the end
-        // of the daemon's build even if cancellation precedes its first RUN.
-        abortSignal: AbortSignal.any([timeout, shutdown]),
+        // Preemption and the deadline stop the installer. Keep the response
+        // open until Docker finishes, even if its first RUN is still pending.
+        abortSignal: shutdown,
       },
     );
     stream.setEncoding("utf8");
@@ -253,12 +262,14 @@ async function buildImage(
       else if (typeof event.status === "string") appendLog(event.status + "\n");
     }
     for await (const chunk of stream) {
+      if (cancel.aborted) continue;
       const lines = (partial + chunk).split("\n");
       partial = lines.pop()!;
       for (const line of lines) consume(line);
       if (partial.length > maxBuildEventLength)
         throw new Error("Docker returned an oversized build event.");
     }
+    cancel.throwIfAborted();
     consume(partial);
   } finally {
     cancel.removeEventListener("abort", onCancel);
@@ -405,6 +416,87 @@ async function pruneProjectImages(baseId: string, signal?: AbortSignal) {
   }
 }
 
+function matchesInstallCommand(command: string, base: string, hash: string) {
+  const parts = command.split(` ${installProgram} `);
+  if (
+    parts.length !== 2 ||
+    !/^WORKSPACE_PACKAGE_RUN_BUDGET=\d+$/.test(parts[0])
+  )
+    return false;
+  const args = /^\d+ '(.+)' && rm -rf \/var\/lib\/apt\/lists\/\*$/.exec(
+    parts[1],
+  );
+  const names = args && projectPackageNames(args[1].split("' '"));
+  return !!names && imageHash(base, names) === hash;
+}
+
+async function isBuildContainer(
+  info: Docker.ContainerInspectInfo,
+  base: string,
+  hash: string,
+) {
+  const { Shell } = info.Config as Docker.ContainerCreateOptions;
+  const shell = Shell?.length ? Shell : ["/bin/sh", "-c"];
+  const cmd = info.Config.Cmd ?? [];
+  if (!shell.every((arg, i) => cmd[i] === arg)) return false;
+  const args = cmd.slice(shell.length);
+  const metadata =
+    args.length === 2 &&
+    args[0] === "#(nop) " &&
+    (info.State.Status === "created" || info.State.Status === "removing");
+  if (
+    !metadata &&
+    (args.length !== 1 || !matchesInstallCommand(args[0], base, hash))
+  )
+    return false;
+
+  const labels = imageLabels(base, hash);
+  // Docker appends the build-option labels in key order after the Dockerfile.
+  const steps = [
+    ...buildInstructions(labels, null),
+    ...Object.entries(labels)
+      .map(([key, value]) => `LABEL ${key}=${value}`)
+      .sort(),
+  ];
+  const step = steps.indexOf(metadata ? args[1] : null);
+  if (step < 0) return false;
+  const history: { Id: string; CreatedBy: string }[] = await imageDocker
+    .getImage(info.Image)
+    .history()
+    .catch((error) => {
+      if (error.statusCode !== 404) throw error;
+      return [];
+    });
+  // History is newest first. Each committed ONBUILD trigger in FROM adds a
+  // layer before our first LABEL. A downstream build also contains the
+  // finished Workspace layers between its own instructions and that same ID.
+  const depth = history.findIndex(({ Id }) => Id === base);
+  if (depth < step) return false;
+  const runner = await inspectImage(base);
+  if (depth - step !== (runner?.Config?.OnBuild?.length ?? 0)) return false;
+  const prefix = shell.join(" ") + " ";
+  return history.slice(0, step).every(({ CreatedBy }, i) => {
+    const expected = steps[step - 1 - i];
+    if (expected === null) {
+      // The classic builder prepends "|N key=value ..." to a committed RUN
+      // when the base declared build arguments. Config.Cmd has no prefix.
+      const start = CreatedBy.lastIndexOf(
+        `${prefix}WORKSPACE_PACKAGE_RUN_BUDGET=`,
+      );
+      return (
+        start >= 0 &&
+        (start === 0 || /^\|\d+ [\s\S]* $/.test(CreatedBy.slice(0, start))) &&
+        matchesInstallCommand(
+          CreatedBy.slice(start + prefix.length),
+          base,
+          hash,
+        )
+      );
+    }
+    return CreatedBy === `${prefix}#(nop)  ${expected}`;
+  });
+}
+
 async function cleanBuildContainers(hash?: string) {
   const owner = sha256(config.data);
   const filter = [`${ownerLabel}=${owner}`];
@@ -428,51 +520,11 @@ async function cleanBuildContainers(hash?: string) {
       if (error.statusCode !== 404) throw error;
       return null;
     });
-    if (!info) continue;
-    // The display command includes the runner entrypoint and shell quoting.
-    // Match the builder's actual argv, including Docker's final LABEL steps.
-    const cmd = info.Config.Cmd ?? [];
-    const { Shell } = info.Config as Docker.ContainerCreateOptions;
-    const shell = Shell?.length ? Shell : ["/bin/sh", "-c"];
-    if (!shell.every((arg, i) => cmd[i] === arg)) continue;
-    const [script, instruction, ...extra] = cmd.slice(shell.length);
-    if (extra.length) continue;
-    const labels = imageLabels(Labels[baseLabel], Labels[hashLabel]);
-    const labelSteps = Object.entries(labels)
-      .map(([key, value]) => `LABEL ${key}=${value}`)
-      .sort();
-    const metadata =
-      (info.State.Status === "created" || info.State.Status === "removing") &&
-      script === "#(nop) " &&
-      (instruction === "USER node" ||
-        instruction === "USER root" ||
-        instruction ===
-          `LABEL ${ownerLabel}=${owner} ${hashLabel}=${Labels[hashLabel]} ${baseLabel}=${Labels[baseLabel]}` ||
-        labelSteps.includes(instruction));
-    const install =
-      !instruction &&
-      Labels[instanceLabel] === undefined &&
-      script?.startsWith("WORKSPACE_PACKAGE_RUN_BUDGET=") &&
-      script.includes(` ${installProgram} `);
-    if (!metadata && !install) continue;
-    if (Labels[instanceLabel] !== undefined) {
-      // Docker appends build-option labels in key order. Verify the previous
-      // layer to distinguish these steps from a build FROM a finished image.
-      const index = labelSteps.indexOf(instruction);
-      if (index < 1) continue;
-      const [parent] = await imageDocker
-        .getImage(info.Image)
-        .history()
-        .catch((error) => {
-          if (error.statusCode !== 404) throw error;
-          return [];
-        });
-      if (
-        parent?.CreatedBy !==
-        `${shell.join(" ")} #(nop)  ${labelSteps[index - 1]}`
-      )
-        continue;
-    }
+    if (
+      !info ||
+      !(await isBuildContainer(info, Labels[baseLabel], Labels[hashLabel]))
+    )
+      continue;
     await removeDockerResource(() =>
       container.remove({ force: true, v: true }),
     );

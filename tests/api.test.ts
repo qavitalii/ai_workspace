@@ -144,6 +144,21 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
   });
 
   describe("project images", () => {
+    async function removeRunnerWithTrigger(runner: string) {
+      // The test's ONBUILD layer and its anonymous volume predate Workspace's
+      // ownership LABEL. Only remove direct children of this disposable runner.
+      const filters = { label: [`ai.workspace.instance=${config.data}`] };
+      for (const item of await docker.listContainers({ all: true, filters })) {
+        if (item.ImageID === runner)
+          await docker.getContainer(item.Id).remove({ force: true, v: true });
+      }
+      for (const image of await docker.listImages({ all: true, filters })) {
+        if (image.ParentId === runner)
+          await docker.getImage(image.Id).remove({ noprune: true });
+      }
+      await docker.getImage(runner).remove();
+    }
+
     async function newProject() {
       const id = randomUUID();
       await db.query(
@@ -550,6 +565,7 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
         let container:
           Awaited<ReturnType<typeof docker.createContainer>> | undefined;
         let externalStep: Docker.Container | undefined;
+        let externalParent: string | undefined;
         const originalRunner = config.image;
         const shell = ["/bin/bash", "-o", "pipefail", "-c"];
         const volumePath = "/workspace-test-volume";
@@ -561,10 +577,13 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
           const seed = await docker.createContainer({
             Image: originalRunner,
             Shell: shell,
+            Labels: { "ai.workspace.instance": config.data },
             Volumes: { [volumePath]: {} },
           });
           try {
-            const committed = await seed.commit();
+            const committed = await seed.commit({
+              changes: ["ONBUILD ARG WORKSPACE_TEST_BUILD_ARG=yes"],
+            });
             customRunner = config.image = committed.Id;
           } finally {
             await seed.remove({ v: true });
@@ -679,10 +698,25 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
                   Command.includes("project-image-install.js"),
               ),
             ).toBe(true);
-            // A separate classic build can also use this finished image as
-            // its FROM and inherit every label, even for an identical step.
-            externalStep = await docker.createContainer({
+            // A downstream build can reapply two consecutive Workspace labels.
+            // Its immediately preceding history entry matches our own build.
+            const priorInstruction = `LABEL ai.workspace.instance=${config.data}`;
+            const priorStep = await docker.createContainer({
               Image: built.image_id,
+              Entrypoint: [],
+              Cmd: [...shell, "#(nop) ", priorInstruction],
+            });
+            try {
+              externalParent = (await priorStep.commit()).Id;
+            } finally {
+              await priorStep.remove({ v: true });
+            }
+            const [history] = await docker.getImage(externalParent!).history();
+            expect(history.CreatedBy).toBe(
+              `${shell.join(" ")} #(nop)  ${priorInstruction}`,
+            );
+            externalStep = await docker.createContainer({
+              Image: externalParent!,
               Cmd: [
                 ...shell,
                 "#(nop) ",
@@ -700,6 +734,8 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
             ).toEqual([]);
             await externalStep.remove({ v: true });
             externalStep = undefined;
+            await docker.getImage(externalParent!).remove({ noprune: true });
+            externalParent = undefined;
             await waitForDocker(async () => {
               await retry.tick();
               expect(await queuedImageAt(first)).toBeNull();
@@ -809,6 +845,8 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
           buildImage.mockRestore();
           config.image = originalRunner;
           await externalStep?.remove({ force: true, v: true });
+          if (externalParent)
+            await docker.getImage(externalParent).remove({ noprune: true });
           await container?.remove({ force: true, v: true });
           await cleanProjectImageOrphans();
           if (imageTag)
@@ -818,7 +856,7 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
               .catch((error) => {
                 if (error.statusCode !== 404) throw error;
               });
-          if (customRunner) await docker.getImage(customRunner).remove();
+          if (customRunner) await removeRunnerWithTrigger(customRunner);
         }
       },
       500_000,
@@ -859,22 +897,28 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
       }
     });
 
-    it("keeps update readiness busy until a cancelled Docker build settles and preserves its request", async () => {
+    it("keeps update readiness busy across a build timeout until Docker settles and cleanup finishes", async () => {
       const project = await newProject();
       await addProjectPackage(project, "hello");
       const builder = new ProjectImageBuilds();
       const daemon = mockImageDaemon();
       const stream = new PassThrough();
+      const deadline = new AbortController();
+      const timeout = vi
+        .spyOn(AbortSignal, "timeout")
+        .mockReturnValueOnce(deadline.signal);
       let release!: () => void;
       const removal = new Promise<void>((resolve) => {
         release = resolve;
       });
-      daemon.containers
-        .mockResolvedValueOnce([])
-        .mockImplementation(async () => {
+      let finalScanStarted = false;
+      daemon.containers.mockImplementation(async () => {
+        if (stream.readableEnded) {
+          finalScanStarted = true;
           await removal;
-          return [];
-        });
+        }
+        return [];
+      });
       const build = vi
         .spyOn(docker, "buildImage")
         .mockResolvedValueOnce(stream)
@@ -887,12 +931,17 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
         await vi.waitFor(() => expect(build).toHaveBeenCalledOnce());
         expect(builder.busy).toBe(true);
         await builder.tick(false);
+        deadline.abort();
         expect(build.mock.calls[0][1]!.abortSignal!.aborted).toBe(false);
+        // Docker can report the interrupted RUN before it finishes the request.
+        stream.write('{"error":"installer stopped"}\n');
+        await vi.waitFor(() =>
+          expect(daemon.containers.mock.calls.length).toBeGreaterThan(1),
+        );
+        expect(stream.destroyed).toBe(false);
         expect(builder.busy).toBe(true);
         stream.end();
-        await vi.waitFor(() =>
-          expect(daemon.containers).toHaveBeenCalledTimes(2),
-        );
+        await vi.waitFor(() => expect(finalScanStarted).toBe(true));
         expect(builder.busy).toBe(true);
         release();
         await vi.waitFor(() => expect(builder.busy).toBe(false));
@@ -906,38 +955,80 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
         release();
         stream.destroy();
         await builder.stop();
+        timeout.mockRestore();
+        build.mockRestore();
+        daemon.restore();
+      }
+    });
+
+    it("records a build timeout after Docker ends the response even if it ended successfully", async () => {
+      const project = await newProject();
+      await addProjectPackage(project, "hello");
+      const builder = new ProjectImageBuilds();
+      const daemon = mockImageDaemon();
+      const deadline = new AbortController();
+      const timeout = vi
+        .spyOn(AbortSignal, "timeout")
+        .mockReturnValueOnce(deadline.signal);
+      const stream = new PassThrough();
+      const build = vi.spyOn(docker, "buildImage").mockResolvedValue(stream);
+      try {
+        await builder.tick();
+        await vi.waitFor(() => expect(build).toHaveBeenCalledOnce());
+        deadline.abort();
+        await vi.waitFor(() => expect(daemon.containers).toHaveBeenCalled());
+        expect(builder.busy).toBe(true);
+        daemon.complete(build.mock.calls[0][1]!.labels!);
+        stream.end();
+        await vi.waitFor(() => expect(builder.busy).toBe(false));
+        expect(await imageState(project)).toMatchObject({
+          state: "failed",
+          error: "The project image build timed out.",
+        });
+      } finally {
+        stream.destroy();
+        await builder.stop();
+        timeout.mockRestore();
         build.mockRestore();
         daemon.restore();
       }
     });
 
     it.skipIf(process.env.DOCKER_TESTS !== "1")(
-      "drains the live classic-builder container before reporting an update ready",
+      "drains a live installer that inherits the runner's instance label before reporting an update ready",
       async () => {
         const builder = new ProjectImageBuilds();
         const project = await newProject();
         await addProjectPackage(project, "hello");
         const request = await queuedImageAt(project);
-        const build = docker.buildImage.bind(docker);
-        const buildImage = vi
-          .spyOn(docker, "buildImage")
-          .mockImplementationOnce(async (context, options) => {
-            // Hold the installer step open until the scheduler preempts it.
-            const file = path.join(
-              (context as Docker.ImageBuildContext).context,
-              "Dockerfile",
-            );
-            const contents = await readFile(file, "utf8");
-            await writeFile(
-              file,
-              contents.replace(
-                "RUN WORKSPACE_PACKAGE_RUN_BUDGET=",
-                "RUN WORKSPACE_PACKAGE_RUN_BUDGET=1 sleep 60 && WORKSPACE_PACKAGE_RUN_BUDGET=",
-              ),
-            );
-            return build(context, options);
-          });
+        const originalRunner = config.image;
+        let customRunner: string | undefined;
         try {
+          // Delay the installer inside the base so Docker executes the exact
+          // production Dockerfile against a runner with inherited labels.
+          const seed = await docker.createContainer({
+            Image: originalRunner,
+            Labels: { "ai.workspace.instance": config.data },
+            Entrypoint: ["/bin/sh", "-c"],
+            User: "root",
+            Cmd: [
+              "echo 'setTimeout(() => {}, 60000)' > /app/dist/node/runner/project-image-install.js",
+            ],
+          });
+          try {
+            await seed.start();
+            expect((await seed.wait()).StatusCode).toBe(0);
+            customRunner = config.image = (
+              await seed.commit({
+                changes: [
+                  "USER node",
+                  "ONBUILD ENV WORKSPACE_TEST_TRIGGER=yes",
+                ],
+              })
+            ).Id;
+          } finally {
+            await seed.remove({ force: true, v: true });
+          }
           await builder.tick();
           const installer = await vi.waitFor(
             async () => {
@@ -950,7 +1041,9 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
                 },
               });
               const match = running.find(({ Command }) =>
-                Command.includes("sleep 60"),
+                Command.includes(
+                  "node /app/dist/node/runner/project-image-install.js",
+                ),
               );
               expect(match).toBeDefined();
               return docker.getContainer(match!.Id);
@@ -967,8 +1060,9 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
           expect(await queuedImageAt(project)).toEqual(request);
         } finally {
           await builder.stop();
-          buildImage.mockRestore();
+          config.image = originalRunner;
           await cleanProjectImageOrphans();
+          if (customRunner) await removeRunnerWithTrigger(customRunner);
         }
       },
       60_000,
