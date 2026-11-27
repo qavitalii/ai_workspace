@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import Docker from "dockerode";
 import { packageBudgetError, packageBudgets } from "../runner/package-disk.js";
 import { projectPackageNames } from "../runner/package-request.js";
@@ -187,6 +188,8 @@ async function buildImage(
   budget: number,
   labels: Record<string, string>,
   signal: AbortSignal,
+  timeout: AbortSignal,
+  shutdown: AbortSignal,
   appendLog: (text: string) => void,
 ) {
   if (!imageIdPattern.test(base))
@@ -208,8 +211,20 @@ async function buildImage(
   const context = await mkdtemp(
     path.join(tmpdir(), "workspace-project-image-"),
   );
+  const finished = new AbortController();
+  const cancel = AbortSignal.any([signal, timeout]);
+  let draining: Promise<void> | undefined;
+  function onCancel() {
+    draining = drainCancelledBuild(
+      labels[hashLabel],
+      finished.signal,
+      shutdown,
+    );
+  }
   try {
     await writeFile(path.join(context, "Dockerfile"), dockerfile);
+    cancel.throwIfAborted();
+    cancel.addEventListener("abort", onCancel, { once: true });
     const stream = await docker.buildImage(
       { context, src: ["Dockerfile"] },
       {
@@ -220,7 +235,9 @@ async function buildImage(
         nocache: true,
         forcerm: true,
         labels,
-        abortSignal: signal,
+        // Keep the response open during preemption. It acknowledges the end
+        // of the daemon's build even if cancellation precedes its first RUN.
+        abortSignal: AbortSignal.any([timeout, shutdown]),
       },
     );
     stream.setEncoding("utf8");
@@ -244,7 +261,33 @@ async function buildImage(
     }
     consume(partial);
   } finally {
+    cancel.removeEventListener("abort", onCancel);
+    finished.abort();
+    await draining;
     await rm(context, { recursive: true, force: true });
+  }
+}
+
+async function drainCancelledBuild(
+  hash: string,
+  finished: AbortSignal,
+  shutdown: AbortSignal,
+) {
+  for (;;) {
+    // A build can create another intermediate after a scan. Do the final
+    // scan only once the build response has settled.
+    const finalScan = finished.aborted;
+    try {
+      await cleanBuildContainers(hash);
+      if (finalScan) return;
+    } catch (error) {
+      console.error("Cancelled build cleanup failed:", redact(String(error)));
+      // Startup recovers remaining containers if the daemon is offline at exit.
+      if (shutdown.aborted) return;
+      await delay(retryDelay);
+      continue;
+    }
+    await delay(100);
   }
 }
 
@@ -362,16 +405,19 @@ async function pruneProjectImages(baseId: string, signal?: AbortSignal) {
   }
 }
 
-export async function cleanProjectImageOrphans() {
+async function cleanBuildContainers(hash?: string) {
   const owner = sha256(config.data);
+  const filter = [`${ownerLabel}=${owner}`];
+  if (hash) filter.push(`${hashLabel}=${hash}`);
   // The classic builder's intermediate containers inherit the owner label.
   // Finished project images also carry it, including in external containers.
   for (const { Id, Labels, Command } of await imageDocker.listContainers({
     all: true,
-    filters: { label: [`${ownerLabel}=${owner}`] },
+    filters: { label: filter },
   })) {
     if (
       Labels?.[ownerLabel] !== owner ||
+      (hash !== undefined && Labels[hashLabel] !== hash) ||
       !imageIdPattern.test(Labels[baseLabel]) ||
       !/^[a-f0-9]{64}$/.test(Labels[hashLabel]) ||
       (!Command.includes("#(nop)") && !Command.includes(installProgram))
@@ -385,14 +431,18 @@ export async function cleanProjectImageOrphans() {
     if (!info) continue;
     // The display command includes the runner entrypoint and shell quoting.
     // Match the builder's actual argv, including Docker's final LABEL steps.
-    const [shell, flag, script, instruction, ...extra] = info.Config.Cmd ?? [];
-    if (shell !== "/bin/sh" || flag !== "-c" || extra.length) continue;
+    const cmd = info.Config.Cmd ?? [];
+    const { Shell } = info.Config as Docker.ContainerCreateOptions;
+    const shell = Shell?.length ? Shell : ["/bin/sh", "-c"];
+    if (!shell.every((arg, i) => cmd[i] === arg)) continue;
+    const [script, instruction, ...extra] = cmd.slice(shell.length);
+    if (extra.length) continue;
     const labels = imageLabels(Labels[baseLabel], Labels[hashLabel]);
     const labelSteps = Object.entries(labels)
       .map(([key, value]) => `LABEL ${key}=${value}`)
       .sort();
     const metadata =
-      info.State.Status === "created" &&
+      (info.State.Status === "created" || info.State.Status === "removing") &&
       script === "#(nop) " &&
       (instruction === "USER node" ||
         instruction === "USER root" ||
@@ -410,12 +460,27 @@ export async function cleanProjectImageOrphans() {
       // layer to distinguish these steps from a build FROM a finished image.
       const index = labelSteps.indexOf(instruction);
       if (index < 1) continue;
-      const [parent] = await imageDocker.getImage(info.Image).history();
-      if (parent?.CreatedBy !== `/bin/sh -c #(nop)  ${labelSteps[index - 1]}`)
+      const [parent] = await imageDocker
+        .getImage(info.Image)
+        .history()
+        .catch((error) => {
+          if (error.statusCode !== 404) throw error;
+          return [];
+        });
+      if (
+        parent?.CreatedBy !==
+        `${shell.join(" ")} #(nop)  ${labelSteps[index - 1]}`
+      )
         continue;
     }
-    await removeDockerResource(() => container.remove({ force: true }));
+    await removeDockerResource(() =>
+      container.remove({ force: true, v: true }),
+    );
   }
+}
+
+export async function cleanProjectImageOrphans() {
+  await cleanBuildContainers();
   // The idle worker retries image GC. Orphan container removal above must
   // finish before the scheduler can admit another build.
   try {
@@ -438,7 +503,7 @@ async function foregroundBusy() {
 export class ProjectImageBuilds {
   private active?: Build;
   private polling?: { abort: AbortController; done: Promise<void> };
-  private stopped = false;
+  private readonly shutdown = new AbortController();
   private retryAt = 0;
   private pruneAt = 0;
   private baseId?: string;
@@ -449,10 +514,13 @@ export class ProjectImageBuilds {
 
   async recover() {
     // Reconcile existing projects after startup or a runner replacement.
-    // Leave any queued requests in their original order.
+    // Keep queued requests in order. The idle scan reconciles failures once
+    // it knows whether the base changed or the weekly retry is due.
     await db.query(
       `UPDATE projects p SET package_image_requested_at=clock_timestamp()
-       WHERE package_image_requested_at IS NULL AND (
+       WHERE package_image_requested_at IS NULL AND NOT EXISTS(
+         SELECT 1 FROM project_images i WHERE i.project_id=p.id AND i.state='failed'
+       ) AND (
          EXISTS(SELECT 1 FROM project_packages pp WHERE pp.project_id=p.id AND NOT pp.disabled)
          OR EXISTS(SELECT 1 FROM project_images i WHERE i.project_id=p.id)
        )`,
@@ -474,7 +542,7 @@ export class ProjectImageBuilds {
       this.polling?.abort.abort();
     }
     if (
-      this.stopped ||
+      this.shutdown.signal.aborted ||
       !allowBuild ||
       this.polling ||
       (!this.active && Date.now() < this.retryAt)
@@ -523,9 +591,10 @@ export class ProjectImageBuilds {
             `UPDATE projects p SET package_image_requested_at=clock_timestamp()
              FROM project_images i WHERE i.project_id=p.id
              AND ((i.state='ready' AND (i.built_at IS NULL OR i.built_at <= $1))
-               OR (i.state='failed' AND i.failed_at <= $1))
+               OR (i.state='failed' AND (i.failed_at IS NULL OR i.failed_at <= $1
+                 OR i.failed_base_id IS DISTINCT FROM $2)))
              AND p.package_image_requested_at IS NULL`,
-            [new Date(Date.now() - imageMaxAge)],
+            [new Date(Date.now() - imageMaxAge), base.Id],
           );
           await pruneProjectImages(base.Id, signal);
         }
@@ -585,7 +654,7 @@ export class ProjectImageBuilds {
   }
 
   async stop() {
-    this.stopped = true;
+    this.shutdown.abort();
     this.active?.abort.abort();
     this.polling?.abort.abort();
     await Promise.allSettled([this.polling?.done, this.active?.done]);
@@ -627,7 +696,7 @@ export class ProjectImageBuilds {
          SELECT id,$3,'building' FROM projects
          WHERE id=$1 AND package_image_requested_at=$2::timestamptz
          FOR NO KEY UPDATE
-         ON CONFLICT(project_id) DO UPDATE SET hash=$3,state='building',image_id=NULL,error=NULL,log='',built_at=NULL,failed_budget_bytes=NULL,failed_env_measurement=false,failed_at=NULL`,
+         ON CONFLICT(project_id) DO UPDATE SET hash=$3,state='building',image_id=NULL,error=NULL,log='',built_at=NULL,failed_budget_bytes=NULL,failed_env_measurement=false,failed_at=NULL,failed_base_id=NULL`,
         [projectId, request.requestedAt, hash],
       );
       if (!rowCount) return;
@@ -681,7 +750,9 @@ export class ProjectImageBuilds {
             Number(reservedSlots),
             budget,
             labels,
-            AbortSignal.any([signal, timeout]),
+            signal,
+            timeout,
+            this.shutdown.signal,
             appendLog,
           );
         } catch (error) {
@@ -727,9 +798,9 @@ export class ProjectImageBuilds {
       // A package edit locks the same project and supersedes the old request.
       if (!(await clearRequest(c, request))) return;
       await c.query(
-        `INSERT INTO project_images(project_id,hash,image_id,state,error,log,built_at,failed_budget_bytes,failed_env_measurement,failed_at)
-         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,CASE WHEN $4='failed' THEN clock_timestamp() END)
-         ON CONFLICT(project_id) DO UPDATE SET hash=$2,image_id=$3,state=$4,error=$5,log=$6,built_at=$7,failed_budget_bytes=$8,failed_env_measurement=$9,failed_at=excluded.failed_at
+        `INSERT INTO project_images(project_id,hash,image_id,state,error,log,built_at,failed_budget_bytes,failed_env_measurement,failed_at,failed_base_id)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,CASE WHEN $4='failed' THEN clock_timestamp() END,$10)
+         ON CONFLICT(project_id) DO UPDATE SET hash=$2,image_id=$3,state=$4,error=$5,log=$6,built_at=$7,failed_budget_bytes=$8,failed_env_measurement=$9,failed_at=excluded.failed_at,failed_base_id=excluded.failed_base_id
          WHERE project_images.state<>'ready' OR project_images.hash<>$2 OR project_images.image_id IS DISTINCT FROM $3
             OR project_images.built_at IS DISTINCT FROM excluded.built_at`,
         [
@@ -742,6 +813,7 @@ export class ProjectImageBuilds {
           created,
           failedBudget,
           Boolean(measurementFailure),
+          imageId ? null : base,
         ],
       );
     });
