@@ -64,7 +64,7 @@ async function requestExists(name = "update.json") {
 
 export function updateRoutes(
   app: FastifyInstance,
-  hasOpenTerminal: () => boolean,
+  hasLocalWork: () => boolean,
 ) {
   let writes = 0;
   const safeMethods = new Set(["GET", "HEAD", "OPTIONS"]);
@@ -207,6 +207,6 @@ export function updateRoutes(
         `)
       ).rows[0].busy;
     });
-    return { ready: !busy && !hasOpenTerminal() && writes === 0 };
+    return { ready: !busy && !hasLocalWork() && writes === 0 };
   });
 }

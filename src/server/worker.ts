@@ -22,7 +22,10 @@ import { event, notify, bus } from "./events.js";
 import { githubSyncMessage, type AgentEvent } from "../shared.js";
 import { packageNames } from "../runner/package-request.js";
 import { rememberProjectPackages } from "./project-packages.js";
-import { projectImageBuilds } from "./project-images.js";
+import {
+  cleanProjectImageOrphans,
+  projectImageBuilds,
+} from "./project-images.js";
 export const active = new Map<string, Running>();
 const maxPackageStartupNotices = 4;
 const maxPackageStartupNoticeBytes = 32 * 1024;
@@ -800,6 +803,7 @@ export async function switchAccount(
 export async function startWorker() {
   await recover();
   await projectImageBuilds.recover();
+  await cleanProjectImageOrphans();
   function pollProjectImages(allowBuild: boolean) {
     void projectImageBuilds.tick(allowBuild).catch((error) => {
       console.error("Project image worker failed:", redact(String(error)));

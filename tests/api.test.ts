@@ -71,6 +71,7 @@ import {
   addProjectPackage,
 } from "../src/server/project-packages";
 import {
+  cleanProjectImageOrphans,
   findProjectImage,
   ProjectImageBuilds,
 } from "../src/server/project-images";
@@ -143,6 +144,21 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
   });
 
   describe("project images", () => {
+    async function removeRunnerWithTrigger(runner: string) {
+      // The test's ONBUILD layer and its anonymous volume predate Workspace's
+      // ownership LABEL. Only remove direct children of this disposable runner.
+      const filters = { label: [`ai.workspace.instance=${config.data}`] };
+      for (const item of await docker.listContainers({ all: true, filters })) {
+        if (item.ImageID === runner)
+          await docker.getContainer(item.Id).remove({ force: true, v: true });
+      }
+      for (const image of await docker.listImages({ all: true, filters })) {
+        if (image.ParentId === runner)
+          await docker.getImage(image.Id).remove({ noprune: true });
+      }
+      await docker.getImage(runner).remove();
+    }
+
     async function newProject() {
       const id = randomUUID();
       await db.query(
@@ -462,6 +478,9 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
       let baseInspectError: Error | undefined;
       let inspectError: Error | undefined;
       const realGetImage = Docker.prototype.getImage;
+      const containers = vi
+        .spyOn(Docker.prototype, "listContainers")
+        .mockResolvedValue([]);
       const list = vi
         .spyOn(Docker.prototype, "listImages")
         .mockResolvedValue([]);
@@ -494,6 +513,7 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
         });
       return {
         get,
+        containers,
         replaceBase(id: string) {
           baseId = id;
         },
@@ -512,7 +532,7 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
           built.set(tag, {
             Id: id,
             Size: size,
-            Created: new Date().toISOString(),
+            Created: new Date(Date.now()).toISOString(),
             Config: {
               User: "node",
               Labels: labels,
@@ -523,6 +543,7 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
           inspectError = error;
         },
         restore() {
+          containers.mockRestore();
           list.mockRestore();
           get.mockRestore();
         },
@@ -533,11 +554,40 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
       "builds, shares and cleans up project images, preserving runner configuration and recording failures",
       async () => {
         const builder = new ProjectImageBuilds();
-        const buildImage = vi.spyOn(docker, "buildImage");
+        // Leave the first classic build's actual intermediate containers on
+        // the daemon, as if the supervisor crashed before Docker removed them.
+        const build = docker.buildImage.bind(docker);
+        const buildImage = vi
+          .spyOn(docker, "buildImage")
+          .mockImplementationOnce((context, options) =>
+            build(context, { ...options, rm: false, forcerm: false }),
+          );
         let container:
           Awaited<ReturnType<typeof docker.createContainer>> | undefined;
+        let externalStep: Docker.Container | undefined;
+        let externalParent: string | undefined;
+        const originalRunner = config.image;
+        const shell = ["/bin/bash", "-o", "pipefail", "-c"];
+        const volumePath = "/workspace-test-volume";
+        let customRunner: string | undefined;
         let imageTag: string | undefined;
+        const waitForDocker = (check: () => Promise<void>) =>
+          vi.waitFor(check, { timeout: 30_000 });
         try {
+          const seed = await docker.createContainer({
+            Image: originalRunner,
+            Shell: shell,
+            Labels: { "ai.workspace.instance": config.data },
+            Volumes: { [volumePath]: {} },
+          });
+          try {
+            const committed = await seed.commit({
+              changes: ["ONBUILD ARG WORKSPACE_TEST_BUILD_ARG=yes"],
+            });
+            customRunner = config.image = committed.Id;
+          } finally {
+            await seed.remove({ v: true });
+          }
           const first = await newProject();
           const second = await newProject();
           const failing = await newProject();
@@ -591,7 +641,7 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
           await container.start();
           expect((await container.wait()).StatusCode).toBe(0);
 
-          await vi.waitFor(async () => {
+          await waitForDocker(async () => {
             await builder.tick();
             expect(await imageState(second)).toMatchObject({
               state: "ready",
@@ -623,10 +673,76 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
           const retry = new ProjectImageBuilds();
           try {
             await retry.recover();
-            await vi.waitFor(async () => {
-              await retry.tick();
-              expect(buildImage).toHaveBeenCalledTimes(3);
+            const buildContainers = () =>
+              docker.listContainers({
+                all: true,
+                filters: {
+                  label: [
+                    `ai.workspace.env-owner=${image.Config.Labels["ai.workspace.env-owner"]}`,
+                    `ai.workspace.env-hash=${built.hash}`,
+                  ],
+                },
+              });
+            const leftByBuild = await buildContainers();
+            const volumes = leftByBuild
+              .filter(({ Id }) => Id !== container!.id)
+              .flatMap(({ Mounts }) => Mounts)
+              .filter((mount) => mount.Destination === volumePath)
+              .flatMap((mount) => mount.Name ?? []);
+            expect(volumes.length).toBeGreaterThan(0);
+            expect(
+              leftByBuild.some(
+                ({ Id, Command }) =>
+                  Id !== container!.id &&
+                  Command.includes(shell.join(" ")) &&
+                  Command.includes("project-image-install.js"),
+              ),
+            ).toBe(true);
+            // A downstream build can reapply two consecutive Workspace labels.
+            // Its immediately preceding history entry matches our own build.
+            const priorInstruction = `LABEL ai.workspace.instance=${config.data}`;
+            const priorStep = await docker.createContainer({
+              Image: built.image_id,
+              Entrypoint: [],
+              Cmd: [...shell, "#(nop) ", priorInstruction],
             });
+            try {
+              externalParent = (await priorStep.commit()).Id;
+            } finally {
+              await priorStep.remove({ v: true });
+            }
+            const [history] = await docker.getImage(externalParent!).history();
+            expect(history.CreatedBy).toBe(
+              `${shell.join(" ")} #(nop)  ${priorInstruction}`,
+            );
+            externalStep = await docker.createContainer({
+              Image: externalParent!,
+              Cmd: [
+                ...shell,
+                "#(nop) ",
+                "LABEL ai.workspace.runner.package-installer=1",
+              ],
+            });
+            await cleanProjectImageOrphans();
+            expect(
+              (await buildContainers()).map(({ Id }) => Id).sort(),
+            ).toEqual([container.id, externalStep.id].sort());
+            expect(
+              (await docker.listVolumes()).Volumes.filter(({ Name }) =>
+                volumes.includes(Name),
+              ),
+            ).toEqual([]);
+            await externalStep.remove({ v: true });
+            externalStep = undefined;
+            await docker.getImage(externalParent!).remove({ noprune: true });
+            externalParent = undefined;
+            await waitForDocker(async () => {
+              await retry.tick();
+              expect(await queuedImageAt(first)).toBeNull();
+              expect(await queuedImageAt(second)).toBeNull();
+            });
+            expect(await queuedImageAt(failing)).toBeNull();
+            expect(buildImage).toHaveBeenCalledTimes(2);
             expect(await imageState(first)).toEqual(built);
             await vi.waitFor(expectFailure, { timeout: 120_000 });
 
@@ -651,8 +767,6 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
               vi.unstubAllEnvs();
             }
 
-            await container.remove();
-            container = undefined;
             const pending = await newProject();
             const beforeRemoval = buildImage.mock.calls.length;
             async function removeSavedPackages(project: string) {
@@ -669,7 +783,7 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
               }
             }
             await removeSavedPackages(first);
-            await vi.waitFor(async () => {
+            await waitForDocker(async () => {
               await retry.tick();
               expect(await imageState(first)).toBeUndefined();
             });
@@ -680,7 +794,7 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
             await removeSavedPackages(second);
             await addProjectPackage(pending, "jq");
             await addProjectPackage(pending, "hello");
-            await vi.waitFor(async () => {
+            await waitForDocker(async () => {
               await retry.tick();
               expect(await imageState(second)).toBeUndefined();
               expect(await imageState(pending)).toMatchObject({
@@ -692,9 +806,18 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
             expect(buildImage).toHaveBeenCalledTimes(beforeRemoval);
 
             await removeSavedPackages(pending);
-            await vi.waitFor(async () => {
+            await waitForDocker(async () => {
               await retry.tick();
               expect(await imageState(pending)).toBeUndefined();
+            });
+            await cleanProjectImageOrphans();
+            expect((await docker.getImage(imageTag).inspect()).Id).toBe(
+              built.image_id,
+            );
+            await container.remove({ v: true });
+            container = undefined;
+            await cleanProjectImageOrphans();
+            await waitForDocker(async () => {
               await expect(
                 docker.getImage(imageTag!).inspect(),
               ).rejects.toMatchObject({ statusCode: 404 });
@@ -720,7 +843,12 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
         } finally {
           await builder.stop();
           buildImage.mockRestore();
-          await container?.remove({ force: true });
+          config.image = originalRunner;
+          await externalStep?.remove({ force: true, v: true });
+          if (externalParent)
+            await docker.getImage(externalParent).remove({ noprune: true });
+          await container?.remove({ force: true, v: true });
+          await cleanProjectImageOrphans();
           if (imageTag)
             await docker
               .getImage(imageTag)
@@ -728,6 +856,7 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
               .catch((error) => {
                 if (error.statusCode !== 404) throw error;
               });
+          if (customRunner) await removeRunnerWithTrigger(customRunner);
         }
       },
       500_000,
@@ -749,33 +878,195 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
       await addProjectPackage(project, "hello");
       const builder = new ProjectImageBuilds();
       const daemon = mockImageDaemon();
-      let buildSignal: AbortSignal | undefined;
-      const build = vi
-        .spyOn(docker, "buildImage")
-        .mockImplementation(async (_context, options) => {
-          const signal = options!.abortSignal!;
-          buildSignal = signal;
-          const stream = new PassThrough();
-          signal.addEventListener("abort", () => stream.destroy(), {
-            once: true,
-          });
-          return stream;
-        });
+      const stream = new PassThrough();
+      const build = vi.spyOn(docker, "buildImage").mockResolvedValue(stream);
       try {
         await builder.tick();
-        await vi.waitFor(() => expect(buildSignal).toBeDefined());
+        await vi.waitFor(() => expect(build).toHaveBeenCalledOnce());
         await db.query("UPDATE accounts SET status='ready' WHERE id=$1", [
           account,
         ]);
         expect((await claim())?.id).toBe(queued.json().job_id);
         await builder.tick();
-        expect(buildSignal?.aborted).toBe(true);
+        expect(daemon.containers).toHaveBeenCalledOnce();
       } finally {
+        stream.end();
         await builder.stop();
         build.mockRestore();
         daemon.restore();
       }
     });
+
+    it("keeps update readiness busy across a build timeout until Docker settles and cleanup finishes", async () => {
+      const project = await newProject();
+      await addProjectPackage(project, "hello");
+      const builder = new ProjectImageBuilds();
+      const daemon = mockImageDaemon();
+      const stream = new PassThrough();
+      const deadline = new AbortController();
+      const timeout = vi
+        .spyOn(AbortSignal, "timeout")
+        .mockReturnValueOnce(deadline.signal);
+      let release!: () => void;
+      const removal = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      let finalScanStarted = false;
+      daemon.containers.mockImplementation(async () => {
+        if (stream.readableEnded) {
+          finalScanStarted = true;
+          await removal;
+        }
+        return [];
+      });
+      const build = vi
+        .spyOn(docker, "buildImage")
+        .mockResolvedValueOnce(stream)
+        .mockImplementation(async (_context, options) => {
+          daemon.complete(options!.labels!);
+          return new PassThrough().end();
+        });
+      try {
+        await builder.tick();
+        await vi.waitFor(() => expect(build).toHaveBeenCalledOnce());
+        expect(builder.busy).toBe(true);
+        await builder.tick(false);
+        deadline.abort();
+        expect(build.mock.calls[0][1]!.abortSignal!.aborted).toBe(false);
+        // Docker can report the interrupted RUN before it finishes the request.
+        stream.write('{"error":"installer stopped"}\n');
+        await vi.waitFor(() =>
+          expect(daemon.containers.mock.calls.length).toBeGreaterThan(1),
+        );
+        expect(stream.destroyed).toBe(false);
+        expect(builder.busy).toBe(true);
+        stream.end();
+        await vi.waitFor(() => expect(finalScanStarted).toBe(true));
+        expect(builder.busy).toBe(true);
+        release();
+        await vi.waitFor(() => expect(builder.busy).toBe(false));
+
+        await builder.tick();
+        await vi.waitFor(async () => {
+          expect((await imageState(project)).state).toBe("ready");
+        });
+        expect(build).toHaveBeenCalledTimes(2);
+      } finally {
+        release();
+        stream.destroy();
+        await builder.stop();
+        timeout.mockRestore();
+        build.mockRestore();
+        daemon.restore();
+      }
+    });
+
+    it("records a build timeout after Docker ends the response even if it ended successfully", async () => {
+      const project = await newProject();
+      await addProjectPackage(project, "hello");
+      const builder = new ProjectImageBuilds();
+      const daemon = mockImageDaemon();
+      const deadline = new AbortController();
+      const timeout = vi
+        .spyOn(AbortSignal, "timeout")
+        .mockReturnValueOnce(deadline.signal);
+      const stream = new PassThrough();
+      const build = vi.spyOn(docker, "buildImage").mockResolvedValue(stream);
+      try {
+        await builder.tick();
+        await vi.waitFor(() => expect(build).toHaveBeenCalledOnce());
+        deadline.abort();
+        await vi.waitFor(() => expect(daemon.containers).toHaveBeenCalled());
+        expect(builder.busy).toBe(true);
+        daemon.complete(build.mock.calls[0][1]!.labels!);
+        stream.end();
+        await vi.waitFor(() => expect(builder.busy).toBe(false));
+        expect(await imageState(project)).toMatchObject({
+          state: "failed",
+          error: "The project image build timed out.",
+        });
+      } finally {
+        stream.destroy();
+        await builder.stop();
+        timeout.mockRestore();
+        build.mockRestore();
+        daemon.restore();
+      }
+    });
+
+    it.skipIf(process.env.DOCKER_TESTS !== "1")(
+      "drains a live installer that inherits the runner's instance label before reporting an update ready",
+      async () => {
+        const builder = new ProjectImageBuilds();
+        const project = await newProject();
+        await addProjectPackage(project, "hello");
+        const request = await queuedImageAt(project);
+        const originalRunner = config.image;
+        let customRunner: string | undefined;
+        try {
+          // Delay the installer inside the base so Docker executes the exact
+          // production Dockerfile against a runner with inherited labels.
+          const seed = await docker.createContainer({
+            Image: originalRunner,
+            Labels: { "ai.workspace.instance": config.data },
+            Entrypoint: ["/bin/sh", "-c"],
+            User: "root",
+            Cmd: [
+              "echo 'setTimeout(() => {}, 60000)' > /app/dist/node/runner/project-image-install.js",
+            ],
+          });
+          try {
+            await seed.start();
+            expect((await seed.wait()).StatusCode).toBe(0);
+            customRunner = config.image = (
+              await seed.commit({
+                changes: [
+                  "USER node",
+                  "ONBUILD ENV WORKSPACE_TEST_TRIGGER=yes",
+                ],
+              })
+            ).Id;
+          } finally {
+            await seed.remove({ force: true, v: true });
+          }
+          await builder.tick();
+          const installer = await vi.waitFor(
+            async () => {
+              const running = await docker.listContainers({
+                filters: {
+                  label: [
+                    "ai.workspace.env-owner=" +
+                      createHash("sha256").update(config.data).digest("hex"),
+                  ],
+                },
+              });
+              const match = running.find(({ Command }) =>
+                Command.includes(
+                  "node /app/dist/node/runner/project-image-install.js",
+                ),
+              );
+              expect(match).toBeDefined();
+              return docker.getContainer(match!.Id);
+            },
+            { timeout: 30_000 },
+          );
+          await builder.tick(false);
+          await vi.waitFor(() => expect(builder.busy).toBe(false), {
+            timeout: 15_000,
+          });
+          await expect(installer.inspect()).rejects.toMatchObject({
+            statusCode: 404,
+          });
+          expect(await queuedImageAt(project)).toEqual(request);
+        } finally {
+          await builder.stop();
+          config.image = originalRunner;
+          await cleanProjectImageOrphans();
+          if (customRunner) await removeRunnerWithTrigger(customRunner);
+        }
+      },
+      60_000,
+    );
 
     it("discards an idle result already in flight when a foreground job is claimed", async () => {
       const project = await newProject();
@@ -828,19 +1119,13 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
 
     it("yields to a terminal and cancels a build when its package list changes", async () => {
       const builder = new ProjectImageBuilds();
-      const signals: AbortSignal[] = [];
+      const streams: PassThrough[] = [];
       const daemon = mockImageDaemon();
       const buildImage = vi
         .spyOn(docker, "buildImage")
-        .mockImplementation(async (_file, options) => {
-          const signal = options!.abortSignal!;
-          signals.push(signal);
+        .mockImplementation(async () => {
           const stream = new PassThrough();
-          signal.addEventListener(
-            "abort",
-            () => stream.destroy(signal.reason),
-            { once: true },
-          );
+          streams.push(stream);
           return stream;
         });
       try {
@@ -857,15 +1142,16 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
         await db.query("DELETE FROM workspace_leases WHERE chat_id=$1", [chat]);
 
         await Promise.all([builder.tick(), builder.tick()]);
-        await vi.waitFor(() => expect(signals).toHaveLength(1));
+        await vi.waitFor(() => expect(streams).toHaveLength(1));
         const initial = await imageState(project);
         expect(initial.state).toBe("building");
         await addProjectPackage(project, "jq");
         await builder.tick();
-        expect(signals[0].aborted).toBe(true);
+        expect(daemon.containers).toHaveBeenCalledOnce();
+        streams[0].end();
         await vi.waitFor(async () => {
           await builder.tick();
-          expect(signals).toHaveLength(2);
+          expect(streams).toHaveLength(2);
         });
         expect(await imageState(project)).toMatchObject({
           state: "building",
@@ -876,8 +1162,16 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
           [chat],
         );
         await builder.tick();
-        expect(signals[1].aborted).toBe(true);
+        expect(daemon.containers).toHaveBeenLastCalledWith({
+          all: true,
+          filters: {
+            label: expect.arrayContaining([
+              "ai.workspace.env-hash=" + (await imageState(project)).hash,
+            ]),
+          },
+        });
       } finally {
+        for (const stream of streams) stream.end();
         await builder.stop();
         buildImage.mockRestore();
         daemon.restore();
@@ -1114,8 +1408,8 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
           .digest("hex");
         const budget = 64 * 1024 ** 2;
         await db.query(
-          "INSERT INTO project_images(project_id,hash,state,failed_budget_bytes) VALUES($1,$2,'failed',$3)",
-          [project, hash, budget],
+          "INSERT INTO project_images(project_id,hash,state,failed_budget_bytes,failed_at,failed_base_id) VALUES($1,$2,'failed',$3,clock_timestamp(),$4)",
+          [project, hash, budget, base.Id],
         );
         await db.query(
           "UPDATE projects SET package_image_requested_at=NULL WHERE id=$1",
@@ -1346,6 +1640,172 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
       },
     );
 
+    it("refreshes a week-old image once for idle projects sharing the same packages", async () => {
+      const first = await newProject();
+      const second = await newProject();
+      await addProjectPackage(first, "hello");
+      await addProjectPackage(second, "hello");
+      const builder = new ProjectImageBuilds();
+      const daemon = mockImageDaemon();
+      const start = Date.now();
+      const week = 7 * 24 * 60 * 60_000;
+      const clock = vi.spyOn(Date, "now").mockReturnValue(start);
+      const original = "sha256:" + "b".repeat(64);
+      const refreshed = "sha256:" + "c".repeat(64);
+      const build = vi
+        .spyOn(docker, "buildImage")
+        .mockImplementation(async (_context, options) => {
+          daemon.complete(
+            options!.labels!,
+            Date.now() === start ? original : refreshed,
+          );
+          return new PassThrough().end('{"stream":"Built image."}\n');
+        });
+      async function expectBoth(id: string) {
+        await vi.waitFor(async () => {
+          await builder.tick();
+          for (const project of [first, second]) {
+            expect((await imageState(project))?.image_id).toBe(id);
+            expect(await queuedImageAt(project)).toBeNull();
+          }
+        });
+      }
+      try {
+        await expectBoth(original);
+        const base = await docker.getImage(config.image).inspect();
+        await db.query(
+          "UPDATE project_images SET built_at=NULL WHERE project_id=$1",
+          [first],
+        );
+        clock.mockReturnValue(start + 60_000);
+        await expectBoth(original);
+        expect((await imageState(first)).built_at.getTime()).toBe(start);
+        clock.mockReturnValue(start + week - 1);
+        await expectBoth(original);
+        expect(await findProjectImage(first, base, ["hello"], 1024 ** 2)).toBe(
+          original,
+        );
+        expect(build).toHaveBeenCalledTimes(1);
+
+        clock.mockReturnValue(start + week + 60_000);
+        // The idle scan discovers both projects without a runner launch.
+        await expectBoth(refreshed);
+        expect(build).toHaveBeenCalledTimes(2);
+        expect(await findProjectImage(first, base, ["hello"], 1024 ** 2)).toBe(
+          refreshed,
+        );
+
+        clock.mockReturnValue(Date.now() + week);
+        expect(
+          await findProjectImage(first, base, ["hello"], 1024 ** 2),
+        ).toBeUndefined();
+        expect(await queuedImageAt(first)).toBeInstanceOf(Date);
+      } finally {
+        await builder.stop();
+        build.mockRestore();
+        clock.mockRestore();
+        daemon.restore();
+      }
+    });
+
+    it("waits a week after a failed refresh across a worker restart", async () => {
+      const project = await newProject();
+      await addProjectPackage(project, "hello");
+      let builder = new ProjectImageBuilds();
+      const daemon = mockImageDaemon();
+      const week = 7 * 24 * 60 * 60_000;
+      const now = Date.now();
+      const clock = vi.spyOn(Date, "now").mockReturnValue(now - week);
+      const build = vi
+        .spyOn(docker, "buildImage")
+        .mockImplementation(async (_context, options) => {
+          daemon.complete(options!.labels!);
+          return new PassThrough().end();
+        });
+      async function expectState(state: string) {
+        return vi.waitFor(async () => {
+          await builder.tick();
+          const result = await imageState(project);
+          expect(result?.state).toBe(state);
+          expect(await queuedImageAt(project)).toBeNull();
+          return result;
+        });
+      }
+      try {
+        await expectState("ready");
+        clock.mockReturnValue(now);
+        build.mockRejectedValueOnce(new Error("Debian mirror unavailable"));
+        const failed = await expectState("failed");
+        const retryAt = failed.failed_at.getTime() + week;
+        clock.mockReturnValue(retryAt - 1);
+        await builder.stop();
+        builder = new ProjectImageBuilds();
+        await builder.recover();
+        expect(await queuedImageAt(project)).toBeNull();
+        await expectState("failed");
+        expect(build).toHaveBeenCalledTimes(2);
+        clock.mockReturnValue(retryAt + 60_000);
+        const ready = await expectState("ready");
+        expect(ready.failed_at).toBeNull();
+        expect(ready.failed_base_id).toBeNull();
+        expect(build).toHaveBeenCalledTimes(3);
+      } finally {
+        await builder.stop();
+        build.mockRestore();
+        clock.mockRestore();
+        daemon.restore();
+      }
+    });
+
+    it.each([
+      "runner replacement",
+      "package edit",
+      "explicit retry",
+      "legacy failure",
+    ])("recovers a failed build on restart after a %s", async (reason) => {
+      const project = await newProject();
+      await addProjectPackage(project, "hello");
+      let builder = new ProjectImageBuilds();
+      const daemon = mockImageDaemon();
+      const build = vi
+        .spyOn(docker, "buildImage")
+        .mockRejectedValueOnce(new Error("Debian mirror unavailable"))
+        .mockImplementation(async (_context, options) => {
+          daemon.complete(options!.labels!);
+          return new PassThrough().end();
+        });
+      try {
+        await builder.tick();
+        await vi.waitFor(async () => {
+          expect((await imageState(project))?.state).toBe("failed");
+        });
+        await builder.stop();
+        builder = new ProjectImageBuilds();
+        if (reason === "runner replacement")
+          daemon.replaceBase("sha256:" + "c".repeat(64));
+        if (reason === "package edit") await addProjectPackage(project, "jq");
+        if (reason === "explicit retry")
+          await addProjectPackage(project, "hello");
+        if (reason === "legacy failure")
+          await db.query(
+            "UPDATE project_images SET failed_at=NULL,failed_base_id=NULL WHERE project_id=$1",
+            [project],
+          );
+        const requested = await queuedImageAt(project);
+        await builder.recover();
+        if (requested) expect(await queuedImageAt(project)).toEqual(requested);
+        await vi.waitFor(async () => {
+          await builder.tick();
+          expect((await imageState(project))?.state).toBe("ready");
+        });
+        expect(build).toHaveBeenCalledTimes(2);
+      } finally {
+        await builder.stop();
+        build.mockRestore();
+        daemon.restore();
+      }
+    });
+
     it("rebuilds a ready project when the base runner tag changes while idle", async () => {
       const project = await newProject();
       await addProjectPackage(project, "hello");
@@ -1445,6 +1905,7 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
       const taggedId = "sha256:" + "c".repeat(64);
       const referencedHash = "d".repeat(64);
       const orphanHash = "e".repeat(64);
+      const usedHash = "f".repeat(64);
       const pendingHash = createHash("sha256")
         .update(JSON.stringify([baseId, ["hello", "jq"]]))
         .digest("hex");
@@ -1490,12 +1951,20 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
           image("shared-layer", baseId, referencedHash),
           image("detached-ready-layer", baseId, referencedHash),
           image("foreign", baseId, orphanHash, ["manual:keep"]),
+          image("in-use", "in-use-layer", usedHash, [
+            managedImageTag(usedHash, owner),
+            "manual:keep",
+          ]),
+          image("in-use-layer", baseId, usedHash),
           image("pending", "pending-layer", pendingHash, [
             managedImageTag(pendingHash, owner),
           ]),
           image("pending-layer", baseId, pendingHash),
           image("detached-pending-layer", baseId, pendingHash),
         ]);
+      const containers = vi
+        .spyOn(Docker.prototype, "listContainers")
+        .mockResolvedValue([{ ImageID: "in-use" } as Docker.ContainerInfo]);
       const remove = vi.fn().mockResolvedValue([]);
       const get = vi.spyOn(Docker.prototype, "getImage").mockImplementation(
         (name) =>
@@ -1506,6 +1975,9 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
       );
       try {
         await builder.tick();
+        expect(containers).toHaveBeenCalledWith(
+          expect.objectContaining({ all: true }),
+        );
         expect(remove.mock.calls).toEqual([
           [tag],
           [layerId],
@@ -1514,6 +1986,7 @@ describe.skipIf(!enabled)("PostgreSQL API integration", () => {
         ]);
       } finally {
         await builder.stop();
+        containers.mockRestore();
         get.mockRestore();
         list.mockRestore();
       }

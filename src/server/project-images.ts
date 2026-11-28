@@ -2,12 +2,14 @@ import { createHash } from "node:crypto";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import Docker from "dockerode";
 import { packageBudgetError, packageBudgets } from "../runner/package-disk.js";
 import { projectPackageNames } from "../runner/package-request.js";
 import { config, GiB } from "./config.js";
 import { db, transaction } from "./db.js";
 import { docker } from "./docker.js";
+import { removeDockerResource } from "./docker-cleanup.js";
 import {
   measureProjectEnv,
   ProjectEnvMeasurementError,
@@ -18,6 +20,7 @@ import {
 } from "./project-packages.js";
 import { redact } from "./security.js";
 import { concurrentTasks, projectEnvLimitGib } from "./settings.js";
+import { updatePhase } from "./updates.js";
 
 const installerLabel = "ai.workspace.runner.package-installer";
 const builderLabel = "ai.workspace.runner.project-image-builder";
@@ -25,12 +28,14 @@ const instanceLabel = "ai.workspace.instance";
 const ownerLabel = "ai.workspace.env-owner";
 const hashLabel = "ai.workspace.env-hash";
 const baseLabel = "ai.workspace.base-image";
+const installProgram = "node /app/dist/node/runner/project-image-install.js";
 const imageIdPattern = /^sha256:[a-f0-9]{64}$/;
 const maxLogLength = 32 * 1024;
 const maxBuildEventLength = 1024 * 1024;
 const buildTimeout = 5 * 60_000;
 const retryDelay = 5_000;
 const pruneInterval = 60_000;
+const imageMaxAge = 7 * 24 * 60 * 60_000;
 const transientDockerCodes = new Set([
   "EAI_AGAIN",
   "ECONNREFUSED",
@@ -67,13 +72,24 @@ function imageLabels(base: string, hash: string) {
   };
 }
 
-function matchesProjectImage(
+function buildInstructions(labels: Record<string, string>, run: string | null) {
+  return [
+    // The classic builder can keep untagged layers from a completed RUN.
+    `LABEL ${ownerLabel}=${labels[ownerLabel]} ${hashLabel}=${labels[hashLabel]} ${baseLabel}=${labels[baseLabel]}`,
+    "USER root",
+    run,
+    "USER node",
+  ];
+}
+
+function matchesFreshProjectImage(
   image: Docker.ImageInspectInfo | null,
   base: string,
   hash: string,
 ) {
   return (
     image?.Config?.User === "node" &&
+    Date.parse(image.Created) > Date.now() - imageMaxAge &&
     Object.entries(imageLabels(base, hash)).every(
       ([name, value]) => image.Config.Labels?.[name] === value,
     )
@@ -123,7 +139,7 @@ export async function findProjectImage(
       imageIdPattern.test(image.Id) &&
       image.Id !== base.Id &&
       (candidate !== id || image.Id === id) &&
-      matchesProjectImage(image, base.Id, hash)
+      matchesFreshProjectImage(image, base.Id, hash)
     ) {
       // Only the additional layers count towards project storage. A shared
       // image can fit even when this project's build needed too much APT space.
@@ -182,6 +198,8 @@ async function buildImage(
   budget: number,
   labels: Record<string, string>,
   signal: AbortSignal,
+  timeout: AbortSignal,
+  shutdown: AbortSignal,
   appendLog: (text: string) => void,
 ) {
   if (!imageIdPattern.test(base))
@@ -193,18 +211,29 @@ async function buildImage(
   signal.throwIfAborted();
   const dockerfile = [
     `FROM ${base}`,
-    // The classic builder can keep untagged layers from a completed RUN.
-    `LABEL ${ownerLabel}=${labels[ownerLabel]} ${hashLabel}=${labels[hashLabel]} ${baseLabel}=${base}`,
-    "USER root",
-    `RUN WORKSPACE_PACKAGE_RUN_BUDGET=${budget} node /app/dist/node/runner/project-image-install.js ${concurrency} ${names} && rm -rf /var/lib/apt/lists/*`,
-    "USER node",
+    ...buildInstructions(
+      labels,
+      `RUN WORKSPACE_PACKAGE_RUN_BUDGET=${budget} ${installProgram} ${concurrency} ${names} && rm -rf /var/lib/apt/lists/*`,
+    ),
     "",
   ].join("\n");
   const context = await mkdtemp(
     path.join(tmpdir(), "workspace-project-image-"),
   );
+  const finished = new AbortController();
+  const cancel = AbortSignal.any([signal, timeout]);
+  let draining: Promise<void> | undefined;
+  function onCancel() {
+    draining = drainCancelledBuild(
+      labels[hashLabel],
+      finished.signal,
+      shutdown,
+    );
+  }
   try {
     await writeFile(path.join(context, "Dockerfile"), dockerfile);
+    cancel.throwIfAborted();
+    cancel.addEventListener("abort", onCancel, { once: true });
     const stream = await docker.buildImage(
       { context, src: ["Dockerfile"] },
       {
@@ -215,7 +244,9 @@ async function buildImage(
         nocache: true,
         forcerm: true,
         labels,
-        abortSignal: signal,
+        // Preemption and the deadline stop the installer. Keep the response
+        // open until Docker finishes, even if its first RUN is still pending.
+        abortSignal: shutdown,
       },
     );
     stream.setEncoding("utf8");
@@ -231,15 +262,43 @@ async function buildImage(
       else if (typeof event.status === "string") appendLog(event.status + "\n");
     }
     for await (const chunk of stream) {
+      if (cancel.aborted) continue;
       const lines = (partial + chunk).split("\n");
       partial = lines.pop()!;
       for (const line of lines) consume(line);
       if (partial.length > maxBuildEventLength)
         throw new Error("Docker returned an oversized build event.");
     }
+    cancel.throwIfAborted();
     consume(partial);
   } finally {
+    cancel.removeEventListener("abort", onCancel);
+    finished.abort();
+    await draining;
     await rm(context, { recursive: true, force: true });
+  }
+}
+
+async function drainCancelledBuild(
+  hash: string,
+  finished: AbortSignal,
+  shutdown: AbortSignal,
+) {
+  for (;;) {
+    // A build can create another intermediate after a scan. Do the final
+    // scan only once the build response has settled.
+    const finalScan = finished.aborted;
+    try {
+      await cleanBuildContainers(hash);
+      if (finalScan) return;
+    } catch (error) {
+      console.error("Cancelled build cleanup failed:", redact(String(error)));
+      // Startup recovers remaining containers if the daemon is offline at exit.
+      if (shutdown.aborted) return;
+      await delay(retryDelay);
+      continue;
+    }
+    await delay(100);
   }
 }
 
@@ -265,7 +324,7 @@ async function clearRequest(
   return !!rowCount;
 }
 
-async function pruneProjectImages(baseId: string, signal: AbortSignal) {
+async function pruneProjectImages(baseId: string, signal?: AbortSignal) {
   const instance = config.data;
   const owner = sha256(instance);
   const images = await imageDocker.listImages({
@@ -274,7 +333,7 @@ async function pruneProjectImages(baseId: string, signal: AbortSignal) {
     abortSignal: signal,
   });
   if (!images.length) return;
-  signal.throwIfAborted();
+  signal?.throwIfAborted();
   const { rows } = await db.query<{
     hash: string;
     image_id: string | null;
@@ -320,6 +379,12 @@ async function pruneProjectImages(baseId: string, signal: AbortSignal) {
       .map((image) => [image.Id, image]),
   );
   if (!candidates.size) return;
+  // Even a stopped or externally created container may still need its tag.
+  for (const container of await imageDocker.listContainers({
+    all: true,
+    abortSignal: signal,
+  }))
+    retain(container.ImageID);
   function depth(image: Docker.ImageInfo) {
     let depth = 0;
     let parent = candidates.get(image.ParentId);
@@ -333,8 +398,8 @@ async function pruneProjectImages(baseId: string, signal: AbortSignal) {
   // remove untagged build layers individually without pruning their parents.
   const ordered = [...candidates.values()].sort((a, b) => depth(b) - depth(a));
   for (const { Id, Labels, RepoTags, RepoDigests } of ordered) {
-    signal.throwIfAborted();
-    if (Id === Labels[baseLabel]) continue;
+    signal?.throwIfAborted();
+    if (retained.has(Id) || Id === Labels[baseLabel]) continue;
     const tag = imageTag(Labels[hashLabel], instance);
     const managedTag = RepoTags?.includes(tag);
     const untagged =
@@ -351,6 +416,133 @@ async function pruneProjectImages(baseId: string, signal: AbortSignal) {
   }
 }
 
+function matchesInstallCommand(command: string, base: string, hash: string) {
+  const parts = command.split(` ${installProgram} `);
+  if (
+    parts.length !== 2 ||
+    !/^WORKSPACE_PACKAGE_RUN_BUDGET=\d+$/.test(parts[0])
+  )
+    return false;
+  const args = /^\d+ '(.+)' && rm -rf \/var\/lib\/apt\/lists\/\*$/.exec(
+    parts[1],
+  );
+  const names = args && projectPackageNames(args[1].split("' '"));
+  return !!names && imageHash(base, names) === hash;
+}
+
+async function isBuildContainer(
+  info: Docker.ContainerInspectInfo,
+  base: string,
+  hash: string,
+) {
+  const { Shell } = info.Config as Docker.ContainerCreateOptions;
+  const shell = Shell?.length ? Shell : ["/bin/sh", "-c"];
+  const cmd = info.Config.Cmd ?? [];
+  if (!shell.every((arg, i) => cmd[i] === arg)) return false;
+  const args = cmd.slice(shell.length);
+  const metadata =
+    args.length === 2 &&
+    args[0] === "#(nop) " &&
+    (info.State.Status === "created" || info.State.Status === "removing");
+  if (
+    !metadata &&
+    (args.length !== 1 || !matchesInstallCommand(args[0], base, hash))
+  )
+    return false;
+
+  const labels = imageLabels(base, hash);
+  // Docker appends the build-option labels in key order after the Dockerfile.
+  const steps = [
+    ...buildInstructions(labels, null),
+    ...Object.entries(labels)
+      .map(([key, value]) => `LABEL ${key}=${value}`)
+      .sort(),
+  ];
+  const step = steps.indexOf(metadata ? args[1] : null);
+  if (step < 0) return false;
+  const history: { Id: string; CreatedBy: string }[] = await imageDocker
+    .getImage(info.Image)
+    .history()
+    .catch((error) => {
+      if (error.statusCode !== 404) throw error;
+      return [];
+    });
+  // History is newest first. Each committed ONBUILD trigger in FROM adds a
+  // layer before our first LABEL. A downstream build also contains the
+  // finished Workspace layers between its own instructions and that same ID.
+  const depth = history.findIndex(({ Id }) => Id === base);
+  if (depth < step) return false;
+  const runner = await inspectImage(base);
+  if (depth - step !== (runner?.Config?.OnBuild?.length ?? 0)) return false;
+  const prefix = shell.join(" ") + " ";
+  return history.slice(0, step).every(({ CreatedBy }, i) => {
+    const expected = steps[step - 1 - i];
+    if (expected === null) {
+      // The classic builder prepends "|N key=value ..." to a committed RUN
+      // when the base declared build arguments. Config.Cmd has no prefix.
+      const start = CreatedBy.lastIndexOf(
+        `${prefix}WORKSPACE_PACKAGE_RUN_BUDGET=`,
+      );
+      return (
+        start >= 0 &&
+        (start === 0 || /^\|\d+ [\s\S]* $/.test(CreatedBy.slice(0, start))) &&
+        matchesInstallCommand(
+          CreatedBy.slice(start + prefix.length),
+          base,
+          hash,
+        )
+      );
+    }
+    return CreatedBy === `${prefix}#(nop)  ${expected}`;
+  });
+}
+
+async function cleanBuildContainers(hash?: string) {
+  const owner = sha256(config.data);
+  const filter = [`${ownerLabel}=${owner}`];
+  if (hash) filter.push(`${hashLabel}=${hash}`);
+  // The classic builder's intermediate containers inherit the owner label.
+  // Finished project images also carry it, including in external containers.
+  for (const { Id, Labels, Command } of await imageDocker.listContainers({
+    all: true,
+    filters: { label: filter },
+  })) {
+    if (
+      Labels?.[ownerLabel] !== owner ||
+      (hash !== undefined && Labels[hashLabel] !== hash) ||
+      !imageIdPattern.test(Labels[baseLabel]) ||
+      !/^[a-f0-9]{64}$/.test(Labels[hashLabel]) ||
+      (!Command.includes("#(nop)") && !Command.includes(installProgram))
+    )
+      continue;
+    const container = imageDocker.getContainer(Id);
+    const info = await container.inspect().catch((error) => {
+      if (error.statusCode !== 404) throw error;
+      return null;
+    });
+    if (
+      !info ||
+      !(await isBuildContainer(info, Labels[baseLabel], Labels[hashLabel]))
+    )
+      continue;
+    await removeDockerResource(() =>
+      container.remove({ force: true, v: true }),
+    );
+  }
+}
+
+export async function cleanProjectImageOrphans() {
+  await cleanBuildContainers();
+  // The idle worker retries image GC. Orphan container removal above must
+  // finish before the scheduler can admit another build.
+  try {
+    const base = await inspectImage(config.image);
+    if (base) await pruneProjectImages(base.Id);
+  } catch (error) {
+    console.error("Project image cleanup failed:", redact(String(error)));
+  }
+}
+
 async function foregroundBusy() {
   // The scheduler preempts builds as soon as it claims a runnable task.
   const { rows } = await db.query<{ busy: boolean }>(
@@ -363,17 +555,24 @@ async function foregroundBusy() {
 export class ProjectImageBuilds {
   private active?: Build;
   private polling?: { abort: AbortController; done: Promise<void> };
-  private stopped = false;
+  private readonly shutdown = new AbortController();
   private retryAt = 0;
   private pruneAt = 0;
   private baseId?: string;
 
+  get busy() {
+    return Boolean(this.polling || this.active);
+  }
+
   async recover() {
     // Reconcile existing projects after startup or a runner replacement.
-    // Leave any queued requests in their original order.
+    // Keep queued requests in order. The idle scan reconciles failures once
+    // it knows whether the base changed or the weekly retry is due.
     await db.query(
       `UPDATE projects p SET package_image_requested_at=clock_timestamp()
-       WHERE package_image_requested_at IS NULL AND (
+       WHERE package_image_requested_at IS NULL AND NOT EXISTS(
+         SELECT 1 FROM project_images i WHERE i.project_id=p.id AND i.state='failed'
+       ) AND (
          EXISTS(SELECT 1 FROM project_packages pp WHERE pp.project_id=p.id AND NOT pp.disabled)
          OR EXISTS(SELECT 1 FROM project_images i WHERE i.project_id=p.id)
        )`,
@@ -395,7 +594,7 @@ export class ProjectImageBuilds {
       this.polling?.abort.abort();
     }
     if (
-      this.stopped ||
+      this.shutdown.signal.aborted ||
       !allowBuild ||
       this.polling ||
       (!this.active && Date.now() < this.retryAt)
@@ -415,6 +614,10 @@ export class ProjectImageBuilds {
   }
 
   private async poll(signal: AbortSignal) {
+    // An already-running scheduler iteration can reach this poll after the
+    // update probe. Read the phase while the poll is visible to that probe.
+    const phase = await updatePhase();
+    if (signal.aborted || phase === "waiting" || phase === "updating") return;
     const busy = await foregroundBusy();
     if (signal.aborted) return;
     if (this.active) {
@@ -433,7 +636,20 @@ export class ProjectImageBuilds {
       this.pruneAt = Date.now() + pruneInterval;
       try {
         base = await this.inspectBase(signal);
-        if (base && !signal.aborted) await pruneProjectImages(base.Id, signal);
+        if (base && !signal.aborted) {
+          // Queue existing installations even when nobody opens the project.
+          // Keep the original timestamp of any request already in progress.
+          await db.query(
+            `UPDATE projects p SET package_image_requested_at=clock_timestamp()
+             FROM project_images i WHERE i.project_id=p.id
+             AND ((i.state='ready' AND (i.built_at IS NULL OR i.built_at <= $1))
+               OR (i.state='failed' AND (i.failed_at IS NULL OR i.failed_at <= $1
+                 OR i.failed_base_id IS DISTINCT FROM $2)))
+             AND p.package_image_requested_at IS NULL`,
+            [new Date(Date.now() - imageMaxAge), base.Id],
+          );
+          await pruneProjectImages(base.Id, signal);
+        }
       } catch (error) {
         if (!signal.aborted)
           console.error("Project image cleanup failed:", redact(String(error)));
@@ -490,7 +706,7 @@ export class ProjectImageBuilds {
   }
 
   async stop() {
-    this.stopped = true;
+    this.shutdown.abort();
     this.active?.abort.abort();
     this.polling?.abort.abort();
     await Promise.allSettled([this.polling?.done, this.active?.done]);
@@ -520,7 +736,7 @@ export class ProjectImageBuilds {
     if (signal.aborted) return;
     const supported = baseLabels?.[builderLabel] === "1";
     let image = supported ? await inspectImage(tag) : null;
-    if (!matchesProjectImage(image, base, hash)) image = null;
+    if (!matchesFreshProjectImage(image, base, hash)) image = null;
     let concurrency = 0;
     let runBudget = 0;
     let budget = 0;
@@ -532,7 +748,7 @@ export class ProjectImageBuilds {
          SELECT id,$3,'building' FROM projects
          WHERE id=$1 AND package_image_requested_at=$2::timestamptz
          FOR NO KEY UPDATE
-         ON CONFLICT(project_id) DO UPDATE SET hash=$3,state='building',image_id=NULL,error=NULL,log='',built_at=NULL,failed_budget_bytes=NULL,failed_env_measurement=false`,
+         ON CONFLICT(project_id) DO UPDATE SET hash=$3,state='building',image_id=NULL,error=NULL,log='',built_at=NULL,failed_budget_bytes=NULL,failed_env_measurement=false,failed_at=NULL,failed_base_id=NULL`,
         [projectId, request.requestedAt, hash],
       );
       if (!rowCount) return;
@@ -586,14 +802,17 @@ export class ProjectImageBuilds {
             Number(reservedSlots),
             budget,
             labels,
-            AbortSignal.any([signal, timeout]),
+            signal,
+            timeout,
+            this.shutdown.signal,
             appendLog,
           );
         } catch (error) {
           if (timeout.aborted)
             throw new Error("The project image build timed out.");
           // The installer in the base image reports its budget rejection in
-          // the Docker build stream. Other build errors require a manual retry.
+          // the Docker build stream. Other build errors wait for the weekly
+          // retry unless a new request is queued explicitly.
           if (log.includes(packageBudgetError("run", budget)))
             failedBudget = budget;
           throw error;
@@ -617,7 +836,7 @@ export class ProjectImageBuilds {
       // An Engine error here leaves the request pending so the next tick can
       // inspect and reuse the already-built image.
       image ??= await inspectImage(tag);
-      if (image && matchesProjectImage(image, base, hash)) {
+      if (image && matchesFreshProjectImage(image, base, hash)) {
         imageId = image.Id;
         created = image.Created;
       } else {
@@ -631,10 +850,11 @@ export class ProjectImageBuilds {
       // A package edit locks the same project and supersedes the old request.
       if (!(await clearRequest(c, request))) return;
       await c.query(
-        `INSERT INTO project_images(project_id,hash,image_id,state,error,log,built_at,failed_budget_bytes,failed_env_measurement)
-         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
-         ON CONFLICT(project_id) DO UPDATE SET hash=$2,image_id=$3,state=$4,error=$5,log=$6,built_at=$7,failed_budget_bytes=$8,failed_env_measurement=$9
-         WHERE project_images.state<>'ready' OR project_images.hash<>$2 OR project_images.image_id IS DISTINCT FROM $3`,
+        `INSERT INTO project_images(project_id,hash,image_id,state,error,log,built_at,failed_budget_bytes,failed_env_measurement,failed_at,failed_base_id)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,CASE WHEN $4='failed' THEN clock_timestamp() END,$10)
+         ON CONFLICT(project_id) DO UPDATE SET hash=$2,image_id=$3,state=$4,error=$5,log=$6,built_at=$7,failed_budget_bytes=$8,failed_env_measurement=$9,failed_at=excluded.failed_at,failed_base_id=excluded.failed_base_id
+         WHERE project_images.state<>'ready' OR project_images.hash<>$2 OR project_images.image_id IS DISTINCT FROM $3
+            OR project_images.built_at IS DISTINCT FROM excluded.built_at`,
         [
           projectId,
           hash,
@@ -645,6 +865,7 @@ export class ProjectImageBuilds {
           created,
           failedBudget,
           Boolean(measurementFailure),
+          imageId ? null : base,
         ],
       );
     });

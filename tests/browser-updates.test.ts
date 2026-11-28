@@ -37,6 +37,69 @@ afterEach(() => {
 });
 
 describe("browser update API", () => {
+  it("waits for project image work to drain and prevents a late scheduler tick from starting more", async () => {
+    const statusFile = path.join(fixture(), "status.json");
+    vi.stubEnv("WORKSPACE_UPDATE_STATUS", statusFile);
+    function save(phase: string) {
+      writeFileSync(
+        statusFile,
+        JSON.stringify({
+          phase,
+          heartbeat: Date.now(),
+          available: null,
+          target: null,
+          checkedAt: null,
+          checkFailed: false,
+          message: null,
+        }),
+      );
+    }
+    save("idle");
+    const { updateRoutes } = await import("../src/server/updates.js");
+    const { ProjectImageBuilds } =
+      await import("../src/server/project-images.js");
+    const { db } = await import("../src/server/db.js");
+    const builder = new ProjectImageBuilds();
+    const app = Fastify();
+    updateRoutes(app, () => builder.busy);
+    const probe = () =>
+      app.inject({ url: "/internal/update-ready", remoteAddress: "127.0.0.1" });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const checkForeground = vi
+      .spyOn(db, "query")
+      .mockImplementation(async () => {
+        await gate;
+        return { rows: [{ busy: true }] };
+      });
+    try {
+      const polling = builder.tick();
+      await vi.waitFor(() => expect(checkForeground).toHaveBeenCalledOnce());
+      save("waiting");
+      await builder.tick(false);
+      expect((await probe()).json()).toEqual({ ready: false });
+      release();
+      await polling;
+      expect((await probe()).json()).toEqual({ ready: true });
+
+      // A scheduler iteration that read the old phase can arrive after ready.
+      await builder.tick();
+      save("updating");
+      await builder.tick();
+      expect(checkForeground).toHaveBeenCalledTimes(1);
+      save("idle");
+      await builder.tick();
+      expect(checkForeground).toHaveBeenCalledTimes(2);
+    } finally {
+      release();
+      await builder.stop();
+      checkForeground.mockRestore();
+      await app.close();
+    }
+  });
+
   it("requires owner authentication and records one exact release request", async () => {
     const root = fixture();
     const statusFile = path.join(root, "status.json");

@@ -39,6 +39,7 @@ import {
 } from "./settings.js";
 import { createResourceMonitor } from "./resources.js";
 import { updatePhase, updateRoutes } from "./updates.js";
+import { projectImageBuilds } from "./project-images.js";
 import { disconnectAccount, deleteAccount } from "./accounts.js";
 import { active, switchAccount } from "./worker.js";
 import {
@@ -200,7 +201,7 @@ export async function createApp() {
     limits: { fileSize: config.maxFile, files: 1, fields: 4 },
   });
   await app.register(websocket, { options: { maxPayload: 65536 } });
-  updateRoutes(app, () => terminalCleanups.size > 0);
+  updateRoutes(app, () => terminalCleanups.size > 0 || projectImageBuilds.busy);
   await authRoutes(app);
   app.setErrorHandler((e: any, _req, reply) => {
     const code =
